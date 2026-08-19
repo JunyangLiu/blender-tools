@@ -79,6 +79,37 @@ class SMRN_PT_marking(bpy.types.Panel):
             confirm.candidate_kind = "handle"
             handle.operator("smrn.remove_handle_candidate", text="移除当前扶手候选", icon="TRASH")
 
+        surface = layout.box()
+        surface.label(text="4. 局部原网面重构", icon="MOD_REMESH")
+        surface.label(text="绿色：重构区域  ·  红色：锁定保留")
+        row = surface.row(align=True)
+        smooth = row.operator(
+            "smrn.build_surface_candidate",
+            text="细化平滑",
+            icon="MOD_SUBSURF",
+        )
+        smooth.mode = "smooth"
+        flatten = row.operator(
+            "smrn.build_surface_candidate",
+            text="一键平整",
+            icon="SNAP_FACE",
+        )
+        flatten.mode = "flatten"
+        if _candidate_exists(scene, "smrn_surface_candidate_name", "SMRN_SURFACE_CANDIDATE_"):
+            mode = str(scene.get("smrn_surface_candidate_mode", "smooth"))
+            if mode == "smooth":
+                surface.prop(scene, "smrn_surface_smooth_strength", text="平滑程度", slider=True)
+            apply = surface.operator(
+                "smrn.build_surface_candidate", text="重新应用（只重算标记附近）", icon="FILE_REFRESH"
+            )
+            apply.mode = mode
+            surface.operator(
+                "smrn.confirm_surface_replacement",
+                text="确认替换原网面并清除标记",
+                icon="CHECKMARK",
+            )
+            surface.operator("smrn.remove_surface_candidate", text="移除当前网面候选", icon="TRASH")
+
         advanced = layout.box()
         row = advanced.row()
         row.prop(
@@ -110,6 +141,12 @@ class SMRN_PT_marking(bpy.types.Panel):
             handle_settings.prop(scene, "smrn_handle_clearance", text="额外外扩")
             handle_settings.operator("smrn.analyze_handle", text="只分析扶手证据", icon="VIEWZOOM")
             handle_settings.label(text=scene.smrn_handle_summary, icon="INFO")
+
+            surface_settings = advanced.column(align=True)
+            surface_settings.label(text="局部原网面重构")
+            surface_settings.prop(scene, "smrn_surface_subdivision_level", text="细化等级")
+            surface_settings.prop(scene, "smrn_surface_hard_angle", text="硬边保护角度")
+            surface_settings.label(text=scene.smrn_surface_summary, icon="INFO")
 
         if scene.smrn_status:
             status = layout.box()

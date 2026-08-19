@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Semantic Mesh Marker Next",
     "author": "Local developer",
-    "version": (0, 4, 8),
+    "version": (0, 5, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > 语义标记 Next",
     "description": "Non-destructive target and exclude surface marking",
@@ -79,6 +79,19 @@ def register():
     bpy.types.Scene.smrn_handle_summary = bpy.props.StringProperty(
         name="扶手还原结果", default="尚未分析本轮扶手标记",
     )
+    bpy.types.Scene.smrn_surface_subdivision_level = bpy.props.IntProperty(
+        name="局部细化等级", description="只细分绿色标记附近的局部网面", default=1, min=1, max=2,
+    )
+    bpy.types.Scene.smrn_surface_smooth_strength = bpy.props.FloatProperty(
+        name="局部平滑强度", description="锁定红色面、硬边和区域边界后的受限平滑",
+        default=0.22, min=0.0, max=0.5, step=1, precision=2,
+    )
+    bpy.types.Scene.smrn_surface_hard_angle = bpy.props.FloatProperty(
+        name="硬边保护角度", default=35.0, min=5.0, max=85.0, precision=1,
+    )
+    bpy.types.Scene.smrn_surface_summary = bpy.props.StringProperty(
+        name="局部网面重构结果", default="尚未生成局部网面候选",
+    )
     try:
         migration = migrate_scene_anchors(bpy.context.scene)
         bpy.context.scene.smrn_status = (
@@ -91,6 +104,8 @@ def register():
 
 def unregister():
     for name in (
+        "smrn_surface_summary", "smrn_surface_hard_angle",
+        "smrn_surface_smooth_strength", "smrn_surface_subdivision_level",
         "smrn_handle_summary", "smrn_handle_clearance", "smrn_handle_thickness_scale",
         "smrn_handle_min_diameter", "smrn_handle_section_segments",
         "smrn_handle_path_segments",

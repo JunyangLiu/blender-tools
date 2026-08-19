@@ -109,6 +109,23 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn('def adjust_candidate_thickness(scene):', adapter)
         self.assertIn('"model_rescanned": False', adapter)
 
+    def test_local_surface_rebuild_is_feature_locked_and_recoverable(self):
+        adapter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "surface_rebuild_blender.py").read_text(encoding="utf-8")
+        operators = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "operators.py").read_text(encoding="utf-8")
+        panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
+        self.assertIn('CANDIDATE_PREFIX = "SMRN_SURFACE_CANDIDATE_"', adapter)
+        self.assertIn('"global_geometry_scan": False', adapter)
+        self.assertIn("boundary_edges | hard_edges", adapter)
+        self.assertIn("max_allowed_displacement", adapter)
+        self.assertIn("source.data = new_mesh", adapter)
+        self.assertIn("set_active_source(scene, source_snapshot(source))", adapter)
+        self.assertIn('bl_idname = "smrn.confirm_surface_replacement"', operators)
+        self.assertIn('text="细化平滑"', panel)
+        self.assertIn('text="一键平整"', panel)
+        self.assertIn('text="确认替换原网面并清除标记"', panel)
+        self.assertIn('mode == "flatten"', adapter)
+        self.assertIn("local_region_robust_center_pca", adapter)
+
 
 if __name__ == "__main__":
     unittest.main()

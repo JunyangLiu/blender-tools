@@ -25,6 +25,11 @@ from .handle_blender import (
     remove_last_candidate as remove_handle_candidate,
     store_analysis as store_handle_analysis,
 )
+from .surface_rebuild_blender import (
+    build_scene_candidate as build_surface_candidate,
+    confirm_replacement as confirm_surface_replacement,
+    remove_last_candidate as remove_surface_candidate,
+)
 from .scene_state import (
     ensure_scene_roots,
     keep_model_visible,
@@ -466,6 +471,80 @@ class SMRN_OT_confirm_candidate(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SMRN_OT_build_surface_candidate(bpy.types.Operator):
+    bl_idname = "smrn.build_surface_candidate"
+    bl_label = "生成局部网面重构候选"
+    bl_description = "只读取当前语义源及绿色标记附近的局部拓扑；锁定红色面、硬边与区域边界"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mode: bpy.props.EnumProperty(
+        items=(("smooth", "细化平滑", ""), ("flatten", "一键平整", "")),
+        default="smooth",
+    )
+
+    def execute(self, context):
+        try:
+            candidate, report = build_surface_candidate(context.scene, self.mode)
+        except (ValueError, RuntimeError) as error:
+            self.report({"ERROR"}, str(error))
+            context.scene.smrn_surface_summary = f"生成失败：{error}"
+            _set_status(context.scene, context.scene.smrn_surface_summary)
+            return {"CANCELLED"}
+        topology = report["topology_qa"]
+        region = report["semantic_region"]
+        action = "平整" if report["mode"] == "flatten" else "细化平滑"
+        context.scene.smrn_surface_summary = (
+            f"{action}候选 · {region['selected_faces']} 面 → "
+            f"{topology['region_faces_after']} 面 · 边界与硬边已锁定"
+        )
+        _set_status(context.scene, context.scene.smrn_surface_summary)
+        return {"FINISHED"}
+
+
+class SMRN_OT_remove_surface_candidate(bpy.types.Operator):
+    bl_idname = "smrn.remove_surface_candidate"
+    bl_label = "移除局部网面候选"
+    bl_description = "移除当前预览和工作副本；源模型保持不变"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        removed = remove_surface_candidate(context.scene)
+        context.scene.smrn_surface_summary = (
+            "局部网面候选已移除；源网格保持不变" if removed else "没有可移除的局部网面候选"
+        )
+        _set_status(context.scene, context.scene.smrn_surface_summary)
+        return {"FINISHED" if removed else "CANCELLED"}
+
+
+class SMRN_OT_confirm_surface_replacement(bpy.types.Operator):
+    bl_idname = "smrn.confirm_surface_replacement"
+    bl_label = "确认替换原网面并清除标记"
+    bl_description = "以已通过质量检查的工作网格接替源网格；旧网格自动归档并保留 .blend 检查点"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        if not bpy.data.filepath:
+            self.report({"ERROR"}, "请先保存当前 Blender 工程，再确认替换")
+            return {"CANCELLED"}
+        try:
+            source, archive, _report = confirm_surface_replacement(context.scene)
+            removed = clear_task_marks(context.scene)
+            for record in removed:
+                remove_overlay(record.overlay_object_name)
+            keep_model_visible(context.scene, (source,))
+            bpy.ops.wm.save_mainfile()
+        except (ValueError, RuntimeError) as error:
+            self.report({"ERROR"}, str(error))
+            _set_status(context.scene, f"原网面替换失败：{error}")
+            return {"CANCELLED"}
+        context.scene.smrn_surface_summary = "尚未生成局部网面候选"
+        _set_status(
+            context.scene,
+            f"局部原网面已确认，旧网格归档为 {archive.name}；清除本轮 {len(removed)} 个标记",
+        )
+        return {"FINISHED"}
+
+
 CLASSES = (
     SMRN_OT_setup_source,
     SMRN_OT_mark_surface,
@@ -481,4 +560,7 @@ CLASSES = (
     SMRN_OT_remove_handle_candidate,
     SMRN_OT_adjust_handle_thickness,
     SMRN_OT_confirm_candidate,
+    SMRN_OT_build_surface_candidate,
+    SMRN_OT_remove_surface_candidate,
+    SMRN_OT_confirm_surface_replacement,
 )
