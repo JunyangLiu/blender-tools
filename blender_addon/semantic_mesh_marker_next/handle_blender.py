@@ -8,11 +8,18 @@ from pathlib import Path
 
 import bpy
 from mathutils import Vector
+from mathutils.bvhtree import BVHTree
 import numpy as np
 
 from .anchors import source_snapshot
 from .constants import EXCLUDE_ROLE, SOURCE_NAME_KEY, TARGET_ROLE
-from .handle_fit import fit_handle, path_points_2d, path_points_world
+from .handle_fit import (
+    fit_handle,
+    minimum_enclosing_circle,
+    path_points_2d,
+    path_points_world,
+    polyline_nearest,
+)
 from .scene_state import ensure_scene_roots, keep_model_visible
 from .storage import load_all_marks
 
@@ -139,6 +146,112 @@ def _dense_triangle_samples(records, order=5):
                     u, v = i / order, j / order
                     result.append(tuple(anchor * (1.0 - u - v) + b * u + c * v))
     return result
+
+
+def _dense_face_samples(face_map, order=4):
+    """Densely sample every triangle in a semantic face map without trimming."""
+    result = []
+    areas = []
+    owners = []
+    for object_name, face_indices in face_map.items():
+        source = bpy.data.objects.get(object_name)
+        if source is None or source.type != "MESH":
+            continue
+        for face_index in sorted(face_indices):
+            if not 0 <= face_index < len(source.data.polygons):
+                continue
+            polygon = source.data.polygons[face_index]
+            indices = list(polygon.vertices)
+            if len(indices) < 3:
+                continue
+            anchor = source.matrix_world @ source.data.vertices[indices[0]].co
+            triangle_area = float(polygon.area) / max(1, len(indices) - 2)
+            for corner in range(1, len(indices) - 1):
+                b = source.matrix_world @ source.data.vertices[indices[corner]].co
+                c = source.matrix_world @ source.data.vertices[indices[corner + 1]].co
+                sample_count = (order + 1) * (order + 2) // 2
+                for i in range(order + 1):
+                    for j in range(order + 1 - i):
+                        u, v = i / order, j / order
+                        result.append(tuple(anchor * (1.0 - u - v) + b * u + c * v))
+                        areas.append(triangle_area / sample_count)
+                        owners.append((object_name, face_index))
+    return np.asarray(result, dtype=float), np.asarray(areas, dtype=float), owners
+
+
+def _path_vertex_frames(path, plane_normal):
+    path = np.asarray(path, dtype=float)
+    normal = np.asarray(plane_normal, dtype=float)
+    tangents = np.empty_like(path)
+    tangents[0] = path[1] - path[0]
+    tangents[-1] = path[-1] - path[-2]
+    tangents[1:-1] = path[2:] - path[:-2]
+    tangents /= np.maximum(np.linalg.norm(tangents, axis=1)[:, None], 1.0e-12)
+    in_plane = np.cross(tangents, normal)
+    in_plane /= np.maximum(np.linalg.norm(in_plane, axis=1)[:, None], 1.0e-12)
+    return tangents, in_plane
+
+
+def _semantic_handle_faces(targets, path, plane_normal, corridor):
+    """Grow marked tube faces inside a local, orientation-aware corridor.
+
+    The old handle is welded into the vehicle mesh, so unrestricted connected
+    selection reaches the complete turret.  A face can enter the flood only
+    when it is close to the fitted centerline and its normal is transverse to
+    the local path tangent, as a tube wall must be.
+    """
+    seeds_by_object = {}
+    for record in targets:
+        source = _evidence_object(record)
+        seeds_by_object.setdefault(source.name, set()).add(int(record.face_index))
+    result = {}
+    diagnostics = []
+    for object_name, seeds in seeds_by_object.items():
+        source = bpy.data.objects.get(object_name)
+        polygons = source.data.polygons
+        centers = np.asarray([
+            tuple(source.matrix_world @ polygon.center) for polygon in polygons
+        ], dtype=float)
+        normals = np.asarray([
+            tuple(_world_normal(source, polygon.normal)) for polygon in polygons
+        ], dtype=float)
+        _nearest, tangents, distances = polyline_nearest(centers, path)
+        transverse = np.abs(np.sum(normals * tangents, axis=1)) <= 0.62
+        eligible = (distances <= corridor) & transverse
+        # Always allow the explicit seeds to start the local growth. Neighbours
+        # still have to satisfy the tube-wall gate.
+        edge_faces = {}
+        for face_index in np.flatnonzero(eligible):
+            for edge in polygons[int(face_index)].edge_keys:
+                edge_faces.setdefault(tuple(edge), []).append(int(face_index))
+        accepted = set()
+        queue = []
+        for seed in seeds:
+            if not 0 <= seed < len(polygons):
+                continue
+            accepted.add(seed)
+            queue.extend(
+                adjacent
+                for edge in polygons[seed].edge_keys
+                for adjacent in edge_faces.get(tuple(edge), ())
+            )
+        while queue:
+            face_index = queue.pop()
+            if face_index in accepted or not eligible[face_index]:
+                continue
+            accepted.add(face_index)
+            for edge in polygons[face_index].edge_keys:
+                queue.extend(edge_faces.get(tuple(edge), ()))
+        result[object_name] = accepted
+        diagnostics.append({
+            "object": object_name,
+            "seed_faces": len(seeds),
+            "expanded_faces": len(accepted),
+            "eligible_faces": int(np.sum(eligible)),
+            "corridor": float(corridor),
+            "normal_tangent_limit": 0.62,
+        })
+    return result, diagnostics
 
 
 def _local(points, fit):
@@ -303,6 +416,68 @@ def _topology(vertices, faces):
     }
 
 
+def _mesh_containment(vertices, faces, points, sample_areas, owners, tolerance):
+    """Test points against the actual watertight shell using winding numbers.
+
+    Nearest-face normal signs are not a valid inside/outside test around swept
+    bends, while parity rays can double-hit shared polygon boundaries.  The
+    generalized winding number integrates solid angle over every candidate
+    triangle and therefore tests the closed shell itself. Nearest distance is
+    retained as the measured deficit used to enlarge a rejected shell.
+    """
+    bvh = BVHTree.FromPolygons(
+        [Vector(value) for value in vertices], faces, all_triangles=False
+    )
+    vertex_values = np.asarray(vertices, dtype=float)
+    triangles = []
+    for face in faces:
+        for index in range(1, len(face) - 1):
+            triangles.append((face[0], face[index], face[index + 1]))
+    triangle_values = vertex_values[np.asarray(triangles, dtype=int)]
+
+    def winding_inside(point):
+        vectors = triangle_values - np.asarray(point, dtype=float)[None, None, :]
+        first, second, third = vectors[:, 0], vectors[:, 1], vectors[:, 2]
+        first_length = np.linalg.norm(first, axis=1)
+        second_length = np.linalg.norm(second, axis=1)
+        third_length = np.linalg.norm(third, axis=1)
+        numerator = np.einsum("ij,ij->i", first, np.cross(second, third))
+        denominator = (
+            first_length * second_length * third_length
+            + np.einsum("ij,ij->i", first, second) * third_length
+            + np.einsum("ij,ij->i", second, third) * first_length
+            + np.einsum("ij,ij->i", third, first) * second_length
+        )
+        winding = float(np.sum(2.0 * np.arctan2(numerator, denominator)))
+        return abs(winding) > 2.0 * np.pi
+
+    signed_values = []
+    outside = []
+    for index, point in enumerate(points):
+        _location, _normal, _face, distance = bvh.find_nearest(Vector(point))
+        distance = float(distance)
+        if distance <= tolerance:
+            inside = True
+        else:
+            inside = winding_inside(point)
+        signed = -distance if inside else distance
+        signed_values.append(signed)
+        if not inside:
+            outside.append((index, signed, distance, owners[index]))
+    worst = sorted(outside, key=lambda item: item[1], reverse=True)[:12]
+    return {
+        "samples": int(len(points)),
+        "outside": int(len(outside)),
+        "outside_area": float(sum(sample_areas[index] for index, *_rest in outside)),
+        "max_signed": float(max(signed_values)),
+        "min_signed": float(min(signed_values)),
+        "tolerance": float(tolerance),
+        "worst": [[int(index), signed, distance, list(owner)]
+                  for index, signed, distance, owner in worst],
+        "passed": not outside,
+    }
+
+
 def _checkpoint(scene, source):
     existing = str(scene.get("smrn_handle_checkpoint_path", ""))
     if existing and Path(existing).exists():
@@ -357,7 +532,7 @@ def _commit_candidate(scene, obj):
     scene[key] = obj.name
 
 
-def build_scene_candidate(scene):
+def _build_scene_candidate_legacy(scene):
     fit, source, targets, supports, context_report = analyze_scene(scene)
     report = {"fit": fit.to_dict(), **context_report}
     if fit.status != "candidate_ready" or source is None:
@@ -471,6 +646,183 @@ def build_scene_candidate(scene):
     })
     if not topology["passed"] or not coverage["passed"] or not source_unchanged or not evidence_unchanged:
         report.update({"status": "rejected", "reason": "扶手候选未通过拓扑或源不变性检查"})
+        return None, report
+    checkpoint = _checkpoint(scene, source)
+    report["checkpoint"] = checkpoint
+    _model, candidates, _helpers = ensure_scene_roots(scene)
+    mesh = bpy.data.meshes.new(f"{CANDIDATE_PREFIX}MESH")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update(calc_edges=True)
+    obj = bpy.data.objects.new(f"{CANDIDATE_PREFIX}{fit.path_kind.upper()}", mesh)
+    candidates.objects.link(obj)
+    obj.color = (1.0, 0.24, 0.03, 0.78)
+    obj.show_wire = True
+    obj.show_all_edges = True
+    obj["smrn_candidate_only"] = True
+    obj["smrn_source_name"] = source.name
+    obj["smrn_handle_report_json"] = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+    _commit_candidate(scene, obj)
+    scene["smrn_handle_last_report_json"] = obj["smrn_handle_report_json"]
+    return obj, report
+
+
+def build_scene_candidate(scene):
+    """Build a centered, minimum-radius candidate covering all semantic tube faces."""
+    fit, source, targets, supports, context_report = analyze_scene(scene)
+    report = {"fit": fit.to_dict(), **context_report}
+    if fit.status != "candidate_ready" or source is None:
+        report.update({"status": "rejected", "reason": fit.reason})
+        return None, report
+    fingerprint_before = source_snapshot(source)["fingerprint"]
+    evidence_before = {
+        _evidence_object(item).name: source_snapshot(_evidence_object(item))["fingerprint"]
+        for item in targets + supports
+    }
+    marked_dense = _dense_triangle_samples(targets, order=6)
+    if not marked_dense:
+        report.update({"status": "rejected", "reason": "marked faces have no valid triangles"})
+        return None, report
+
+    path_segments = max(64, int(scene.smrn_handle_path_segments))
+    base_path = path_points_world(fit, path_segments, (0.0, 0.0))
+    marked_values = np.asarray(marked_dense, dtype=float)
+    _nearest, _tangents, marked_distances = polyline_nearest(marked_values, base_path)
+    # This source-scaled corridor only bounds topology growth. No accepted
+    # semantic sample can later disappear from the coverage denominator.
+    corridor = max(float(np.max(marked_distances)) * 1.35, fit.radius_hint * 1.75)
+    semantic_faces, semantic_diagnostics = _semantic_handle_faces(
+        targets, base_path, fit.plane_normal, corridor
+    )
+    dense, sample_areas, sample_owners = _dense_face_samples(semantic_faces, order=4)
+    if len(dense) < 24:
+        report.update({
+            "status": "rejected",
+            "reason": "topology and orientation gates found too little complete tube-wall evidence",
+            "semantic_expansion": semantic_diagnostics,
+        })
+        return None, report
+
+    nearest, tangents, _distances = polyline_nearest(dense, base_path)
+    plane_normal = np.asarray(fit.plane_normal, dtype=float)
+    in_plane = np.cross(tangents, plane_normal)
+    in_plane /= np.maximum(np.linalg.norm(in_plane, axis=1)[:, None], 1.0e-12)
+    offsets = dense - nearest
+    cross_points = np.column_stack((
+        offsets @ plane_normal,
+        np.sum(offsets * in_plane, axis=1),
+    ))
+    section_center, enclosing_radius = minimum_enclosing_circle(cross_points)
+
+    def shifted_path(endpoint_penetrations):
+        raw = path_points_world(fit, path_segments, endpoint_penetrations)
+        _frame_tangents, frame_in_plane = _path_vertex_frames(raw, plane_normal)
+        return raw + plane_normal * section_center[0] + frame_in_plane * section_center[1]
+
+    clearance = max(0.0, float(scene.smrn_handle_clearance))
+    requested_radius = max(0.0, float(scene.smrn_handle_min_diameter) * 0.5)
+    preliminary_radius = max(enclosing_radius + clearance, requested_radius)
+    penetrations, endpoint_evidence = _support_penetrations(
+        scene, supports, fit, preliminary_radius
+    )
+    path = shifted_path(penetrations)
+    start_tangent = path[1] - path[0]
+    start_tangent /= max(float(np.linalg.norm(start_tangent)), 1.0e-12)
+    end_tangent = path[-1] - path[-2]
+    end_tangent /= max(float(np.linalg.norm(end_tangent)), 1.0e-12)
+    start_deficit = max(
+        0.0, float(np.max(-((dense - path[0]) @ start_tangent)))
+    )
+    end_deficit = max(
+        0.0, float(np.max((dense - path[-1]) @ end_tangent))
+    )
+    cap_margin = max(1.0e-5, preliminary_radius * 1.0e-4)
+    penetrations = (
+        float(penetrations[0] + start_deficit + (cap_margin if start_deficit else 0.0)),
+        float(penetrations[1] + end_deficit + (cap_margin if end_deficit else 0.0)),
+    )
+    path = shifted_path(penetrations)
+    endpoint_coverage_extension = {
+        "start": start_deficit,
+        "end": end_deficit,
+        "margin": cap_margin,
+    }
+    _coverage_nearest, _coverage_tangents, source_distances = polyline_nearest(dense, path)
+    source_radius = float(np.max(source_distances))
+    section_radius = max(source_radius + clearance, requested_radius)
+    section_segments = max(8, int(scene.smrn_handle_section_segments))
+    containment_iterations = []
+    for iteration in range(6):
+        vertices, faces = _candidate_geometry(
+            path, fit.plane_normal, section_radius, section_radius, section_segments
+        )
+        containment_tolerance = max(1.0e-7, section_radius * 1.0e-6)
+        containment = _mesh_containment(
+            vertices, faces, dense, sample_areas, sample_owners,
+            containment_tolerance,
+        )
+        containment_iterations.append({
+            "iteration": iteration,
+            "radius": float(section_radius),
+            "outside": containment["outside"],
+            "max_signed": containment["max_signed"],
+        })
+        if containment["passed"]:
+            break
+        # Compensate the measured polygon-shell deficit. The cosine converts
+        # radial vertex movement to the minimum face-normal movement of the
+        # regular section; repeated measured checks also cover bend chords.
+        projection = max(float(np.cos(np.pi / section_segments)), 0.80)
+        if iteration < 5:
+            section_radius += (
+                max(0.0, containment["max_signed"]) + containment_tolerance * 2.0
+            ) / projection
+    topology = _topology(vertices, faces)
+    coverage_tolerance = max(1.0e-8, section_radius * 1.0e-7)
+    uncovered_mask = source_distances > section_radius + coverage_tolerance
+    uncovered = int(np.sum(uncovered_mask))
+    clearances = section_radius - source_distances
+    coverage = {
+        "samples": int(len(dense)), "uncovered": uncovered,
+        "uncovered_area": float(np.sum(sample_areas[uncovered_mask])),
+        "semantic_faces": int(sum(len(values) for values in semantic_faces.values())),
+        "marked_samples": int(len(marked_dense)),
+        "discarded_semantic_samples": 0,
+        "section_center_offset": [float(value) for value in section_center],
+        "minimum_enclosing_radius": float(enclosing_radius),
+        "normal_radius": section_radius, "in_plane_radius": section_radius,
+        "clearance_min": float(np.min(clearances)),
+        "clearance_median": float(np.median(clearances)),
+        "clearance_p95": float(np.quantile(clearances, 0.95)),
+        "clearance_max": float(np.max(clearances)),
+        "passed": uncovered == 0,
+    }
+    coverage["mesh_containment"] = containment
+    coverage["mesh_containment_iterations"] = containment_iterations
+    coverage["passed"] = coverage["passed"] and containment["passed"]
+    source_unchanged = source_snapshot(source)["fingerprint"] == fingerprint_before
+    evidence_unchanged = all(
+        bpy.data.objects.get(name) is not None
+        and source_snapshot(bpy.data.objects[name])["fingerprint"] == fingerprint
+        for name, fingerprint in evidence_before.items()
+    )
+    report.update({
+        "status": "candidate_ready", "coverage_qa": coverage,
+        "semantic_expansion": semantic_diagnostics,
+        "endpoint_qa": endpoint_evidence, "endpoint_penetrations": list(penetrations),
+        "endpoint_coverage_extension": endpoint_coverage_extension,
+        "topology_qa": topology, "source_unchanged": source_unchanged,
+        "evidence_sources_unchanged": evidence_unchanged,
+        "frame_qa": {
+            "shared_leg_axis": True,
+            "span_rise_dot": abs(float(np.dot(fit.span_axis, fit.rise_axis))),
+            "span_normal_dot": abs(float(np.dot(fit.span_axis, fit.plane_normal))),
+            "rise_normal_dot": abs(float(np.dot(fit.rise_axis, fit.plane_normal))),
+            "plane_thickness_ratio": fit.plane_thickness_ratio,
+            "passed": fit.status == "candidate_ready",
+        },
+    })
+    if not topology["passed"] or not coverage["passed"] or not source_unchanged or not evidence_unchanged:
+        report.update({"status": "rejected", "reason": "handle candidate failed topology, coverage, or source immutability QA"})
         return None, report
     checkpoint = _checkpoint(scene, source)
     report["checkpoint"] = checkpoint

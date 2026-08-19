@@ -15,6 +15,8 @@ SPEC.loader.exec_module(HANDLE)
 fit_handle = HANDLE.fit_handle
 path_points_2d = HANDLE.path_points_2d
 path_points_world = HANDLE.path_points_world
+polyline_nearest = HANDLE.polyline_nearest
+minimum_enclosing_circle = HANDLE.minimum_enclosing_circle
 
 
 def unit(value):
@@ -59,6 +61,31 @@ def surface_marks(kind="flat_top", uneven=False):
 
 
 class HandleFitTests(unittest.TestCase):
+    def test_minimum_enclosing_circle_keeps_extreme_body_sample(self):
+        angles = np.linspace(0.0, 2.0 * math.pi, 24, endpoint=False)
+        points = np.column_stack((0.4 * np.cos(angles), 0.4 * np.sin(angles)))
+        points = np.vstack((points, (0.475, 0.0)))
+        center, radius = minimum_enclosing_circle(points)
+        distances = np.linalg.norm(points - center, axis=1)
+        self.assertLessEqual(float(np.max(distances)), radius + 1.0e-10)
+        self.assertGreater(radius, 0.4)
+
+    def test_minimum_enclosing_circle_corrects_section_offset(self):
+        center_expected = np.asarray((0.18, -0.11))
+        angles = np.linspace(0.0, 2.0 * math.pi, 64, endpoint=False)
+        points = center_expected + 0.32 * np.column_stack((np.cos(angles), np.sin(angles)))
+        center, radius = minimum_enclosing_circle(points)
+        np.testing.assert_allclose(center, center_expected, atol=1.0e-9)
+        self.assertAlmostEqual(radius, 0.32, places=9)
+
+    def test_polyline_nearest_returns_local_tangent(self):
+        path = np.asarray(((0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (2.0, 2.0, 0.0)))
+        points = np.asarray(((0.5, 0.3, 0.0), (2.2, 1.5, 0.0)))
+        nearest, tangents, distances = polyline_nearest(points, path)
+        np.testing.assert_allclose(nearest, ((0.5, 0.0, 0.0), (2.0, 1.5, 0.0)))
+        np.testing.assert_allclose(tangents, ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)))
+        np.testing.assert_allclose(distances, (0.3, 0.2))
+
     def test_flat_top_uses_final_support_frame_before_path_fit(self):
         values = surface_marks("flat_top", uneven=True)
         points, normals, supports, support_normals, radius, span, rise, _origin = values

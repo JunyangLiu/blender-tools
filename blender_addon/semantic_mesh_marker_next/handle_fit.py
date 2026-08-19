@@ -129,6 +129,83 @@ def _polyline_distances(points: np.ndarray, path: np.ndarray):
     return result
 
 
+def polyline_nearest(points: np.ndarray, path: np.ndarray):
+    """Return nearest points, unit tangents and distances for a 3D polyline."""
+    values = np.asarray(points, dtype=float)
+    line = np.asarray(path, dtype=float)
+    if values.ndim != 2 or values.shape[1] != 3:
+        raise ValueError("points must be an N by 3 array")
+    if line.ndim != 2 or line.shape[1] != 3 or len(line) < 2:
+        raise ValueError("path must contain at least two 3D points")
+    best_squared = np.full(len(values), np.inf, dtype=float)
+    nearest = np.zeros_like(values)
+    tangents = np.zeros_like(values)
+    for first, second in zip(line[:-1], line[1:]):
+        direction = second - first
+        denominator = float(direction @ direction)
+        if denominator <= EPSILON:
+            continue
+        factor = np.clip(((values - first) @ direction) / denominator, 0.0, 1.0)
+        candidate = first + factor[:, None] * direction
+        squared = np.sum(np.square(values - candidate), axis=1)
+        replace = squared < best_squared
+        best_squared[replace] = squared[replace]
+        nearest[replace] = candidate[replace]
+        tangents[replace] = direction / math.sqrt(denominator)
+    return nearest, tangents, np.sqrt(best_squared)
+
+
+def _circle_from_three(a: np.ndarray, b: np.ndarray, c: np.ndarray):
+    """Circumcircle for three points, or None when they are collinear."""
+    twice_area = 2.0 * float(np.cross(b - a, c - a))
+    if abs(twice_area) <= EPSILON:
+        return None
+    aa, bb, cc = float(a @ a), float(b @ b), float(c @ c)
+    center = np.asarray((
+        (aa * (b[1] - c[1]) + bb * (c[1] - a[1]) + cc * (a[1] - b[1])) / twice_area,
+        (aa * (c[0] - b[0]) + bb * (a[0] - c[0]) + cc * (b[0] - a[0])) / twice_area,
+    ))
+    return center, float(np.linalg.norm(center - a))
+
+
+def minimum_enclosing_circle(points: np.ndarray):
+    """Deterministic smallest circle enclosing finite 2D evidence points.
+
+    A fixed pseudo-random order keeps the expected incremental complexity low
+    while producing byte-for-byte stable results for the same evidence.
+    """
+    values = np.asarray(points, dtype=float)
+    if values.ndim != 2 or values.shape[1] != 2 or not len(values):
+        raise ValueError("points must be a non-empty N by 2 array")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("points must be finite")
+    order = np.random.default_rng(0).permutation(len(values))
+    rows = values[order]
+    center = rows[0].copy()
+    radius = 0.0
+    tolerance = 1.0e-10
+    for i, point in enumerate(rows):
+        if float(np.linalg.norm(point - center)) <= radius + tolerance:
+            continue
+        center, radius = point.copy(), 0.0
+        for j in range(i):
+            other = rows[j]
+            if float(np.linalg.norm(other - center)) <= radius + tolerance:
+                continue
+            center = (point + other) * 0.5
+            radius = float(np.linalg.norm(point - other)) * 0.5
+            for k in range(j):
+                third = rows[k]
+                if float(np.linalg.norm(third - center)) <= radius + tolerance:
+                    continue
+                circle = _circle_from_three(point, other, third)
+                if circle is not None:
+                    center, radius = circle
+    # Numerical guard: never report a radius smaller than an input distance.
+    radius = max(radius, float(np.max(np.linalg.norm(values - center, axis=1))))
+    return center, radius
+
+
 def path_points_2d(path_kind: str, half_span: float, rise: float,
                    corner_radius: float = 0.0, samples: int = 96) -> np.ndarray:
     """Return an endpoint-to-endpoint centerline in the fitted local frame."""
