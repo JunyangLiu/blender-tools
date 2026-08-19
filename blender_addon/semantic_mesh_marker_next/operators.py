@@ -333,6 +333,9 @@ class SMRN_OT_build_handle_candidate(bpy.types.Operator):
             return {"CANCELLED"}
         store_handle_analysis(context.scene, report)
         if candidate is None:
+            request = report.get("evidence_request", {})
+            if request.get("required"):
+                report["reason"] = f"请补标：{request['message']}"
             reason = report.get("reason", "扶手质量门槛未通过")
             context.scene.smrn_handle_summary = f"已拒绝：{reason}"
             _set_status(context.scene, context.scene.smrn_handle_summary)

@@ -27,6 +27,30 @@ from .storage import load_all_marks
 CANDIDATE_PREFIX = "SMRN_HANDLE_CANDIDATE_"
 
 
+def _evidence_request(fit, targets, supports):
+    """Return one compact, actionable request instead of guessing geometry."""
+    if fit.status == "candidate_ready":
+        return {"required": False, "message": "当前证据充足"}
+    missing_green = max(0, 7 - len(targets))
+    green = (
+        f"再补至少 {missing_green} 个绿色管体标记，分布到两腿、两处弯角和顶部"
+        if missing_green else
+        "补充绿色管体标记到证据稀疏的腿部、弯角或顶部"
+    )
+    red = None
+    if len(supports) < 2:
+        red = "若两端安装角度或落点不明确，请在左右安装平面各补 1 个红色标记"
+    message = green if red is None else f"{green}；{red}"
+    return {
+        "required": True,
+        "green": green,
+        "red": red,
+        "message": message,
+        "target_count": len(targets),
+        "support_count": len(supports),
+    }
+
+
 def _world_normal(obj, local_normal):
     value = obj.matrix_world.to_3x3().inverted_safe().transposed() @ Vector(local_normal)
     return value.normalized() if value.length_squared else Vector((0.0, 0.0, 1.0))
@@ -105,7 +129,10 @@ def analyze_scene(scene):
             [item.world_location for item in targets],
             [item.world_normal for item in targets],
         )
-        return fit, None, targets, excludes, {"source": None}
+        return fit, None, targets, excludes, {
+            "source": None,
+            "evidence_request": _evidence_request(fit, targets, excludes),
+        }
     source, snapshot, evidence = _source_for_targets(scene, targets)
     target_values = [_current_anchor(item) for item in targets]
     supports = excludes
@@ -120,6 +147,7 @@ def analyze_scene(scene):
     return fit, source, targets, supports, {
         "source": snapshot,
         "evidence_sources": evidence,
+        "evidence_request": _evidence_request(fit, targets, supports),
     }
 
 
@@ -193,13 +221,18 @@ def _path_vertex_frames(path, plane_normal):
 
 
 def _semantic_handle_faces(targets, path, plane_normal, corridor):
-    """Grow marked tube faces inside a local, orientation-aware corridor.
+    """Grow marked tube faces by local topology from the explicit seeds.
 
     The old handle is welded into the vehicle mesh, so unrestricted connected
-    selection reaches the complete turret.  A face can enter the flood only
-    when it is close to the fitted centerline and its normal is transverse to
-    the local path tangent, as a tube wall must be.
+    selection reaches the complete turret.  This traversal only evaluates
+    neighbours reached from marked faces; it never constructs centers,
+    normals, or a geometric eligibility mask for every face in the vehicle.
+    A reached face enters the flood only when it is close to the fitted
+    centerline and transverse to the local path tangent, as a tube wall must
+    be. BMesh supplies edge links, while geometric work remains local.
     """
+    import bmesh
+
     seeds_by_object = {}
     for record in targets:
         source = _evidence_object(record)
@@ -208,49 +241,63 @@ def _semantic_handle_faces(targets, path, plane_normal, corridor):
     diagnostics = []
     for object_name, seeds in seeds_by_object.items():
         source = bpy.data.objects.get(object_name)
-        polygons = source.data.polygons
-        centers = np.asarray([
-            tuple(source.matrix_world @ polygon.center) for polygon in polygons
-        ], dtype=float)
-        normals = np.asarray([
-            tuple(_world_normal(source, polygon.normal)) for polygon in polygons
-        ], dtype=float)
-        _nearest, tangents, distances = polyline_nearest(centers, path)
-        transverse = np.abs(np.sum(normals * tangents, axis=1)) <= 0.62
-        eligible = (distances <= corridor) & transverse
-        # Always allow the explicit seeds to start the local growth. Neighbours
-        # still have to satisfy the tube-wall gate.
-        edge_faces = {}
-        for face_index in np.flatnonzero(eligible):
-            for edge in polygons[int(face_index)].edge_keys:
-                edge_faces.setdefault(tuple(edge), []).append(int(face_index))
-        accepted = set()
-        queue = []
-        for seed in seeds:
-            if not 0 <= seed < len(polygons):
-                continue
-            accepted.add(seed)
-            queue.extend(
-                adjacent
-                for edge in polygons[seed].edge_keys
-                for adjacent in edge_faces.get(tuple(edge), ())
-            )
-        while queue:
-            face_index = queue.pop()
-            if face_index in accepted or not eligible[face_index]:
-                continue
-            accepted.add(face_index)
-            for edge in polygons[face_index].edge_keys:
-                queue.extend(edge_faces.get(tuple(edge), ()))
-        result[object_name] = accepted
-        diagnostics.append({
-            "object": object_name,
-            "seed_faces": len(seeds),
-            "expanded_faces": len(accepted),
-            "eligible_faces": int(np.sum(eligible)),
-            "corridor": float(corridor),
-            "normal_tangent_limit": 0.62,
-        })
+        if source is None or source.type != "MESH":
+            continue
+        mesh_face_count = len(source.data.polygons)
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(source.data)
+            bm.faces.ensure_lookup_table()
+            accepted = set()
+            visited = set()
+            queued = set()
+            queue = []
+            for seed in seeds:
+                if not 0 <= seed < len(bm.faces):
+                    continue
+                accepted.add(seed)
+                for edge in bm.faces[seed].edges:
+                    for adjacent in edge.link_faces:
+                        index = int(adjacent.index)
+                        if index not in accepted and index not in queued:
+                            queue.append(adjacent)
+                            queued.add(index)
+            while queue:
+                face = queue.pop()
+                face_index = int(face.index)
+                queued.discard(face_index)
+                if face_index in accepted or face_index in visited:
+                    continue
+                visited.add(face_index)
+                center = source.matrix_world @ face.calc_center_median()
+                normal = _world_normal(source, face.normal)
+                _nearest, tangents, distances = polyline_nearest(
+                    np.asarray([tuple(center)], dtype=float), path
+                )
+                transverse = abs(float(np.dot(tuple(normal), tangents[0]))) <= 0.62
+                if float(distances[0]) > corridor or not transverse:
+                    continue
+                accepted.add(face_index)
+                for edge in face.edges:
+                    for adjacent in edge.link_faces:
+                        index = int(adjacent.index)
+                        if index not in accepted and index not in visited and index not in queued:
+                            queue.append(adjacent)
+                            queued.add(index)
+            result[object_name] = accepted
+            diagnostics.append({
+                "object": object_name,
+                "seed_faces": len(seeds),
+                "expanded_faces": len(accepted),
+                "locally_tested_faces": len(visited),
+                "object_faces": mesh_face_count,
+                "tested_ratio": len(visited) / max(1, mesh_face_count),
+                "global_geometry_scan": False,
+                "corridor": float(corridor),
+                "normal_tangent_limit": 0.62,
+            })
+        finally:
+            bm.free()
     return result, diagnostics
 
 
@@ -520,6 +567,11 @@ def _commit_candidate(scene, obj):
     key = "smrn_handle_candidate_name"
     old_name = str(scene.get(key, ""))
     old_obj = bpy.data.objects.get(old_name)
+    # Accepted objects are immutable baselines. Even a stale scene pointer must
+    # never make a future build treat one as a disposable working candidate.
+    if old_obj is not None and bool(old_obj.get("smrn_accepted", False)):
+        old_obj = None
+        old_name = ""
     source = bpy.data.objects.get(str(obj.get("smrn_source_name", "")))
     try:
         keep_model_visible(scene, (source,))
@@ -698,6 +750,12 @@ def build_scene_candidate(scene):
         report.update({
             "status": "rejected",
             "reason": "topology and orientation gates found too little complete tube-wall evidence",
+            "evidence_request": {
+                "required": True,
+                "green": "沿缺失的腿部、弯角或顶部补充绿色管体标记",
+                "red": "若端部安装面仍不明确，在左右安装平面各补 1 个红色标记",
+                "message": "局部管体证据不足：补绿色路径标记；端部角度不明确时再补左右红色安装平面",
+            },
             "semantic_expansion": semantic_diagnostics,
         })
         return None, report

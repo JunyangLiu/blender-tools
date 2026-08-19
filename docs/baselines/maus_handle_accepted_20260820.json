@@ -1,0 +1,35 @@
+{
+  "schema": "smrn.accepted-handle-baseline.v1",
+  "accepted_object": "SMRN_HANDLE_ACCEPTED_MAUS_20260819T184509Z",
+  "accepted_commit": "7a792c6",
+  "geometry_sha256": "84235613c4b5b3860b4d58e3c04d68fc83060487dc08c2f5f05b7367c29a9638",
+  "archive_blend": "C:/codex_auto/semantic_mesh_restorer_maus_turret/archives/maus_handle_accepted_20260820.blend",
+  "working_blend": "C:/codex_auto/semantic_mesh_restorer_maus_turret/maus_turret_rear_two_chairs_component_rigid_working.blend",
+  "topology": {
+    "vertices": 1440,
+    "faces": 1426,
+    "edges": 2864,
+    "boundary_or_nonmanifold_edges": 0
+  },
+  "coverage": {
+    "semantic_faces": 190,
+    "dense_samples": 2850,
+    "outside_samples": 0,
+    "outside_area": 0.0
+  },
+  "local_search_regression": {
+    "exact_geometry_match": true,
+    "turret_tested_faces": 110,
+    "turret_total_faces": 51426,
+    "source_tested_faces": 110,
+    "source_total_faces": 183380,
+    "global_geometry_scan": false
+  },
+  "protection": {
+    "accepted_collection": "SMRN_已确认修复_始终可见",
+    "accepted_flag": true,
+    "locked_baseline": true,
+    "working_candidate_pointer_cleared": true,
+    "future_candidate_replacement_guard": true
+  }
+}
