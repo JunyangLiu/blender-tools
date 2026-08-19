@@ -1,0 +1,5 @@
+interface:
+  display_name: "语义标记 Next"
+  short_description: "Refactor Blender semantic surface marking"
+  default_prompt: "Use $semantic-marking-next to migrate or verify non-destructive Blender target and exclude marking."
+

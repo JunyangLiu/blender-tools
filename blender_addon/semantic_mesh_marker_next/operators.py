@@ -1,0 +1,219 @@
+import uuid
+
+import bpy
+
+from .constants import (
+    EXCLUDE_COLOR,
+    EXCLUDE_ROLE,
+    MARK_PREFIX,
+    MODAL_TOKEN_KEY,
+    TARGET_COLOR,
+    TARGET_ROLE,
+)
+from .overlay import create_surface_overlay, remove_overlay
+from .raycast import magnetic_scene_hit
+from .records import MarkRecord, next_mark_id, role_counts
+from .scene_state import (
+    ensure_scene_roots,
+    keep_model_visible,
+    load_marks,
+    save_marks,
+    set_helpers_hidden,
+    set_source,
+    visible_meshes,
+)
+
+
+def _set_status(scene, text):
+    scene.smrn_status = text
+
+
+class SMRN_OT_setup_source(bpy.types.Operator):
+    bl_idname = "smrn.setup_source"
+    bl_label = "设为当前语义源"
+    bl_description = "将选中网格放入当前模型集合；不复制、不隐藏、不修改网格"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        source = context.active_object
+        if source is None or source.type != "MESH":
+            self.report({"ERROR"}, "请先选择一个网格对象")
+            return {"CANCELLED"}
+        set_source(context.scene, source)
+        _set_status(context.scene, f"当前语义源：{source.name}；源模型保持可见且未修改。")
+        return {"FINISHED"}
+
+
+class SMRN_OT_mark_surface(bpy.types.Operator):
+    bl_idname = "smrn.mark_surface"
+    bl_label = "语义表面标记"
+    bl_description = "在所有可见网格的最前方表面建立非破坏式目标或排除标记"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mark_value: bpy.props.IntProperty(default=1)
+
+    def _finish(self, context):
+        if context.scene.get(MODAL_TOKEN_KEY, "") == getattr(self, "_token", ""):
+            context.scene[MODAL_TOKEN_KEY] = ""
+        context.window.cursor_modal_restore()
+        counts = role_counts(load_marks(context.scene))
+        _set_status(context.scene, f"标记结束：目标 {counts['target']}，排除 {counts['exclude']}。")
+
+    def _click(self, context, event):
+        x = event.mouse_x - self._window_region.x
+        y = event.mouse_y - self._window_region.y
+        if not (0 <= x < self._window_region.width and 0 <= y < self._window_region.height):
+            return
+        hit = magnetic_scene_hit(
+            context,
+            self._window_region,
+            self._region_3d,
+            (x, y),
+            context.scene.smrn_magnetic_radius_px,
+        )
+        if hit is None:
+            _set_status(context.scene, "未找到可见表面；请靠近零件点击或增大磁吸半径。")
+            return
+        records = load_marks(context.scene)
+        number = next_mark_id(records)
+        role = TARGET_ROLE if self.mark_value == 1 else EXCLUDE_ROLE
+        color = TARGET_COLOR if role == TARGET_ROLE else EXCLUDE_COLOR
+        name = f"{MARK_PREFIX}{number:04d}_{role.upper()}"
+        try:
+            _overlay, surface_offset, stored_normal = create_surface_overlay(
+                context, name, hit, color, context.scene.smrn_marker_size
+            )
+        except RuntimeError as error:
+            self.report({"ERROR"}, str(error))
+            return
+        records.append(
+            MarkRecord(
+                id=number,
+                role=role,
+                overlay_object_name=name,
+                hit_object_name=hit["hit_object_name"],
+                source_object_name=hit["source_object_name"],
+                face_index=hit["face_index"],
+                world_location=tuple(hit["world_location"]),
+                world_normal=tuple(stored_normal),
+                screen_offset_px=hit["screen_offset_px"],
+                surface_offset=surface_offset,
+            )
+        )
+        save_marks(context.scene, records)
+        _set_status(
+            context.scene,
+            f"已标记 {hit['hit_object_name']} 面 {hit['face_index']}；磁吸偏移 {hit['screen_offset_px']:.1f}px。",
+        )
+
+    def invoke(self, context, event):
+        if context.area is None or context.area.type != "VIEW_3D":
+            self.report({"ERROR"}, "请从 3D 视图侧栏启动标记")
+            return {"CANCELLED"}
+        meshes = visible_meshes(context)
+        if not meshes:
+            self.report({"ERROR"}, "当前视图没有可见网格")
+            return {"CANCELLED"}
+        self._window_region = next((region for region in context.area.regions if region.type == "WINDOW"), None)
+        self._ui_region = next((region for region in context.area.regions if region.type == "UI"), None)
+        if self._window_region is None:
+            self.report({"ERROR"}, "找不到 3D 视图窗口")
+            return {"CANCELLED"}
+        self._region_3d = context.space_data.region_3d
+        self._token = uuid.uuid4().hex
+        context.scene[MODAL_TOKEN_KEY] = self._token
+        context.window.cursor_modal_set("PAINT_BRUSH")
+        context.window_manager.modal_handler_add(self)
+        _set_status(context.scene, f"标记已启动：检测 {len(meshes)} 个可见网格；左键标记，Z 撤销，右键结束。")
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if context.scene.get(MODAL_TOKEN_KEY, "") != getattr(self, "_token", ""):
+            self._finish(context)
+            return {"FINISHED"}
+        if event.type == "Z" and event.value == "PRESS":
+            bpy.ops.smrn.undo_mark()
+            return {"RUNNING_MODAL"}
+        if event.type in {"RET", "NUMPAD_ENTER", "RIGHTMOUSE", "ESC"} and event.value == "PRESS":
+            self._finish(context)
+            return {"FINISHED"}
+        if event.type == "LEFTMOUSE" and event.value == "PRESS":
+            over_sidebar = self._ui_region is not None and (
+                self._ui_region.x <= event.mouse_x < self._ui_region.x + self._ui_region.width
+                and self._ui_region.y <= event.mouse_y < self._ui_region.y + self._ui_region.height
+            )
+            if over_sidebar:
+                self._finish(context)
+                return {"FINISHED"}
+            self._click(context, event)
+            return {"RUNNING_MODAL"}
+        return {"PASS_THROUGH"}
+
+
+class SMRN_OT_undo_mark(bpy.types.Operator):
+    bl_idname = "smrn.undo_mark"
+    bl_label = "撤销上一标记"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        records = load_marks(context.scene)
+        if not records:
+            self.report({"WARNING"}, "没有可撤销的标记")
+            return {"CANCELLED"}
+        record = records.pop()
+        remove_overlay(record.overlay_object_name)
+        save_marks(context.scene, records)
+        _set_status(context.scene, f"已撤销标记 {record.id}；剩余 {len(records)} 个。")
+        return {"FINISHED"}
+
+
+class SMRN_OT_clear_marks(bpy.types.Operator):
+    bl_idname = "smrn.clear_marks"
+    bl_label = "清空全部标记"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        for record in load_marks(context.scene):
+            remove_overlay(record.overlay_object_name)
+        for candidate in tuple(bpy.data.objects):
+            if candidate.name.startswith(MARK_PREFIX):
+                remove_overlay(candidate.name)
+        save_marks(context.scene, [])
+        keep_model_visible(context.scene)
+        _set_status(context.scene, "全部语义标记已清除；源模型未修改并保持可见。")
+        return {"FINISHED"}
+
+
+class SMRN_OT_toggle_helpers(bpy.types.Operator):
+    bl_idname = "smrn.toggle_helpers"
+    bl_label = "显示/隐藏标记辅助"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        _model, _candidates, helpers = ensure_scene_roots(context.scene)
+        hidden = not helpers.hide_viewport
+        set_helpers_hidden(context.scene, hidden)
+        _set_status(context.scene, "标记辅助已隐藏；当前模型保持可见。" if hidden else "标记辅助已显示。")
+        context.view_layer.update()
+        return {"FINISHED"}
+
+
+class SMRN_OT_stop_marking(bpy.types.Operator):
+    bl_idname = "smrn.stop_marking"
+    bl_label = "退出标记 / 恢复普通选择"
+
+    def execute(self, context):
+        context.scene[MODAL_TOKEN_KEY] = ""
+        keep_model_visible(context.scene)
+        _set_status(context.scene, "已退出标记模式；普通选择已恢复。")
+        return {"FINISHED"}
+
+
+CLASSES = (
+    SMRN_OT_setup_source,
+    SMRN_OT_mark_surface,
+    SMRN_OT_undo_mark,
+    SMRN_OT_clear_marks,
+    SMRN_OT_toggle_helpers,
+    SMRN_OT_stop_marking,
+)
