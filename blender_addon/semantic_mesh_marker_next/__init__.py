@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Semantic Mesh Marker Next",
     "author": "Local developer",
-    "version": (0, 4, 2),
+    "version": (0, 4, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > 语义标记 Next",
     "description": "Non-destructive target and exclude surface marking",
@@ -27,6 +27,11 @@ def register():
         min=0.0001,
         max=10.0,
         precision=4,
+    )
+    bpy.types.Scene.smrn_show_advanced = bpy.props.BoolProperty(
+        name="高级设置",
+        description="显示不常用的拟合与诊断参数",
+        default=False,
     )
     bpy.types.Scene.smrn_magnetic_radius_px = bpy.props.IntProperty(
         name="磁吸半径",
@@ -83,6 +88,7 @@ def unregister():
         "smrn_rotational_summary", "smrn_rotational_clearance",
         "smrn_rotational_thickness", "smrn_rotational_segments",
         "smrn_status", "smrn_magnetic_radius_px", "smrn_marker_size",
+        "smrn_show_advanced",
     ):
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)

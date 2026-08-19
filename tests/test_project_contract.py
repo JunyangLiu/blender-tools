@@ -27,6 +27,18 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("marks_summary(scene)", panel)
         self.assertNotIn("load_marks(scene)", panel)
 
+    def test_panel_defaults_to_one_click_workflow(self):
+        panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
+        addon = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn('text="一键生成圆润候选"', panel)
+        self.assertIn('text="一键生成扶手候选"', panel)
+        self.assertIn("if scene.smrn_show_advanced:", panel)
+        self.assertIn('bpy.types.Scene.smrn_show_advanced = bpy.props.BoolProperty(', addon)
+        self.assertIn("default=False", addon)
+        advanced_section = panel.split("if scene.smrn_show_advanced:", 1)[1]
+        self.assertIn('prop(scene, "smrn_rotational_segments"', advanced_section)
+        self.assertIn('prop(scene, "smrn_handle_path_segments"', advanced_section)
+
     def test_chunked_versioned_storage_exists(self):
         storage = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "storage.py").read_text(encoding="utf-8")
         self.assertIn('DOCUMENT_KEY = "smrn_document_json"', storage)
