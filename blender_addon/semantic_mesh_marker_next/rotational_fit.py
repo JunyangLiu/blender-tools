@@ -215,6 +215,113 @@ def _angle_interval(angles: np.ndarray) -> tuple[float, float, float, str]:
     return start, (2.0 * math.pi if full else span), largest_gap, ("full_rotation" if full else "partial_arc")
 
 
+def _fit_sparse_circumference(points: np.ndarray, normals: np.ndarray,
+                              thresholds: FitThresholds):
+    """Fit a broad, axially narrow ring without letting its axis tilt away."""
+    if len(points) < 6:
+        return None
+    origin = np.mean(points, axis=0)
+    centered = points - origin
+    values, vectors = np.linalg.eigh(centered.T @ centered)
+    order = np.argsort(values)
+    smallest, middle, largest = (float(values[index]) for index in order)
+    if largest <= EPSILON:
+        return None
+    # This path is only for a well-spread ring in one source-derived plane.
+    if math.sqrt(max(smallest, 0.0) / max(middle, EPSILON)) > 0.22:
+        return None
+    if math.sqrt(max(middle, 0.0) / largest) < 0.42:
+        return None
+    axis = _canonical_axis(vectors[:, order[0]])
+    if axis is None:
+        return None
+    basis_x, basis_y = _basis(axis)
+    plane = np.column_stack((centered @ basis_x, centered @ basis_y))
+    circle_design = np.column_stack((2.0 * plane[:, 0], 2.0 * plane[:, 1], np.ones(len(points))))
+    circle_values = np.sum(np.square(plane), axis=1)
+    circle, _residuals, rank, singular = np.linalg.lstsq(circle_design, circle_values, rcond=None)
+    if rank < 3:
+        return None
+    center_2d = circle[:2]
+    radius_squared = float(circle[2] + center_2d @ center_2d)
+    if radius_squared <= EPSILON:
+        return None
+    radius = math.sqrt(radius_squared)
+    radial_2d = plane - center_2d
+    radial_size = np.linalg.norm(radial_2d, axis=1)
+    geometry_direction_2d = radial_2d / np.maximum(radial_size[:, None], EPSILON)
+    angles = np.arctan2(geometry_direction_2d[:, 1], geometry_direction_2d[:, 0])
+    start, span, largest_gap, coverage_mode = _angle_interval(angles)
+    # A broad partial circumference still determines its circle plane and
+    # center reliably, but it must remain partial instead of inventing the
+    # unmarked closing sector.
+    if coverage_mode != "full_rotation" and span < math.radians(180.0):
+        return None
+
+    unit_normals = normals / np.maximum(np.linalg.norm(normals, axis=1)[:, None], EPSILON)
+    normal_axial = unit_normals @ axis
+    normal_radial_3d = unit_normals - normal_axial[:, None] * axis
+    normal_radial_length = np.linalg.norm(normal_radial_3d, axis=1)
+    if float(np.quantile(normal_radial_length, 0.25)) < 0.30:
+        return None
+    geometry_direction_3d = (
+        geometry_direction_2d[:, 0, None] * basis_x
+        + geometry_direction_2d[:, 1, None] * basis_y
+    )
+    radial_alignment = np.sum(normal_radial_3d * geometry_direction_3d, axis=1)
+    orientation = 1.0 if float(np.median(radial_alignment)) >= 0.0 else -1.0
+    if float(np.quantile(np.abs(radial_alignment) / normal_radial_length, 0.25)) < 0.72:
+        return None
+    slope_samples = -normal_axial / np.maximum(normal_radial_length, EPSILON)
+    signed_slope = float(np.median(slope_samples))
+    slope_deviation = float(np.quantile(np.abs(slope_samples - signed_slope), 0.90))
+    if slope_deviation > max(0.08, abs(signed_slope) * 0.20):
+        return None
+    cone = abs(signed_slope) >= 0.04
+    if not cone:
+        signed_slope = 0.0
+    predicted = orientation * geometry_direction_3d - signed_slope * axis
+    predicted /= np.maximum(np.linalg.norm(predicted, axis=1)[:, None], EPSILON)
+    normal_error = np.degrees(np.arccos(np.clip(
+        np.sum(predicted * unit_normals, axis=1), -1.0, 1.0
+    )))
+    radial_residual = np.abs(radial_size - radius)
+    p50 = float(np.quantile(radial_residual, 0.50))
+    p90 = float(np.quantile(radial_residual, 0.90))
+    relative_p90 = p90 / max(radius, EPSILON)
+    normal_p90 = float(np.quantile(normal_error, 0.90))
+    condition = float("inf") if singular[-1] <= EPSILON else float(singular[0] / singular[-1])
+    score = relative_p90 + normal_p90 / 90.0 + math.log1p(condition) / 40.0
+    axial = centered @ axis
+    center_world = origin + center_2d[0] * basis_x + center_2d[1] * basis_y
+    return {
+        "cone": cone,
+        "solution": np.asarray((center_2d[0], center_2d[1], orientation * radius, signed_slope)),
+        "residual": radial_residual,
+        "condition": condition,
+        "p50": p50,
+        "p90": p90,
+        "relative_p90": relative_p90,
+        "normal_p90": normal_p90,
+        "score": score,
+        "start": start,
+        "span": span,
+        "largest_gap": largest_gap,
+        "coverage_mode": coverage_mode,
+        "center_2d": center_2d,
+        "normal_constrained": cone,
+        "normal_slope_deviation": slope_deviation,
+        "axis": axis,
+        "origin": center_world,
+        "basis_x": basis_x,
+        "basis_y": basis_y,
+        "signed_radius": orientation * radius,
+        "signed_slope": signed_slope,
+        "axial_min": float(np.min(axial)),
+        "axial_max": float(np.max(axial)),
+    }
+
+
 def _fit_one_axis(axis: np.ndarray, points: np.ndarray, normals: np.ndarray,
                   thresholds: FitThresholds):
     origin = np.mean(points, axis=0)
@@ -240,7 +347,42 @@ def _fit_one_axis(axis: np.ndarray, points: np.ndarray, normals: np.ndarray,
         solution, residual, rank, condition = _robust_linear(
             design, values, len(points), thresholds.huber_iterations
         )
+        normal_constrained = False
+        normal_slope_deviation = float("inf")
         expected_rank = 4 if cone else 3
+        if cone:
+            # A complete marked circumference can be axially narrow: its
+            # points determine the axis/circle while its normals determine the
+            # local cone slope.  A free four-parameter cone is rank-deficient
+            # in that case and used to drift onto an oblique false axis.
+            radial_scale = max(
+                float(np.median(np.linalg.norm(
+                    plane_points - np.mean(plane_points, axis=0), axis=1
+                ))), EPSILON
+            )
+            slope_samples = -normal_axial / np.maximum(radial_length, EPSILON)
+            normal_slope = float(np.median(slope_samples))
+            normal_slope_deviation = float(np.quantile(
+                np.abs(slope_samples - normal_slope), 0.90
+            ))
+            slope_limit = max(0.08, abs(normal_slope) * 0.20)
+            if (
+                float(np.ptp(axial)) / radial_scale < thresholds.cone_minimum_axial_ratio
+                and abs(normal_slope) >= 0.04
+                and normal_slope_deviation <= slope_limit
+            ):
+                design, adjusted = _design(directions, axial, False)
+                corrected = plane_points - (
+                    normal_slope * axial[:, None] * directions
+                )
+                adjusted[0::2] = corrected[:, 0]
+                adjusted[1::2] = corrected[:, 1]
+                fixed, residual, rank, condition = _robust_linear(
+                    design, adjusted, len(points), thresholds.huber_iterations
+                )
+                solution = np.r_[fixed, normal_slope]
+                expected_rank = 3
+                normal_constrained = True
         if rank < expected_rank:
             continue
         signed_radius = float(solution[2])
@@ -277,6 +419,8 @@ def _fit_one_axis(axis: np.ndarray, points: np.ndarray, normals: np.ndarray,
             "score": score, "start": start, "span": span,
             "largest_gap": largest_gap, "coverage_mode": coverage_mode,
             "center_2d": center_2d,
+            "normal_constrained": normal_constrained,
+            "normal_slope_deviation": normal_slope_deviation,
         })
     if not fits:
         return None
@@ -289,11 +433,18 @@ def _fit_one_axis(axis: np.ndarray, points: np.ndarray, normals: np.ndarray,
         improvement = (cylinder["score"] - cone["score"]) / max(cylinder["score"], EPSILON)
         profile_change = abs(float(cone["solution"][3])) * axial_span
         noise = max(cone["p90"], EPSILON)
-        cone_supported = (
+        standard_cone_supported = (
             axial_span / radius >= thresholds.cone_minimum_axial_ratio
             and improvement >= thresholds.cone_minimum_improvement
             and profile_change >= 2.5 * noise
         )
+        circumference_cone_supported = (
+            cone["normal_constrained"]
+            and cone["coverage_mode"] == "full_rotation"
+            and improvement >= thresholds.cone_minimum_improvement
+            and cone["normal_p90"] <= thresholds.maximum_normal_p90_degrees
+        )
+        cone_supported = standard_cone_supported or circumference_cone_supported
         chosen = cone if cone_supported else cylinder
 
     center_world = origin + chosen["center_2d"][0] * basis_x + chosen["center_2d"][1] * basis_y
@@ -328,6 +479,9 @@ def fit_rotational_surface(points: Iterable[Iterable[float]], normals: Iterable[
             _fit_one_axis(axis, point_rows, normal_rows, thresholds) for axis in axes
         ) if fit is not None
     ]
+    circumference = _fit_sparse_circumference(point_rows, normal_rows, thresholds)
+    if circumference is not None:
+        fits.append(circumference)
     if not fits:
         return _failed("标记法线不足以建立稳定旋转轴", len(point_rows))
     best = min(fits, key=lambda item: item["score"])

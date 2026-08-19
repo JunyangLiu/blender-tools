@@ -80,14 +80,33 @@ def semantic_source_object(obj):
     return source if source is not None and source.type == "MESH" else obj
 
 
-def keep_model_visible(scene):
+def keep_model_visible(scene, required_objects=()):
     model, _candidates, _helpers = ensure_scene_roots(scene)
     model.hide_viewport = False
     model.hide_render = False
-    for obj in model.all_objects:
-        obj.hide_viewport = False
-        obj.hide_render = False
-        obj.hide_set(False)
+    # The complete model must remain in context. Blender can briefly expose a
+    # stale/None RNA entry here immediately after an object is unlinked, so
+    # recursive visibility restoration must be defensive.
+    try:
+        objects = list(model.all_objects)
+    except ReferenceError:
+        objects = list(model.objects)
+    source = bpy.data.objects.get(str(scene.get(SOURCE_NAME_KEY, "")))
+    if source is not None and source not in objects:
+        objects.append(source)
+    for required in required_objects:
+        if required is not None and required not in objects:
+            objects.append(required)
+    for obj in objects:
+        if obj is None:
+            continue
+        try:
+            obj.hide_viewport = False
+            obj.hide_render = False
+            obj.hide_set(False)
+        except (AttributeError, ReferenceError):
+            # A stale dependency-graph reference must not abort construction.
+            continue
 
 
 def set_helpers_hidden(scene, hidden):

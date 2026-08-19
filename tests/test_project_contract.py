@@ -35,8 +35,18 @@ class ProjectContractTests(unittest.TestCase):
     def test_rotational_feature_stays_non_destructive(self):
         adapter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "rotational_blender.py").read_text(encoding="utf-8")
         self.assertIn('CANDIDATE_PREFIX = "SMRN_ROTATIONAL_CANDIDATE_"', adapter)
+        self.assertIn("_commit_candidate(scene, obj)", adapter)
+        self.assertNotIn("remove_last_candidate(scene)\n    _model, candidates", adapter)
         self.assertIn("source_unchanged", (ROOT / "scripts" / "live_build_gate_test.py").read_text(encoding="utf-8"))
         self.assertNotIn("bpy.ops.object.delete", adapter)
+
+    def test_visibility_guard_skips_stale_recursive_objects(self):
+        scene_state = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "scene_state.py").read_text(encoding="utf-8")
+        visibility = scene_state.split("def keep_model_visible", 1)[1].split("def set_helpers_hidden", 1)[0]
+        self.assertIn("list(model.all_objects)", visibility)
+        self.assertIn("if obj is None", visibility)
+        self.assertIn("required_objects", visibility)
+        self.assertIn("except (AttributeError, ReferenceError)", visibility)
 
     def test_rotational_axis_candidates_are_data_derived(self):
         fitter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "rotational_fit.py").read_text(encoding="utf-8")

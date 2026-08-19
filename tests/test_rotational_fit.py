@@ -91,6 +91,25 @@ class RotationalFitTests(unittest.TestCase):
         self.assertEqual(fit.status, "candidate_ready", fit.reason)
         self.assertEqual(fit.coverage_mode, "full_rotation")
 
+    def test_sparse_circumference_uses_point_plane_axis_and_normal_slope(self):
+        expected_axis, x, y = basis((0.37, -0.51, 0.776))
+        origin = np.array((11.0, -7.0, 3.5))
+        radius = 5.8
+        slope = -0.82
+        points, normals = [], []
+        for index, angle in enumerate(np.radians((-166, -104, -43, 18, 81, 142))):
+            axial = (index - 2.5) * 0.012
+            radial = math.cos(angle) * x + math.sin(angle) * y
+            points.append(origin + axial * expected_axis + (radius + slope * axial) * radial)
+            normal = radial - slope * expected_axis
+            normals.append(normal / np.linalg.norm(normal))
+        fit = ROTATIONAL.fit_rotational_surface(points, normals)
+        self.assertEqual(fit.status, "candidate_ready", fit.reason)
+        self.assertEqual(fit.profile_kind, "cone")
+        self.assertEqual(fit.coverage_mode, "full_rotation")
+        self.assertGreater(abs(np.dot(fit.axis, expected_axis)), 0.995)
+        self.assertAlmostEqual(fit.signed_slope, slope, delta=0.04)
+
     def test_planar_strip_is_rejected_instead_of_inventing_large_radius(self):
         points = []
         normals = []

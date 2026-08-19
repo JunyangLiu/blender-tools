@@ -278,14 +278,39 @@ def remove_last_candidate(scene):
     name = str(scene.get("smrn_rotational_candidate_name", ""))
     obj = bpy.data.objects.get(name)
     if obj is None or not name.startswith(CANDIDATE_PREFIX):
+        if name.startswith(CANDIDATE_PREFIX):
+            scene["smrn_rotational_candidate_name"] = ""
         return False
-    mesh = obj.data
-    bpy.data.objects.remove(obj, do_unlink=True)
-    if mesh.users == 0:
-        bpy.data.meshes.remove(mesh)
+    source = bpy.data.objects.get(str(obj.get("smrn_source_name", "")))
+    _remove_candidate_object(obj)
     scene["smrn_rotational_candidate_name"] = ""
-    keep_model_visible(scene)
+    keep_model_visible(scene, (source,))
     return True
+
+
+def _remove_candidate_object(obj):
+    mesh = obj.data if obj is not None and obj.type == "MESH" else None
+    if obj is not None:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh is not None and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
+def _commit_candidate(scene, obj):
+    """Finalize a new candidate before discarding the previous working one."""
+    key = "smrn_rotational_candidate_name"
+    old_name = str(scene.get(key, ""))
+    old_obj = bpy.data.objects.get(old_name)
+    source = bpy.data.objects.get(str(obj.get("smrn_source_name", "")))
+    try:
+        keep_model_visible(scene, (source,))
+    except Exception:
+        _remove_candidate_object(obj)
+        scene[key] = old_name if old_obj is not None else ""
+        raise
+    if old_obj is not None and old_obj != obj and old_name.startswith(CANDIDATE_PREFIX):
+        _remove_candidate_object(old_obj)
+    scene[key] = obj.name
 
 
 def build_scene_candidate(scene):
@@ -333,7 +358,6 @@ def build_scene_candidate(scene):
 
     checkpoint = _checkpoint(scene, source)
     report["checkpoint"] = checkpoint
-    remove_last_candidate(scene)
     _model, candidates, _helpers = ensure_scene_roots(scene)
     mesh = bpy.data.meshes.new(f"{CANDIDATE_PREFIX}MESH")
     mesh.from_pydata(vertices, [], faces)
@@ -347,9 +371,8 @@ def build_scene_candidate(scene):
     obj["smrn_candidate_only"] = True
     obj["smrn_source_name"] = source.name
     obj["smrn_rotational_report_json"] = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
-    scene["smrn_rotational_candidate_name"] = obj.name
+    _commit_candidate(scene, obj)
     scene["smrn_rotational_last_report_json"] = obj["smrn_rotational_report_json"]
-    keep_model_visible(scene)
     return obj, report
 
 
