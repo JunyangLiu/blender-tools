@@ -96,6 +96,19 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn('"uncovered": uncovered', adapter)
         self.assertTrue((ROOT / "scripts" / "live_handle_build_gate_test.py").is_file())
 
+    def test_candidate_confirmation_and_local_thickness_workflow(self):
+        operators = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "operators.py").read_text(encoding="utf-8")
+        panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
+        adapter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "handle_blender.py").read_text(encoding="utf-8")
+        self.assertIn('bl_idname = "smrn.confirm_candidate"', operators)
+        self.assertIn('clear_task_marks(context.scene)', operators)
+        self.assertIn('obj["smrn_accepted"] = True', operators)
+        self.assertIn('bpy.ops.wm.save_mainfile()', operators)
+        self.assertIn('text="确认并清除标记"', panel)
+        self.assertIn('text="粗细（1.00 = 刚好覆盖）"', panel)
+        self.assertIn('def adjust_candidate_thickness(scene):', adapter)
+        self.assertIn('"model_rescanned": False', adapter)
+
 
 if __name__ == "__main__":
     unittest.main()

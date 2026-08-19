@@ -60,6 +60,8 @@ class SMRN_PT_marking(bpy.types.Panel):
             icon="MESH_CYLINDER",
         )
         if _candidate_exists(scene, "smrn_rotational_candidate_name", "SMRN_ROTATIONAL_CANDIDATE_"):
+            confirm = rotational.operator("smrn.confirm_candidate", text="确认并清除标记", icon="CHECKMARK")
+            confirm.candidate_kind = "rotational"
             rotational.operator("smrn.remove_rotational_candidate", text="移除当前圆润候选", icon="TRASH")
 
         handle = layout.box()
@@ -71,6 +73,10 @@ class SMRN_PT_marking(bpy.types.Panel):
             icon="MESH_TORUS",
         )
         if _candidate_exists(scene, "smrn_handle_candidate_name", "SMRN_HANDLE_CANDIDATE_"):
+            handle.prop(scene, "smrn_handle_thickness_scale", text="粗细（1.00 = 刚好覆盖）", slider=True)
+            handle.operator("smrn.adjust_handle_thickness", text="应用粗细（不扫描模型）", icon="MOD_SOLIDIFY")
+            confirm = handle.operator("smrn.confirm_candidate", text="确认并清除标记", icon="CHECKMARK")
+            confirm.candidate_kind = "handle"
             handle.operator("smrn.remove_handle_candidate", text="移除当前扶手候选", icon="TRASH")
 
         advanced = layout.box()

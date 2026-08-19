@@ -591,6 +591,73 @@ def remove_last_candidate(scene):
     return True
 
 
+def adjust_candidate_thickness(scene):
+    """Resize only the current unaccepted handle tube; never rescan the model."""
+    name = str(scene.get("smrn_handle_candidate_name", ""))
+    obj = bpy.data.objects.get(name)
+    if obj is None or not name.startswith(CANDIDATE_PREFIX):
+        raise ValueError("没有可调整的扶手候选")
+    if bool(obj.get("smrn_accepted", False)):
+        raise ValueError("已确认扶手受保护，不能再调整")
+    try:
+        report = json.loads(str(obj.get("smrn_handle_report_json", "{}")))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("当前候选缺少可靠的生成报告") from error
+    if report.get("status") != "candidate_ready":
+        raise ValueError("当前候选尚未通过生成质量门槛")
+
+    sides = int(obj.get("smrn_handle_section_segments", scene.smrn_handle_section_segments))
+    vertex_count = len(obj.data.vertices)
+    if sides < 8 or vertex_count < sides * 2 or vertex_count % sides:
+        raise ValueError("当前候选的截面结构不可安全调整")
+    target_scale = max(1.0, float(scene.smrn_handle_thickness_scale))
+    current_scale = max(1.0, float(obj.get("smrn_handle_thickness_scale", 1.0)))
+    ratio = target_scale / current_scale
+    if abs(ratio - 1.0) > 1.0e-9:
+        vertices = obj.data.vertices
+        for start in range(0, vertex_count, sides):
+            center = Vector((0.0, 0.0, 0.0))
+            for index in range(start, start + sides):
+                center += vertices[index].co
+            center /= sides
+            for index in range(start, start + sides):
+                vertices[index].co = center + (vertices[index].co - center) * ratio
+        obj.data.update()
+
+    coverage = report.setdefault("coverage_qa", {})
+    adjustment = report.setdefault("thickness_adjustment", {})
+    base_radius = float(adjustment.get(
+        "base_radius", float(coverage.get("normal_radius", 0.0)) / current_scale,
+    ))
+    base_clearances = adjustment.get("base_clearances")
+    if not isinstance(base_clearances, dict):
+        base_clearances = {
+            key: float(coverage[key])
+            for key in ("clearance_min", "clearance_median", "clearance_p95", "clearance_max")
+            if key in coverage
+        }
+    adjusted_radius = base_radius * target_scale
+    coverage["normal_radius"] = adjusted_radius
+    coverage["in_plane_radius"] = adjusted_radius
+    radius_growth = adjusted_radius - base_radius
+    for key, value in base_clearances.items():
+        coverage[key] = float(value) + radius_growth
+    adjustment.update({
+        "scale": target_scale,
+        "base_radius": base_radius,
+        "adjusted_radius": adjusted_radius,
+        "base_clearances": base_clearances,
+        "model_rescanned": False,
+        "accepted_geometry_modified": False,
+    })
+    obj["smrn_handle_thickness_scale"] = target_scale
+    obj["smrn_handle_report_json"] = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+    scene["smrn_handle_last_report_json"] = obj["smrn_handle_report_json"]
+    source = bpy.data.objects.get(str(obj.get("smrn_source_name", "")))
+    keep_model_visible(scene, (obj, source))
+    return obj, report
+
+
 def _remove_candidate_object(obj):
     mesh = obj.data if obj is not None and obj.type == "MESH" else None
     if obj is not None:
@@ -748,6 +815,8 @@ def _build_scene_candidate_legacy(scene):
     obj.show_wire = True
     obj.show_all_edges = True
     obj["smrn_candidate_only"] = True
+    obj["smrn_handle_section_segments"] = max(8, int(scene.smrn_handle_section_segments))
+    obj["smrn_handle_thickness_scale"] = 1.0
     obj["smrn_source_name"] = source.name
     obj["smrn_handle_report_json"] = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
     _commit_candidate(scene, obj)
@@ -981,6 +1050,8 @@ def build_scene_candidate(scene):
     obj.show_wire = True
     obj.show_all_edges = True
     obj["smrn_candidate_only"] = True
+    obj["smrn_handle_section_segments"] = section_segments
+    obj["smrn_handle_thickness_scale"] = 1.0
     obj["smrn_source_name"] = source.name
     obj["smrn_handle_report_json"] = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
     _commit_candidate(scene, obj)

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Semantic Mesh Marker Next",
     "author": "Local developer",
-    "version": (0, 4, 7),
+    "version": (0, 4, 8),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > 语义标记 Next",
     "description": "Non-destructive target and exclude surface marking",
@@ -67,6 +67,15 @@ def register():
     bpy.types.Scene.smrn_handle_clearance = bpy.props.FloatProperty(
         name="扶手额外外扩", default=0.0, min=0.0, max=10.0, precision=4,
     )
+    bpy.types.Scene.smrn_handle_thickness_scale = bpy.props.FloatProperty(
+        name="扶手粗细",
+        description="1.00 为刚好覆盖旧扶手；只允许向外加粗，以保证旧扶手完全被覆盖",
+        default=1.0,
+        min=1.0,
+        max=2.0,
+        step=2,
+        precision=2,
+    )
     bpy.types.Scene.smrn_handle_summary = bpy.props.StringProperty(
         name="扶手还原结果", default="尚未分析本轮扶手标记",
     )
@@ -82,7 +91,7 @@ def register():
 
 def unregister():
     for name in (
-        "smrn_handle_summary", "smrn_handle_clearance",
+        "smrn_handle_summary", "smrn_handle_clearance", "smrn_handle_thickness_scale",
         "smrn_handle_min_diameter", "smrn_handle_section_segments",
         "smrn_handle_path_segments",
         "smrn_rotational_summary", "smrn_rotational_clearance",

@@ -1,3 +1,4 @@
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -18,6 +19,7 @@ from .anchors import enrich_hit_anchor, source_snapshot
 from .storage import append_mark, clear_task_marks, document_summary, next_id, pop_last_mark, set_active_source
 from .rotational_blender import analyze_scene, build_scene_candidate, remove_last_candidate, store_analysis
 from .handle_blender import (
+    adjust_candidate_thickness,
     analyze_scene as analyze_handle_scene,
     build_scene_candidate as build_handle_candidate,
     remove_last_candidate as remove_handle_candidate,
@@ -34,6 +36,55 @@ from .scene_state import (
 
 def _set_status(scene, text):
     scene.smrn_status = text
+
+
+def _accepted_collection(scene):
+    model, _candidates, _helpers = ensure_scene_roots(scene)
+    name = "SMR_01A_已确认修复_始终可见"
+    accepted = bpy.data.collections.get(name)
+    if accepted is None:
+        accepted = bpy.data.collections.new(name)
+    if model.children.get(accepted.name) is None:
+        model.children.link(accepted)
+    accepted["smrn_collection_role"] = "accepted_repairs"
+    accepted.hide_viewport = False
+    accepted.hide_render = False
+    return accepted
+
+
+def _accept_candidate(scene, kind):
+    settings = {
+        "handle": ("smrn_handle_candidate_name", "SMRN_HANDLE_CANDIDATE_", "smrn_handle_report_json", "SMRN_HANDLE_ACCEPTED_"),
+        "rotational": ("smrn_rotational_candidate_name", "SMRN_ROTATIONAL_CANDIDATE_", "smrn_rotational_report_json", "SMRN_ROTATIONAL_ACCEPTED_"),
+    }
+    key, prefix, report_key, accepted_prefix = settings[kind]
+    name = str(scene.get(key, ""))
+    obj = bpy.data.objects.get(name)
+    if obj is None or not name.startswith(prefix) or bool(obj.get("smrn_accepted", False)):
+        raise ValueError("没有可确认的当前候选")
+    try:
+        report = json.loads(str(obj.get(report_key, "{}")))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("当前候选缺少可靠的生成报告") from error
+    topology = report.get("topology_qa", {})
+    coverage = report.get("coverage_qa", {})
+    if report.get("status") != "candidate_ready" or not topology.get("passed") or not coverage.get("passed"):
+        raise ValueError("当前候选尚未通过拓扑和覆盖质量门槛")
+    if not report.get("source_unchanged", False):
+        raise ValueError("源模型不变性检查未通过，不能确认")
+    accepted = _accepted_collection(scene)
+    if accepted.objects.get(obj.name) is None:
+        accepted.objects.link(obj)
+    for owner in tuple(obj.users_collection):
+        if owner != accepted:
+            owner.objects.unlink(obj)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    obj.name = f"{accepted_prefix}{stamp}"
+    obj["smrn_accepted"] = True
+    obj["smrn_candidate_only"] = False
+    obj["smrn_accepted_at_utc"] = stamp
+    scene[key] = ""
+    return obj
 
 
 class SMRN_OT_setup_source(bpy.types.Operator):
@@ -364,6 +415,57 @@ class SMRN_OT_remove_handle_candidate(bpy.types.Operator):
         return {"FINISHED" if removed else "CANCELLED"}
 
 
+class SMRN_OT_adjust_handle_thickness(bpy.types.Operator):
+    bl_idname = "smrn.adjust_handle_thickness"
+    bl_label = "应用粗细"
+    bl_description = "只调整当前未确认扶手候选的管径；不重新扫描模型，不改变拟合路径和角度"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        try:
+            candidate, report = adjust_candidate_thickness(context.scene)
+        except (ValueError, RuntimeError) as error:
+            self.report({"ERROR"}, str(error))
+            _set_status(context.scene, f"粗细调整失败：{error}")
+            return {"CANCELLED"}
+        scale = report["thickness_adjustment"]["scale"]
+        context.scene.smrn_handle_summary = f"{candidate.name} · 粗细 {scale:.2f}× · 未扫描模型"
+        _set_status(context.scene, context.scene.smrn_handle_summary)
+        return {"FINISHED"}
+
+
+class SMRN_OT_confirm_candidate(bpy.types.Operator):
+    bl_idname = "smrn.confirm_candidate"
+    bl_label = "确认候选并清除本轮标记"
+    bl_description = "归档当前候选、清除本插件本轮绿色/红色标记并保存工程；已确认结果不会被后续生成覆盖"
+    bl_options = {"REGISTER"}
+
+    candidate_kind: bpy.props.EnumProperty(
+        items=(("handle", "扶手", ""), ("rotational", "圆润", "")),
+        default="handle",
+    )
+
+    def execute(self, context):
+        if not bpy.data.filepath:
+            self.report({"ERROR"}, "请先保存当前 Blender 工程，再确认候选")
+            return {"CANCELLED"}
+        try:
+            accepted = _accept_candidate(context.scene, self.candidate_kind)
+            removed = clear_task_marks(context.scene)
+            for record in removed:
+                remove_overlay(record.overlay_object_name)
+            keep_model_visible(context.scene, (accepted,))
+            bpy.ops.wm.save_mainfile()
+        except (ValueError, RuntimeError) as error:
+            self.report({"ERROR"}, str(error))
+            _set_status(context.scene, f"确认失败：{error}")
+            return {"CANCELLED"}
+        context.scene.smrn_handle_summary = "尚未分析本轮扶手标记"
+        context.scene.smrn_rotational_summary = "尚未分析本轮标记"
+        _set_status(context.scene, f"已确认 {accepted.name}，清除本轮 {len(removed)} 个标记，可以开始下一次生成")
+        return {"FINISHED"}
+
+
 CLASSES = (
     SMRN_OT_setup_source,
     SMRN_OT_mark_surface,
@@ -377,4 +479,6 @@ CLASSES = (
     SMRN_OT_analyze_handle,
     SMRN_OT_build_handle_candidate,
     SMRN_OT_remove_handle_candidate,
+    SMRN_OT_adjust_handle_thickness,
+    SMRN_OT_confirm_candidate,
 )
