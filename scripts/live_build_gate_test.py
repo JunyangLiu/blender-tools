@@ -42,6 +42,7 @@ print("SMRN_BUILD_GATE=" + json.dumps({
     "candidate_names_after": candidate_names_after,
     "exactly_one_candidate": len(candidate_names_after) == 1,
     "fit": report.get("fit"),
+    "semantic_expansion": report.get("semantic_expansion"),
     "domain": report.get("domain"),
     "coverage_qa": report.get("coverage_qa"),
     "exclude_qa": report.get("exclude_qa"),

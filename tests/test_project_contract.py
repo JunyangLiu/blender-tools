@@ -36,6 +36,8 @@ class ProjectContractTests(unittest.TestCase):
         adapter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "rotational_blender.py").read_text(encoding="utf-8")
         self.assertIn('CANDIDATE_PREFIX = "SMRN_ROTATIONAL_CANDIDATE_"', adapter)
         self.assertIn("_commit_candidate(scene, obj)", adapter)
+        self.assertIn("_semantic_rotational_faces(fit, source, targets)", adapter)
+        self.assertIn("semantic_expansion", adapter)
         self.assertNotIn("remove_last_candidate(scene)\n    _model, candidates", adapter)
         self.assertIn("source_unchanged", (ROOT / "scripts" / "live_build_gate_test.py").read_text(encoding="utf-8"))
         self.assertNotIn("bpy.ops.object.delete", adapter)

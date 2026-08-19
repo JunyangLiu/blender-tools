@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from collections import defaultdict, deque
 import json
 import math
 from pathlib import Path
@@ -94,30 +95,129 @@ def _angle_offset(angle, start):
     return np.mod(angle - start, 2.0 * math.pi)
 
 
-def _marked_face_vertices(source, targets):
+def _target_face_indices(source, targets):
+    return {
+        item.face_index for item in targets
+        if 0 <= item.face_index < len(source.data.polygons)
+    }
+
+
+def _face_world_vertices(source, face_index):
+    polygon = source.data.polygons[face_index]
+    return [
+        tuple(source.matrix_world @ source.data.vertices[index].co)
+        for index in polygon.vertices
+    ]
+
+
+def _semantic_rotational_faces(fit, source, targets):
+    """Expand seeds only across the same source-derived rotational surface."""
+    seeds = _target_face_indices(source, targets)
+    if not seeds:
+        return seeds, {"seed_faces": 0, "surface_faces": 0, "expanded_faces": 0}
+
+    seed_rows = []
+    for face_index in seeds:
+        axial, radius, _angle = _coordinates(_face_world_vertices(source, face_index), fit)
+        predicted = np.abs(fit.signed_radius_at_origin + fit.signed_slope * axial)
+        seed_rows.append((axial, radius - predicted))
+    seed_spans = np.asarray([np.ptp(row[0]) for row in seed_rows], dtype=float)
+    seed_residuals = np.concatenate([np.abs(row[1]) for row in seed_rows])
+    typical_span = float(np.median(seed_spans))
+    residual_tolerance = max(
+        1.0e-5,
+        float(np.quantile(seed_residuals, 0.90)) * 2.5,
+        fit.point_residual_p90 * 1.5,
+        fit.radius_at_axial(0.0) * 0.01,
+    )
+    minimum_span = max(1.0e-6, typical_span * 0.55)
+    normal_tolerance = max(12.0, fit.normal_error_p90_degrees * 2.0)
+    origin, axis, basis_x, basis_y = _fit_frame(fit)
+    orientation = 1.0 if fit.signed_radius_at_origin >= 0.0 else -1.0
+    normal_matrix = source.matrix_world.to_3x3().inverted_safe().transposed()
+
+    def same_surface(face_index):
+        polygon = source.data.polygons[face_index]
+        points = _face_world_vertices(source, face_index)
+        axial, radius, angle = _coordinates(points, fit)
+        predicted = np.abs(fit.signed_radius_at_origin + fit.signed_slope * axial)
+        if float(np.max(np.abs(radius - predicted))) > residual_tolerance:
+            return False
+        if float(np.ptp(axial)) < minimum_span:
+            return False
+        center_angle = float(np.angle(np.mean(np.exp(1j * angle))))
+        radial = math.cos(center_angle) * basis_x + math.sin(center_angle) * basis_y
+        expected = orientation * radial - fit.signed_slope * axis
+        expected /= max(float(np.linalg.norm(expected)), 1.0e-10)
+        normal = normal_matrix @ polygon.normal
+        if normal.length_squared == 0.0:
+            return False
+        normal.normalize()
+        error = math.degrees(math.acos(float(np.clip(np.dot(expected, tuple(normal)), -1.0, 1.0))))
+        return error <= normal_tolerance
+
+    edge_faces = defaultdict(list)
+    for polygon in source.data.polygons:
+        for edge in polygon.edge_keys:
+            edge_faces[tuple(sorted(edge))].append(polygon.index)
+    neighbors = defaultdict(set)
+    for linked in edge_faces.values():
+        for first in linked:
+            neighbors[first].update(second for second in linked if second != first)
+
+    accepted = set(seeds)
+    queue = deque(seeds)
+    while queue:
+        current = queue.popleft()
+        for other in neighbors[current]:
+            if other in accepted or not same_surface(other):
+                continue
+            accepted.add(other)
+            queue.append(other)
+    return accepted, {
+        "seed_faces": len(seeds),
+        "surface_faces": len(accepted),
+        "expanded_faces": len(accepted - seeds),
+        "profile_residual_tolerance": residual_tolerance,
+        "minimum_axial_span": minimum_span,
+        "normal_tolerance_degrees": normal_tolerance,
+    }
+
+
+def _marked_face_vertices(source, targets, face_indices=None):
     result = []
-    seen = set()
-    for record in targets:
-        if record.face_index in seen or not 0 <= record.face_index < len(source.data.polygons):
-            continue
-        seen.add(record.face_index)
-        polygon = source.data.polygons[record.face_index]
+    indices = _target_face_indices(source, targets) if face_indices is None else face_indices
+    for face_index in indices:
+        polygon = source.data.polygons[face_index]
         for index in polygon.vertices:
             result.append(tuple(source.matrix_world @ source.data.vertices[index].co))
     return result
 
 
-def _expanded_domain(fit, source, targets):
-    points = _marked_face_vertices(source, targets)
+def _expanded_domain(fit, source, targets, face_indices=None):
+    points = _marked_face_vertices(source, targets, face_indices)
     points.extend(tuple(_current_anchor(item, source)[0]) for item in targets)
     axial, radius, angle = _coordinates(points, fit)
     axial_min, axial_max = float(np.min(axial)), float(np.max(axial))
-    if fit.coverage_mode == "full_rotation":
-        angle_start, angle_span = fit.angular_start, 2.0 * math.pi
+    ordered = np.sort(np.mod(angle, 2.0 * math.pi))
+    gaps = np.diff(np.r_[ordered, ordered[0] + 2.0 * math.pi])
+    gap_index = int(np.argmax(gaps))
+    nonzero_gaps = gaps[gaps > math.radians(0.05)]
+    typical_gap = float(np.median(nonzero_gaps)) if len(nonzero_gaps) else float(gaps[gap_index])
+    # A strictly profile-matched, shared-edge surface can contain a damaged
+    # sector.  Once it supplies broad multi-face evidence, tolerate up to five
+    # native facet steps and restore the closed circumference instead of
+    # preserving the break as an artificial fan opening.
+    semantic_evidence = (
+        face_indices is not None
+        and len(face_indices) >= max(12, 2 * len(_target_face_indices(source, targets)))
+    )
+    closure_factor = 5.0 if semantic_evidence else 2.8
+    closure_limit = max(math.radians(12.0), closure_factor * typical_gap)
+    source_ring_closed = len(nonzero_gaps) >= 6 and float(gaps[gap_index]) <= closure_limit
+    if fit.coverage_mode == "full_rotation" or source_ring_closed:
+        angle_start, angle_span = float(ordered[0]), 2.0 * math.pi
     else:
-        ordered = np.sort(np.mod(angle, 2.0 * math.pi))
-        gaps = np.diff(np.r_[ordered, ordered[0] + 2.0 * math.pi])
-        gap_index = int(np.argmax(gaps))
         angle_start = float(ordered[(gap_index + 1) % len(ordered)])
         angle_span = float(2.0 * math.pi - gaps[gap_index])
     predicted = np.abs(fit.signed_radius_at_origin + fit.signed_slope * axial)
@@ -139,7 +239,7 @@ def _ring_point(fit, axial, angle, radius):
 
 def _candidate_geometry(fit, axial_min, axial_max, angle_start, angle_span,
                         thickness, clearance, requested_segments):
-    full = fit.coverage_mode == "full_rotation"
+    full = angle_span >= 2.0 * math.pi - 1.0e-7
     segments = max(12, int(round(requested_segments * angle_span / (2.0 * math.pi))))
     if full:
         segments = max(32, requested_segments)
@@ -193,14 +293,11 @@ def _topology_report(vertices, faces):
             "passed": finite and nonmanifold == 0}
 
 
-def _dense_triangle_samples(source, targets, order=5):
+def _dense_triangle_samples(source, targets, order=5, face_indices=None):
     result = []
-    seen = set()
-    for record in targets:
-        if record.face_index in seen or not 0 <= record.face_index < len(source.data.polygons):
-            continue
-        seen.add(record.face_index)
-        polygon = source.data.polygons[record.face_index]
+    indices_to_sample = _target_face_indices(source, targets) if face_indices is None else face_indices
+    for face_index in indices_to_sample:
+        polygon = source.data.polygons[face_index]
         indices = list(polygon.vertices)
         if len(indices) < 3:
             continue
@@ -320,10 +417,11 @@ def build_scene_candidate(scene):
         report["status"] = "rejected"
         report["reason"] = fit.reason
         return None, report
+    surface_faces, expansion = _semantic_rotational_faces(fit, source, targets)
     axial_min, axial_max, angle_start, angle_span, fitted_clearance, _points = _expanded_domain(
-        fit, source, targets
+        fit, source, targets, surface_faces
     )
-    dense = _dense_triangle_samples(source, targets)
+    dense = _dense_triangle_samples(source, targets, face_indices=surface_faces)
     clearance = max(fitted_clearance, _required_clearance(fit, dense))
     clearance += max(0.0, float(scene.smrn_rotational_clearance))
     thickness = float(scene.smrn_rotational_thickness)
@@ -343,9 +441,12 @@ def build_scene_candidate(scene):
     topology = _topology_report(vertices, faces)
     report.update({
         "status": "candidate_ready",
+        "semantic_expansion": expansion,
         "domain": {"axial_min": axial_min, "axial_max": axial_max,
                    "angular_start_degrees": math.degrees(angle_start),
                    "angular_span_degrees": math.degrees(angle_span),
+                   "coverage_mode": ("full_rotation" if angle_span >= 2.0 * math.pi - 1.0e-7
+                                     else "partial_arc"),
                    "clearance": clearance, "thickness": thickness,
                    "segments": segments},
         "coverage_qa": coverage, "exclude_qa": excludes_report,
