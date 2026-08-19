@@ -299,7 +299,7 @@ class SMRN_OT_remove_rotational_candidate(bpy.types.Operator):
 class SMRN_OT_analyze_handle(bpy.types.Operator):
     bl_idname = "smrn.analyze_handle"
     bl_label = "分析扶手证据"
-    bl_description = "只读分析绿色扶手管体与红色双端安装面；不生成几何"
+    bl_description = "只读分析绿色扶手管体；红色双端安装面为可选纠偏证据"
 
     def execute(self, context):
         try:

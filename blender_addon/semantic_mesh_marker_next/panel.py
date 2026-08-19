@@ -64,7 +64,7 @@ class SMRN_PT_marking(bpy.types.Panel):
 
         handle = layout.box()
         handle.label(text="3. 扶手 / 把手还原", icon="CURVE_BEZCURVE")
-        handle.label(text="绿色标管体，红色标两端安装面")
+        handle.label(text="绿色标管体；红色安装面仅用于纠偏")
         handle.operator(
             "smrn.build_handle_candidate",
             text="一键生成扶手候选",

@@ -53,6 +53,10 @@ class ProjectContractTests(unittest.TestCase):
         self.assertNotIn("remove_last_candidate(scene)\n    _model, candidates", adapter)
         self.assertIn("source_unchanged", (ROOT / "scripts" / "live_build_gate_test.py").read_text(encoding="utf-8"))
         self.assertNotIn("bpy.ops.object.delete", adapter)
+        auto_thickness = adapter.split("def _auto_thickness", 1)[1].split("def _ring_point", 1)[0]
+        self.assertIn("feature_scale * 0.01", auto_thickness)
+        self.assertIn("radius * 0.005", auto_thickness)
+        self.assertNotIn("radius * 0.08", auto_thickness)
 
     def test_visibility_guard_skips_stale_recursive_objects(self):
         scene_state = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "scene_state.py").read_text(encoding="utf-8")
@@ -79,6 +83,9 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("support_angle_after_degrees", fitter)
         self.assertNotIn("np.eye", fitter)
         self.assertIn("terminal_bridge", adapter)
+        self.assertIn('"section_outliers"', adapter)
+        self.assertIn("def _inferred_mount_surface", adapter)
+        self.assertIn('"shared_leg_axis": True', adapter)
         self.assertIn('"uncovered": uncovered', adapter)
         self.assertTrue((ROOT / "scripts" / "live_handle_build_gate_test.py").is_file())
 

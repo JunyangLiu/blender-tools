@@ -229,7 +229,13 @@ def _expanded_domain(fit, source, targets, face_indices=None):
 def _auto_thickness(fit, axial_min, axial_max):
     middle = 0.5 * (axial_min + axial_max)
     radius = fit.radius_at_axial(middle)
-    return max(0.02, min(radius * 0.08, max(axial_max - axial_min, 0.02) * 0.35))
+    axial_span = max(axial_max - axial_min, 1.0e-5)
+    # Automatic mode is a surface-restoration preview, not a structural
+    # thickening operation. Keep the visible fitted envelope exact and use
+    # only a scale-derived thin backing shell. Explicit advanced thickness
+    # remains available when a printable wall is intentionally requested.
+    feature_scale = min(max(radius, 1.0e-5), axial_span)
+    return max(1.0e-5, min(radius * 0.005, feature_scale * 0.01))
 
 
 def _ring_point(fit, axial, angle, radius):

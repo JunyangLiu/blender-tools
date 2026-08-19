@@ -25,7 +25,23 @@ def _world_normal(obj, local_normal):
     return value.normalized() if value.length_squared else Vector((0.0, 0.0, 1.0))
 
 
-def _current_anchor(record, obj):
+def _evidence_object(record):
+    """Return the mesh that owns the stored face/local anchor.
+
+    The semantic task source and the ray-hit mesh are deliberately separate:
+    overlapping component meshes may belong to one vehicle while retaining
+    independent face indices and transforms.
+    """
+    obj = bpy.data.objects.get(record.hit_object_name) or bpy.data.objects.get(
+        record.source_object_name
+    )
+    if obj is None or obj.type != "MESH":
+        raise ValueError(f"找不到标记 {record.id} 对应的命中网格")
+    return obj
+
+
+def _current_anchor(record, obj=None):
+    obj = obj or _evidence_object(record)
     if record.local_location is not None and record.local_normal is not None:
         return obj.matrix_world @ Vector(record.local_location), _world_normal(obj, record.local_normal)
     return Vector(record.world_location), Vector(record.world_normal).normalized()
@@ -40,29 +56,31 @@ def _records(scene):
 
 
 def _source_for_targets(scene, targets):
-    names = {item.source_object_name for item in targets}
-    if len(names) != 1:
-        raise ValueError("本轮扶手目标标记必须全部来自同一个语义源")
-    source = bpy.data.objects.get(next(iter(names))) or bpy.data.objects.get(
-        str(scene.get(SOURCE_NAME_KEY, ""))
-    )
+    source = bpy.data.objects.get(str(scene.get(SOURCE_NAME_KEY, "")))
+    if source is None and targets:
+        source = _evidence_object(targets[0])
     if source is None or source.type != "MESH":
         raise ValueError("找不到扶手标记对应的源网格")
     snapshot = source_snapshot(source)
-    fingerprints = {item.source_fingerprint for item in targets if item.source_fingerprint}
-    if fingerprints and snapshot["fingerprint"] not in fingerprints:
-        raise ValueError("源网格已在标记后变化，请重新标记扶手")
-    return source, snapshot
+    evidence = {}
+    for record in targets:
+        obj = _evidence_object(record)
+        current = evidence.setdefault(obj.name, source_snapshot(obj))
+        if record.source_fingerprint and current["fingerprint"] != record.source_fingerprint:
+            raise ValueError(f"命中网格 {obj.name} 已在标记后变化，请重新标记扶手")
+    return source, snapshot, list(evidence.values())
 
 
-def _marked_edge_radius(source, targets):
+def _marked_edge_radius(targets):
     lengths = []
     seen = set()
     for record in targets:
+        source = _evidence_object(record)
         face_index = int(record.face_index)
-        if face_index in seen or not 0 <= face_index < len(source.data.polygons):
+        face_key = (source.name, face_index)
+        if face_key in seen or not 0 <= face_index < len(source.data.polygons):
             continue
-        seen.add(face_index)
+        seen.add(face_key)
         polygon = source.data.polygons[face_index]
         for first, second in polygon.edge_keys:
             a = source.matrix_world @ source.data.vertices[first].co
@@ -81,28 +99,33 @@ def analyze_scene(scene):
             [item.world_normal for item in targets],
         )
         return fit, None, targets, excludes, {"source": None}
-    source, snapshot = _source_for_targets(scene, targets)
-    target_values = [_current_anchor(item, source) for item in targets]
-    supports = [item for item in excludes if item.source_object_name == source.name]
-    support_values = [_current_anchor(item, source) for item in supports]
+    source, snapshot, evidence = _source_for_targets(scene, targets)
+    target_values = [_current_anchor(item) for item in targets]
+    supports = excludes
+    support_values = [_current_anchor(item) for item in supports]
     fit = fit_handle(
         [tuple(value[0]) for value in target_values],
         [tuple(value[1]) for value in target_values],
         [tuple(value[0]) for value in support_values],
         [tuple(value[1]) for value in support_values],
-        radius_hint=_marked_edge_radius(source, targets),
+        radius_hint=_marked_edge_radius(targets),
     )
-    return fit, source, targets, supports, {"source": snapshot}
+    return fit, source, targets, supports, {
+        "source": snapshot,
+        "evidence_sources": evidence,
+    }
 
 
-def _dense_triangle_samples(source, records, order=5):
+def _dense_triangle_samples(records, order=5):
     result = []
     seen = set()
     for record in records:
+        source = _evidence_object(record)
         face_index = int(record.face_index)
-        if face_index in seen or not 0 <= face_index < len(source.data.polygons):
+        face_key = (source.name, face_index)
+        if face_key in seen or not 0 <= face_index < len(source.data.polygons):
             continue
-        seen.add(face_index)
+        seen.add(face_key)
         polygon = source.data.polygons[face_index]
         indices = list(polygon.vertices)
         if len(indices) < 3:
@@ -143,24 +166,91 @@ def _path_distances(local, fit):
     return result
 
 
-def _support_penetrations(source, supports, fit, section_radius):
-    points = [tuple(_current_anchor(item, source)[0]) for item in supports]
-    local = _local(points, fit)
-    required = section_radius * 1.15
+def _inferred_mount_surface(scene, fit, side, section_radius):
+    """Find the outer and inner mounting skins below one fitted handle leg."""
+    origin = Vector(fit.origin)
+    span = Vector(fit.span_axis)
+    rise = Vector(fit.rise_axis)
+    baseline = origin + span * (side * fit.half_span)
+    cursor = baseline + rise * (section_radius * 2.0)
+    travelled = -section_radius * 2.0
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    step_epsilon = max(1.0e-4, section_radius * 0.02)
+    maximum_depth = max(section_radius * 8.0, fit.rise * 2.0)
+    surface = None
+    for _index in range(20):
+        hit, location, normal, face_index, obj, _matrix = scene.ray_cast(
+            depsgraph, cursor, -rise, distance=maximum_depth
+        )
+        if not hit:
+            return surface
+        travelled += float((cursor - location).dot(rise))
+        name = obj.name if obj is not None else ""
+        alignment = float(normal.dot(rise))
+        # Tube/candidate caps face downward; the mounting skin faces back up
+        # toward the leg. This also avoids deriving an angle from world axes.
+        if surface is None and (
+            not name.startswith(CANDIDATE_PREFIX)
+            and travelled >= section_radius * 0.05
+            and travelled <= maximum_depth
+            and alignment >= 0.55
+        ):
+            surface = {
+                "object": name,
+                "face_index": int(face_index),
+                "surface_depth": travelled,
+                "normal_alignment": alignment,
+            }
+        elif (
+            surface is not None
+            and name == surface["object"]
+            and travelled > surface["surface_depth"]
+            and alignment <= -0.55
+        ):
+            surface["back_face_index"] = int(face_index)
+            surface["back_depth"] = travelled
+            surface["wall_thickness"] = travelled - surface["surface_depth"]
+            return surface
+        cursor = location - rise * step_epsilon
+        travelled += step_epsilon
+    return surface
+
+
+def _support_penetrations(scene, supports, fit, section_radius):
+    points = [tuple(_current_anchor(item)[0]) for item in supports]
+    local = _local(points, fit) if points else np.empty((0, 3), dtype=float)
+    required = section_radius * 1.50
     result, evidence = [], []
     for side, endpoint in ((-1, -fit.half_span), (1, fit.half_span)):
         mask = np.abs(local[:, 0] - endpoint) <= fit.half_span * 0.38
         values = local[mask, 1]
         if not len(values):
-            result.append(0.0)
-            evidence.append({"side": side, "samples": 0, "connected": False})
+            surface = _inferred_mount_surface(scene, fit, side, section_radius)
+            surface_depth = float(surface["surface_depth"]) if surface else 0.0
+            if surface and surface.get("wall_thickness", 0.0) > 0.0:
+                # End inside the actual wall, not beyond its back face. This
+                # is deep enough to eliminate a floating cap while remaining
+                # safe on thin shells.
+                penetration = surface_depth + float(surface["wall_thickness"]) * 0.65
+            elif surface:
+                penetration = max(required, surface_depth + section_radius * 0.50)
+            else:
+                penetration = required
+            result.append(penetration)
+            evidence.append({
+                "side": side, "samples": 0, "connected": True,
+                "inferred": True, "penetration": penetration,
+                "required_burial": required,
+                "mount_surface": surface,
+            })
             continue
         support_level = float(np.median(values))
         penetration = max(required, -support_level + required)
         result.append(penetration)
         evidence.append({
             "side": side, "samples": int(len(values)), "support_level": support_level,
-            "penetration": penetration, "required_burial": required, "connected": True,
+            "penetration": penetration, "required_burial": required,
+            "connected": True, "inferred": False,
         })
     return tuple(result), evidence
 
@@ -274,7 +364,11 @@ def build_scene_candidate(scene):
         report.update({"status": "rejected", "reason": fit.reason})
         return None, report
     fingerprint_before = source_snapshot(source)["fingerprint"]
-    dense = _dense_triangle_samples(source, targets)
+    evidence_before = {
+        _evidence_object(item).name: source_snapshot(_evidence_object(item))["fingerprint"]
+        for item in targets + supports
+    }
+    dense = _dense_triangle_samples(targets)
     if not dense:
         report.update({"status": "rejected", "reason": "标记面没有可用于外覆盖检查的三角形"})
         return None, report
@@ -313,31 +407,27 @@ def build_scene_candidate(scene):
     body_residual = residual[body_mask]
     clearance = max(0.0, float(scene.smrn_handle_clearance))
     normal_values = np.abs(body_local[:, 2])
-    source_normal_radius = max(
-        fit.radius_hint, float(np.quantile(normal_values, 0.95))
-    )
-    source_in_plane_radius = max(
-        fit.radius_hint, float(np.quantile(body_residual, 0.95))
-    )
-    # Scale the two independently measured axes together only as much as is
-    # required for every retained body sample to lie inside the elliptic tube.
-    ellipse_norm = np.sqrt(
-        np.square(normal_values / source_normal_radius)
-        + np.square(body_residual / source_in_plane_radius)
-    )
-    coverage_scale = max(1.0, float(np.max(ellipse_norm)))
-    source_normal_radius = source_normal_radius * coverage_scale + clearance
-    source_in_plane_radius = source_in_plane_radius * coverage_scale + clearance
-    requested_radius = max(0.0, float(scene.smrn_handle_min_diameter) * 0.5)
-    normal_radius = max(fit.radius_hint, source_normal_radius, requested_radius)
-    in_plane_radius = max(fit.radius_hint, source_in_plane_radius, requested_radius)
-    section_radius = max(normal_radius, in_plane_radius)
-    penetrations, endpoint_evidence = _support_penetrations(
-        source, supports, fit, section_radius
-    )
-    if not all(item["connected"] for item in endpoint_evidence):
-        report.update({"status": "rejected", "reason": "左右端点没有各自独立的安装面证据"})
+    cross_radius = np.sqrt(np.square(normal_values) + np.square(body_residual))
+    # A handful of broad mounting-face/corner samples must not determine the
+    # whole tube diameter. Recover one round section from the robust 95th
+    # percentile, then keep the trimmed samples explicit in the QA report.
+    source_radius = max(fit.radius_hint, float(np.quantile(cross_radius, 0.95)))
+    section_tolerance = max(1.0e-9, source_radius * 1.0e-6)
+    section_body = cross_radius <= source_radius + section_tolerance
+    if int(np.sum(section_body)) < 24:
+        report.update({
+            "status": "rejected",
+            "reason": "扶手圆截面的可靠密集样本不足",
+        })
         return None, report
+    reliable_normal = normal_values[section_body]
+    reliable_residual = body_residual[section_body]
+    requested_radius = max(0.0, float(scene.smrn_handle_min_diameter) * 0.5)
+    section_radius = max(source_radius + clearance, requested_radius)
+    normal_radius = in_plane_radius = section_radius
+    penetrations, endpoint_evidence = _support_penetrations(
+        scene, supports, fit, section_radius
+    )
     path = path_points_world(
         fit, max(48, int(scene.smrn_handle_path_segments)), penetrations
     )
@@ -347,24 +437,39 @@ def build_scene_candidate(scene):
     )
     topology = _topology(vertices, faces)
     normalized = np.sqrt(
-        np.square(normal_values / max(normal_radius, 1.0e-12))
-        + np.square(body_residual / max(in_plane_radius, 1.0e-12))
+        np.square(reliable_normal / max(normal_radius, 1.0e-12))
+        + np.square(reliable_residual / max(in_plane_radius, 1.0e-12))
     )
     uncovered = int(np.sum(normalized > 1.0 + 1.0e-9))
     coverage = {
-        "samples": int(np.sum(body_mask)), "uncovered": uncovered,
+        "samples": int(np.sum(section_body)), "uncovered": uncovered,
         "bridge_outliers": int(np.sum(~retained)), "retained_ratio": retention,
         "terminal_bridge_samples": int(np.sum(terminal_bridge & retained)),
+        "section_outliers": int(np.sum(~section_body)),
         "normal_radius": normal_radius, "in_plane_radius": in_plane_radius,
         "passed": uncovered == 0,
     }
     source_unchanged = source_snapshot(source)["fingerprint"] == fingerprint_before
+    evidence_unchanged = all(
+        bpy.data.objects.get(name) is not None
+        and source_snapshot(bpy.data.objects[name])["fingerprint"] == fingerprint
+        for name, fingerprint in evidence_before.items()
+    )
     report.update({
         "status": "candidate_ready", "coverage_qa": coverage,
         "endpoint_qa": endpoint_evidence, "endpoint_penetrations": list(penetrations),
         "topology_qa": topology, "source_unchanged": source_unchanged,
+        "evidence_sources_unchanged": evidence_unchanged,
+        "frame_qa": {
+            "shared_leg_axis": True,
+            "span_rise_dot": abs(float(np.dot(fit.span_axis, fit.rise_axis))),
+            "span_normal_dot": abs(float(np.dot(fit.span_axis, fit.plane_normal))),
+            "rise_normal_dot": abs(float(np.dot(fit.rise_axis, fit.plane_normal))),
+            "plane_thickness_ratio": fit.plane_thickness_ratio,
+            "passed": fit.status == "candidate_ready",
+        },
     })
-    if not topology["passed"] or not coverage["passed"] or not source_unchanged:
+    if not topology["passed"] or not coverage["passed"] or not source_unchanged or not evidence_unchanged:
         report.update({"status": "rejected", "reason": "扶手候选未通过拓扑或源不变性检查"})
         return None, report
     checkpoint = _checkpoint(scene, source)

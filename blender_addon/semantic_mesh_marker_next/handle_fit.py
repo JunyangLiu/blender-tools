@@ -322,8 +322,6 @@ def fit_handle(points: Iterable[Iterable[float]], normals: Iterable[Iterable[flo
     _score, span, rise, plane, thickness_ratio, model = min(fitted, key=lambda item: item[0])
     origin = (centroid + span * model["center_u"] + rise * model["baseline"])
     reasons = []
-    if not support_used:
-        reasons.append("请在扶手两端安装面补至少 2 个红色标记")
     if model["half_span"] / radius_hint < thresholds.minimum_span_to_section:
         reasons.append("跨度与管径证据无法区分")
     if model["rise"] / radius_hint < thresholds.minimum_rise_to_section:
@@ -347,7 +345,10 @@ def fit_handle(points: Iterable[Iterable[float]], normals: Iterable[Iterable[flo
     ))
     return HandleFit(
         status="candidate_ready" if ready else "needs_more_evidence",
-        reason="；".join(reasons) if reasons else "当前标记支持一个有双端安装证据的连续扶手候选",
+        reason="；".join(reasons) if reasons else (
+            "当前标记支持一个有双端安装证据的连续扶手候选"
+            if support_used else "当前绿色管体标记支持自动推断双端安装的连续扶手候选"
+        ),
         path_kind=model["path_kind"], origin=tuple(float(v) for v in origin),
         span_axis=tuple(float(v) for v in span), rise_axis=tuple(float(v) for v in rise),
         plane_normal=tuple(float(v) for v in plane), half_span=float(model["half_span"]),

@@ -111,6 +111,13 @@ class HandleFitTests(unittest.TestCase):
                          support_normals[:2], radius_hint=radius)
         self.assertEqual(fit.status, "needs_more_evidence")
 
+    def test_green_path_can_infer_end_mounts_without_red_marks(self):
+        values = surface_marks("flat_top")
+        fit = fit_handle(values[0], values[1], radius_hint=values[4])
+        self.assertEqual(fit.status, "candidate_ready", fit.reason)
+        self.assertFalse(fit.support_used)
+        self.assertIn("自动推断双端安装", fit.reason)
+
     def test_generated_path_keeps_exact_flat_top(self):
         values = surface_marks("flat_top")
         fit = fit_handle(*values[:4], radius_hint=values[4])
