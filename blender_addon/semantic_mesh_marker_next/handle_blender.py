@@ -14,6 +14,7 @@ import numpy as np
 from .anchors import source_snapshot
 from .constants import EXCLUDE_ROLE, SOURCE_NAME_KEY, TARGET_ROLE
 from .handle_fit import (
+    endpoint_support_indices,
     fit_handle,
     minimum_enclosing_circle,
     path_points_2d,
@@ -32,11 +33,12 @@ def _evidence_request(fit, targets, supports):
     if fit.status == "candidate_ready":
         return {"required": False, "message": "当前证据充足"}
     missing_green = max(0, 7 - len(targets))
-    green = (
-        f"再补至少 {missing_green} 个绿色管体标记，分布到两腿、两处弯角和顶部"
-        if missing_green else
-        "补充绿色管体标记到证据稀疏的腿部、弯角或顶部"
-    )
+    if missing_green:
+        green = (
+            f"再补至少 {missing_green} 个绿色管体标记，分布到两腿、两处弯角和顶部"
+        )
+    else:
+        green = "绿色标记数量已经足够；请撤销明显偏离同一扶手管体的标记后重试，无需继续增加数量"
     red = None
     if len(supports) < 2:
         red = "若两端安装角度或落点不明确，请在左右安装平面各补 1 个红色标记"
@@ -135,19 +137,47 @@ def analyze_scene(scene):
         }
     source, snapshot, evidence = _source_for_targets(scene, targets)
     target_values = [_current_anchor(item) for item in targets]
-    supports = excludes
-    support_values = [_current_anchor(item) for item in supports]
-    fit = fit_handle(
-        [tuple(value[0]) for value in target_values],
-        [tuple(value[1]) for value in target_values],
-        [tuple(value[0]) for value in support_values],
-        [tuple(value[1]) for value in support_values],
-        radius_hint=_marked_edge_radius(targets),
+    all_supports = excludes
+    support_values = [_current_anchor(item) for item in all_supports]
+    target_points = [tuple(value[0]) for value in target_values]
+    target_normals = [tuple(value[1]) for value in target_values]
+    # The green tube is the primary geometric source.  Red installation marks
+    # may refine it only after proving that they independently cover both feet.
+    # Face-edge scale is a useful section estimate, but it must only influence
+    # the green tube fit.  It must never be combined with an unverified red
+    # background strip to define the handle span/frame.
+    green_fit = fit_handle(
+        target_points, target_normals, radius_hint=_marked_edge_radius(targets)
     )
+    support_indices, support_assessment = endpoint_support_indices(
+        green_fit, [tuple(value[0]) for value in support_values]
+    )
+    supports = [all_supports[index] for index in support_indices]
+    active_values = [support_values[index] for index in support_indices]
+    supported_fit = None
+    if supports:
+        supported_fit = fit_handle(
+            target_points,
+            target_normals,
+            [tuple(value[0]) for value in active_values],
+            [tuple(value[1]) for value in active_values],
+            radius_hint=green_fit.radius_hint,
+        )
+    # Conflicting optional evidence cannot veto an already valid green fit.
+    # It is kept in the report so the decision remains inspectable.
+    if supported_fit is not None and supported_fit.status == "candidate_ready":
+        fit = supported_fit
+        support_assessment["used_for_frame"] = True
+    else:
+        fit = green_fit
+        support_assessment["used_for_frame"] = False
+        if supported_fit is not None:
+            support_assessment["supported_fit_reason"] = supported_fit.reason
     return fit, source, targets, supports, {
         "source": snapshot,
         "evidence_sources": evidence,
-        "evidence_request": _evidence_request(fit, targets, supports),
+        "support_evidence": support_assessment,
+        "evidence_request": _evidence_request(fit, targets, all_supports),
     }
 
 
@@ -349,8 +379,15 @@ def _inferred_mount_surface(scene, fit, side, section_radius):
         alignment = float(normal.dot(rise))
         # Tube/candidate caps face downward; the mounting skin faces back up
         # toward the leg. This also avoids deriving an angle from world axes.
+        is_helper = (
+            name.startswith((CANDIDATE_PREFIX, "SMRN_MARK_", "SMR_VISIBLE_MARK_", "SMR_CONSTRAINT_"))
+            or bool(obj and (
+                obj.get("smrn_accepted", False)
+                or obj.get("smrn_accepted_baseline", False)
+            ))
+        )
         if surface is None and (
-            not name.startswith(CANDIDATE_PREFIX)
+            not is_helper
             and travelled >= section_radius * 0.05
             and travelled <= maximum_depth
             and alignment >= 0.55
@@ -760,25 +797,70 @@ def build_scene_candidate(scene):
         })
         return None, report
 
+    raw_semantic_samples = int(len(dense))
+
     nearest, tangents, _distances = polyline_nearest(dense, base_path)
     plane_normal = np.asarray(fit.plane_normal, dtype=float)
     in_plane = np.cross(tangents, plane_normal)
     in_plane /= np.maximum(np.linalg.norm(in_plane, axis=1)[:, None], 1.0e-12)
     offsets = dense - nearest
+    local_dense = _local(dense, fit)
+    # Faces on the mounting feet extend axially below the fitted baseline.
+    # They determine endpoint burial, not tube diameter.  Including those
+    # axial extensions in a cross-section circle is the exact failure that
+    # produced an enormously thick handle when the user added more marks.
+    terminal_extension = (
+        (local_dense[:, 1] < -fit.radius_hint * 1.25)
+        & (np.abs(local_dense[:, 0]) > fit.half_span * 0.70)
+    )
+    section_mask = ~terminal_extension
+    if int(np.sum(section_mask)) < 24:
+        report.update({
+            "status": "rejected",
+            "reason": "排除两端轴向安装段后，管体截面证据不足",
+            "evidence_request": {
+                "required": True,
+                "message": "请只在扶手管体表面补少量绿色标记；无需增加红色安装面",
+            },
+        })
+        return None, report
     cross_points = np.column_stack((
         offsets @ plane_normal,
         np.sum(offsets * in_plane, axis=1),
-    ))
+    ))[section_mask]
     section_center, enclosing_radius = minimum_enclosing_circle(cross_points)
+
+    clearance = max(0.0, float(scene.smrn_handle_clearance))
+    requested_radius = max(0.0, float(scene.smrn_handle_min_diameter) * 0.5)
+    preliminary_radius = max(enclosing_radius + clearance, requested_radius)
+    # A marked seed can be a long triangulation bridge welded from the handle
+    # into the vehicle shell. Its centroid is locally valid, while one remote
+    # vertex can lie beyond the endpoint. A swept tube of the measured radius
+    # cannot occupy |u| > half_span + radius, so that exact geometric bound
+    # separates the bridge tail without using a hand-tuned width multiplier.
+    endpoint_margin = preliminary_radius
+    topology_bridge = np.abs(local_dense[:, 0]) > fit.half_span + endpoint_margin
+    if np.any(topology_bridge):
+        keep = ~topology_bridge
+        dense = dense[keep]
+        sample_areas = sample_areas[keep]
+        sample_owners = [owner for owner, retained in zip(sample_owners, keep) if retained]
+        local_dense = local_dense[keep]
+        terminal_extension = terminal_extension[keep]
+        section_mask = section_mask[keep]
+    discarded_topology_bridge_samples = raw_semantic_samples - int(len(dense))
+    if len(dense) < 24:
+        report.update({
+            "status": "rejected",
+            "reason": "排除与车体相连的长三角桥接后，局部管体证据不足",
+        })
+        return None, report
 
     def shifted_path(endpoint_penetrations):
         raw = path_points_world(fit, path_segments, endpoint_penetrations)
         _frame_tangents, frame_in_plane = _path_vertex_frames(raw, plane_normal)
         return raw + plane_normal * section_center[0] + frame_in_plane * section_center[1]
 
-    clearance = max(0.0, float(scene.smrn_handle_clearance))
-    requested_radius = max(0.0, float(scene.smrn_handle_min_diameter) * 0.5)
-    preliminary_radius = max(enclosing_radius + clearance, requested_radius)
     penetrations, endpoint_evidence = _support_penetrations(
         scene, supports, fit, preliminary_radius
     )
@@ -844,7 +926,12 @@ def build_scene_candidate(scene):
         "uncovered_area": float(np.sum(sample_areas[uncovered_mask])),
         "semantic_faces": int(sum(len(values) for values in semantic_faces.values())),
         "marked_samples": int(len(marked_dense)),
-        "discarded_semantic_samples": 0,
+        "discarded_semantic_samples": discarded_topology_bridge_samples,
+        "topology_bridge_samples": discarded_topology_bridge_samples,
+        "raw_semantic_samples": raw_semantic_samples,
+        "endpoint_span_margin": float(endpoint_margin),
+        "terminal_extension_samples": int(np.sum(terminal_extension)),
+        "section_samples": int(np.sum(section_mask)),
         "section_center_offset": [float(value) for value in section_center],
         "minimum_enclosing_radius": float(enclosing_radius),
         "normal_radius": section_radius, "in_plane_radius": section_radius,

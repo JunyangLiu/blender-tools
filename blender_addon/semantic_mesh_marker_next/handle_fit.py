@@ -312,6 +312,43 @@ def _signed_angle(first: np.ndarray, second: np.ndarray, normal: np.ndarray) -> 
                                    float(np.clip(first @ second, -1.0, 1.0))))
 
 
+def endpoint_support_indices(fit: HandleFit,
+                             support_points: Iterable[Iterable[float]],
+                             tolerance_ratio: float = 0.38):
+    """Select support marks that independently constrain both handle feet.
+
+    Red marks are optional installation evidence, not a replacement for the
+    green tube path.  A continuous background strip or a cluster near only one
+    foot must therefore not be allowed to rotate the fitted handle frame.
+    """
+    support_rows = _rows(support_points, "support_points")
+    if fit.status != "candidate_ready" or fit.half_span <= EPSILON or not len(support_rows):
+        return (), {
+            "provided": int(len(support_rows)), "usable": 0,
+            "left": 0, "right": 0, "bilateral": False,
+            "reason": "绿色管体尚未形成可验证的双端基准" if len(support_rows) else "未提供红色安装面",
+        }
+    origin = np.asarray(fit.origin, dtype=float)
+    span = np.asarray(fit.span_axis, dtype=float)
+    projected = (support_rows - origin) @ span
+    tolerance = max(fit.half_span * float(tolerance_ratio), fit.radius_hint * 2.0)
+    left = np.flatnonzero(np.abs(projected + fit.half_span) <= tolerance)
+    right = np.flatnonzero(np.abs(projected - fit.half_span) <= tolerance)
+    bilateral = bool(len(left) and len(right))
+    selected = tuple(sorted(set(left.tolist() + right.tolist()))) if bilateral else ()
+    if bilateral:
+        reason = "红色标记分别约束左右安装端"
+    elif len(left) or len(right):
+        reason = "红色标记只约束到一个安装端，已忽略以防带偏主体角度"
+    else:
+        reason = "红色标记未落在绿色拟合的两个安装端附近，已忽略以防带偏主体角度"
+    return selected, {
+        "provided": int(len(support_rows)), "usable": int(len(selected)),
+        "left": int(len(left)), "right": int(len(right)), "bilateral": bilateral,
+        "tolerance": float(tolerance), "reason": reason,
+    }
+
+
 def fit_handle(points: Iterable[Iterable[float]], normals: Iterable[Iterable[float]],
                support_points: Iterable[Iterable[float]] = (),
                support_normals: Iterable[Iterable[float]] = (),

@@ -13,6 +13,7 @@ HANDLE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = HANDLE
 SPEC.loader.exec_module(HANDLE)
 fit_handle = HANDLE.fit_handle
+endpoint_support_indices = HANDLE.endpoint_support_indices
 path_points_2d = HANDLE.path_points_2d
 path_points_world = HANDLE.path_points_world
 polyline_nearest = HANDLE.polyline_nearest
@@ -137,6 +138,31 @@ class HandleFitTests(unittest.TestCase):
         fit = fit_handle(points, normals, supports[:2] * 0.0 + supports[0],
                          support_normals[:2], radius_hint=radius)
         self.assertEqual(fit.status, "needs_more_evidence")
+
+    def test_one_sided_red_strip_cannot_override_green_frame(self):
+        values = surface_marks("flat_top")
+        points, normals, _supports, _support_normals, radius, span, _rise, origin = values
+        green_fit = fit_handle(points, normals, radius_hint=radius)
+        one_sided_strip = np.asarray([
+            origin - 5.0 * span,
+            origin - 4.9 * span,
+            origin - 4.7 * span,
+            origin - 4.5 * span,
+        ])
+        selected, report = endpoint_support_indices(green_fit, one_sided_strip)
+        self.assertEqual(selected, ())
+        self.assertFalse(report["bilateral"])
+        self.assertGreater(report["left"] + report["right"], 0)
+
+    def test_bilateral_red_marks_are_retained_as_optional_support(self):
+        values = surface_marks("flat_top")
+        points, normals, supports, _support_normals, radius = values[:5]
+        green_fit = fit_handle(points, normals, radius_hint=radius)
+        selected, report = endpoint_support_indices(green_fit, supports)
+        self.assertEqual(len(selected), len(supports))
+        self.assertTrue(report["bilateral"])
+        self.assertGreaterEqual(report["left"], 1)
+        self.assertGreaterEqual(report["right"], 1)
 
     def test_green_path_can_infer_end_mounts_without_red_marks(self):
         values = surface_marks("flat_top")
