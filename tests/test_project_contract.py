@@ -22,6 +22,16 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn('obj.get("smr_annotation_only", False)', scene_state)
         self.assertIn('obj.get("smr_source_name", "")', scene_state)
 
+    def test_panel_uses_lightweight_summary(self):
+        panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
+        self.assertIn("marks_summary(scene)", panel)
+        self.assertNotIn("load_marks(scene)", panel)
+
+    def test_chunked_versioned_storage_exists(self):
+        storage = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "storage.py").read_text(encoding="utf-8")
+        self.assertIn('DOCUMENT_KEY = "smrn_document_json"', storage)
+        self.assertIn("CHUNK_SIZE = 128", storage)
+
 
 if __name__ == "__main__":
     unittest.main()

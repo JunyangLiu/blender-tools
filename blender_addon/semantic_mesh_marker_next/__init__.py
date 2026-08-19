@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Semantic Mesh Marker Next",
     "author": "Local developer",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > 语义标记 Next",
     "description": "Non-destructive target and exclude surface marking",
@@ -12,6 +12,7 @@ import bpy
 
 from .operators import CLASSES as OPERATOR_CLASSES
 from .panel import CLASSES as PANEL_CLASSES
+from .anchors import migrate_scene_anchors
 
 
 CLASSES = OPERATOR_CLASSES + PANEL_CLASSES
@@ -37,6 +38,14 @@ def register():
         name="状态",
         default="请选择完整模型或主要语义源，然后开始标记。",
     )
+    try:
+        migration = migrate_scene_anchors(bpy.context.scene)
+        bpy.context.scene.smrn_status = (
+            f"数据架构 v2 已就绪：{migration['count']} 个标记，"
+            f"{migration['anchors_backfilled']} 个稳定表面锚点。"
+        )
+    except Exception as error:
+        bpy.context.scene.smrn_status = f"数据迁移未完成：{error}"
 
 
 def unregister():
@@ -49,4 +58,3 @@ def unregister():
 
 if __name__ == "__main__":
     register()
-

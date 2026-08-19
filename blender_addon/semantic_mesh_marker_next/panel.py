@@ -1,8 +1,7 @@
 import bpy
 
 from .constants import EXCLUDE_ROLE, HELPER_COLLECTION_NAME, TARGET_ROLE
-from .records import role_counts
-from .scene_state import load_marks
+from .scene_state import marks_summary
 
 
 class SMRN_PT_marking(bpy.types.Panel):
@@ -39,10 +38,9 @@ class SMRN_PT_marking(bpy.types.Panel):
             text="显示标记辅助" if helpers is not None and helpers.hide_viewport else "隐藏标记辅助",
             icon="HIDE_OFF" if helpers is not None and helpers.hide_viewport else "HIDE_ON",
         )
-        counts = role_counts(load_marks(scene))
+        counts = marks_summary(scene)["role_counts"]
         marks_box.label(text=f"目标 {counts[TARGET_ROLE]} ｜ 排除 {counts[EXCLUDE_ROLE]}", icon="INFO")
         layout.label(text=scene.smrn_status, icon="INFO")
 
 
 CLASSES = (SMRN_PT_marking,)
-

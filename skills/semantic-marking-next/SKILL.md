@@ -13,7 +13,7 @@ For every Blender marking change:
 2. Keep at least one complete source vehicle visible at all times. Never hide it to expose marks.
 3. Store markers only in the helper collection and exclude helper objects from ray casting.
 4. Use ordinary depth testing and surface-normal offsets so rear marks remain occluded and marks stay attached while the view rotates.
-5. Preserve traceability fields in `records.py`; do not silently change the schema.
+5. Preserve the versioned document/task/mark/anchor contract in `records.py` and `storage.py`; migrate older records non-destructively.
 6. Run `python -m unittest discover -s tests -v` before packaging.
 7. Build the Blender ZIP with `scripts/build_addon.ps1` and report unverified Blender UI behavior honestly when Blender was not run.
 

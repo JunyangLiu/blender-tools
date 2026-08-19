@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 import bpy
 
@@ -12,12 +13,12 @@ from .constants import (
 )
 from .overlay import create_surface_overlay, remove_overlay
 from .raycast import magnetic_scene_hit
-from .records import MarkRecord, next_mark_id, role_counts
+from .records import MarkRecord
+from .anchors import enrich_hit_anchor, source_snapshot
+from .storage import append_mark, clear_task_marks, document_summary, next_id, pop_last_mark, set_active_source
 from .scene_state import (
     ensure_scene_roots,
     keep_model_visible,
-    load_marks,
-    save_marks,
     set_helpers_hidden,
     set_source,
     visible_meshes,
@@ -40,6 +41,7 @@ class SMRN_OT_setup_source(bpy.types.Operator):
             self.report({"ERROR"}, "请先选择一个网格对象")
             return {"CANCELLED"}
         set_source(context.scene, source)
+        set_active_source(context.scene, source_snapshot(source))
         _set_status(context.scene, f"当前语义源：{source.name}；源模型保持可见且未修改。")
         return {"FINISHED"}
 
@@ -56,7 +58,7 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         if context.scene.get(MODAL_TOKEN_KEY, "") == getattr(self, "_token", ""):
             context.scene[MODAL_TOKEN_KEY] = ""
         context.window.cursor_modal_restore()
-        counts = role_counts(load_marks(context.scene))
+        counts = document_summary(context.scene)["role_counts"]
         _set_status(context.scene, f"标记结束：目标 {counts['target']}，排除 {counts['exclude']}。")
 
     def _click(self, context, event):
@@ -74,8 +76,8 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         if hit is None:
             _set_status(context.scene, "未找到可见表面；请靠近零件点击或增大磁吸半径。")
             return
-        records = load_marks(context.scene)
-        number = next_mark_id(records)
+        summary = document_summary(context.scene)
+        number = next_id(context.scene)
         role = TARGET_ROLE if self.mark_value == 1 else EXCLUDE_ROLE
         color = TARGET_COLOR if role == TARGET_ROLE else EXCLUDE_COLOR
         name = f"{MARK_PREFIX}{number:04d}_{role.upper()}"
@@ -86,21 +88,39 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         except RuntimeError as error:
             self.report({"ERROR"}, str(error))
             return
-        records.append(
-            MarkRecord(
-                id=number,
-                role=role,
-                overlay_object_name=name,
-                hit_object_name=hit["hit_object_name"],
-                source_object_name=hit["source_object_name"],
-                face_index=hit["face_index"],
-                world_location=tuple(hit["world_location"]),
-                world_normal=tuple(stored_normal),
-                screen_offset_px=hit["screen_offset_px"],
-                surface_offset=surface_offset,
-            )
+        source = bpy.data.objects.get(hit["source_object_name"])
+        hit_object = bpy.data.objects.get(hit["hit_object_name"])
+        if source is not None:
+            snapshot = summary.get("source") or source_snapshot(source)
+            if not summary.get("source"):
+                set_active_source(context.scene, snapshot)
+        if hit_object is not None:
+            fingerprint = source_snapshot(hit_object).get("fingerprint", "")
+            enrich_hit_anchor(hit, hit_object, fingerprint)
+        record = MarkRecord(
+            id=number,
+            task_id=summary["task_id"],
+            role=role,
+            overlay_object_name=name,
+            hit_object_name=hit["hit_object_name"],
+            source_object_name=hit["source_object_name"],
+            face_index=hit["face_index"],
+            world_location=tuple(hit["world_location"]),
+            world_normal=tuple(stored_normal),
+            screen_offset_px=hit["screen_offset_px"],
+            surface_offset=surface_offset,
+            local_location=hit.get("local_location"),
+            local_normal=hit.get("local_normal"),
+            triangle_vertex_indices=hit.get("triangle_vertex_indices"),
+            barycentric=hit.get("barycentric"),
+            source_fingerprint=hit.get("source_fingerprint", ""),
+            semantic_radius=float(context.scene.smrn_marker_size),
+            created_at=datetime.now(timezone.utc).isoformat(),
         )
-        save_marks(context.scene, records)
+        if not append_mark(context.scene, record):
+            remove_overlay(name)
+            _set_status(context.scene, "该位置已有标记；未创建重复记录。")
+            return
         _set_status(
             context.scene,
             f"已标记 {hit['hit_object_name']} 面 {hit['face_index']}；磁吸偏移 {hit['screen_offset_px']:.1f}px。",
@@ -156,14 +176,13 @@ class SMRN_OT_undo_mark(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        records = load_marks(context.scene)
-        if not records:
+        record = pop_last_mark(context.scene)
+        if record is None:
             self.report({"WARNING"}, "没有可撤销的标记")
             return {"CANCELLED"}
-        record = records.pop()
         remove_overlay(record.overlay_object_name)
-        save_marks(context.scene, records)
-        _set_status(context.scene, f"已撤销标记 {record.id}；剩余 {len(records)} 个。")
+        remaining = document_summary(context.scene)["mark_count"]
+        _set_status(context.scene, f"已撤销标记 {record.id}；剩余 {remaining} 个。")
         return {"FINISHED"}
 
 
@@ -173,12 +192,9 @@ class SMRN_OT_clear_marks(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        for record in load_marks(context.scene):
+        removed = clear_task_marks(context.scene)
+        for record in removed:
             remove_overlay(record.overlay_object_name)
-        for candidate in tuple(bpy.data.objects):
-            if candidate.name.startswith(MARK_PREFIX):
-                remove_overlay(candidate.name)
-        save_marks(context.scene, [])
         keep_model_visible(context.scene)
         _set_status(context.scene, "全部语义标记已清除；源模型未修改并保持可见。")
         return {"FINISHED"}

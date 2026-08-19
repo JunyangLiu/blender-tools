@@ -4,11 +4,10 @@ from .constants import (
     CANDIDATE_COLLECTION_NAME,
     HELPER_COLLECTION_NAME,
     MARK_PREFIX,
-    MARKS_KEY,
     MODEL_COLLECTION_NAME,
     SOURCE_NAME_KEY,
 )
-from .records import dumps_marks, loads_marks
+from .storage import document_summary, load_all_marks
 
 
 def ensure_root_collection(name, scene):
@@ -98,14 +97,11 @@ def set_helpers_hidden(scene, hidden):
 
 
 def load_marks(scene):
-    try:
-        return loads_marks(str(scene.get(MARKS_KEY, "")))
-    except (KeyError, TypeError, ValueError):
-        return []
+    return load_all_marks(scene)
 
 
-def save_marks(scene, records):
-    scene[MARKS_KEY] = dumps_marks(records)
+def marks_summary(scene):
+    return document_summary(scene)
 
 
 def visible_meshes(context):
