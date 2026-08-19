@@ -1,0 +1,18 @@
+{
+  "name": "semantic-mesh-restorer-next",
+  "version": "0.1.0",
+  "description": "Semantic Mesh Restorer Next plugin",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Semantic Mesh Restorer Next",
+    "shortDescription": "Use Semantic Mesh Restorer Next in Codex.",
+    "longDescription": "Semantic Mesh Restorer Next adds a local Codex plugin scaffold.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Help me use Semantic Mesh Restorer Next."
+  }
+}
