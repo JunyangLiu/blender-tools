@@ -45,6 +45,19 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("centered_normals", section)
         self.assertNotIn("np.eye", section)
 
+    def test_handle_feature_is_non_destructive_and_support_constrained(self):
+        adapter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "handle_blender.py").read_text(encoding="utf-8")
+        fitter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "handle_fit.py").read_text(encoding="utf-8")
+        self.assertIn('CANDIDATE_PREFIX = "SMRN_HANDLE_CANDIDATE_"', adapter)
+        self.assertIn("source_unchanged", adapter)
+        self.assertNotIn("bpy.ops.object.delete", adapter)
+        self.assertIn("_signed_angle", fitter)
+        self.assertIn("support_angle_after_degrees", fitter)
+        self.assertNotIn("np.eye", fitter)
+        self.assertIn("terminal_bridge", adapter)
+        self.assertIn('"uncovered": uncovered', adapter)
+        self.assertTrue((ROOT / "scripts" / "live_handle_build_gate_test.py").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

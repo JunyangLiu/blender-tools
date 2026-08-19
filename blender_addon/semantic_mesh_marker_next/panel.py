@@ -50,6 +50,18 @@ class SMRN_PT_marking(bpy.types.Panel):
         row.operator("smrn.build_rotational_candidate", icon="MESH_CYLINDER")
         rotational.operator("smrn.remove_rotational_candidate", icon="TRASH")
         rotational.label(text=scene.smrn_rotational_summary, icon="INFO")
+        handle = layout.box()
+        handle.label(text="扶手 / 把手还原候选", icon="CURVE_BEZCURVE")
+        handle.label(text="绿：管体路径　红：左右安装面", icon="INFO")
+        handle.prop(scene, "smrn_handle_path_segments", text="路径细分")
+        handle.prop(scene, "smrn_handle_section_segments", text="截面细分")
+        handle.prop(scene, "smrn_handle_min_diameter", text="最小直径（0=源尺寸）")
+        handle.prop(scene, "smrn_handle_clearance", text="额外外扩")
+        row = handle.row(align=True)
+        row.operator("smrn.analyze_handle", icon="VIEWZOOM")
+        row.operator("smrn.build_handle_candidate", icon="MESH_TORUS")
+        handle.operator("smrn.remove_handle_candidate", icon="TRASH")
+        handle.label(text=scene.smrn_handle_summary, icon="INFO")
         layout.label(text=scene.smrn_status, icon="INFO")
 
 

@@ -17,6 +17,12 @@ from .records import MarkRecord
 from .anchors import enrich_hit_anchor, source_snapshot
 from .storage import append_mark, clear_task_marks, document_summary, next_id, pop_last_mark, set_active_source
 from .rotational_blender import analyze_scene, build_scene_candidate, remove_last_candidate, store_analysis
+from .handle_blender import (
+    analyze_scene as analyze_handle_scene,
+    build_scene_candidate as build_handle_candidate,
+    remove_last_candidate as remove_handle_candidate,
+    store_analysis as store_handle_analysis,
+)
 from .scene_state import (
     ensure_scene_roots,
     keep_model_visible,
@@ -290,6 +296,71 @@ class SMRN_OT_remove_rotational_candidate(bpy.types.Operator):
         return {"FINISHED" if removed else "CANCELLED"}
 
 
+class SMRN_OT_analyze_handle(bpy.types.Operator):
+    bl_idname = "smrn.analyze_handle"
+    bl_label = "分析扶手证据"
+    bl_description = "只读分析绿色扶手管体与红色双端安装面；不生成几何"
+
+    def execute(self, context):
+        try:
+            fit, _source, _targets, _supports, report = analyze_handle_scene(context.scene)
+        except (ValueError, RuntimeError) as error:
+            self.report({"ERROR"}, str(error))
+            _set_status(context.scene, f"扶手分析失败：{error}")
+            return {"CANCELLED"}
+        report.update({"status": fit.status, "fit": fit.to_dict()})
+        store_handle_analysis(context.scene, report)
+        context.scene.smrn_handle_summary = (
+            f"{fit.path_kind} · 置信度 {fit.confidence:.2f} · 安装角已锁定"
+            if fit.status == "candidate_ready" else f"证据不足：{fit.reason}"
+        )
+        _set_status(context.scene, context.scene.smrn_handle_summary)
+        return {"FINISHED"}
+
+
+class SMRN_OT_build_handle_candidate(bpy.types.Operator):
+    bl_idname = "smrn.build_handle_candidate"
+    bl_label = "生成扶手候选"
+    bl_description = "质量门槛通过后生成独立封闭扶手；不会替换源网格"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        try:
+            candidate, report = build_handle_candidate(context.scene)
+        except (ValueError, RuntimeError) as error:
+            self.report({"ERROR"}, str(error))
+            _set_status(context.scene, f"扶手候选生成失败：{error}")
+            return {"CANCELLED"}
+        store_handle_analysis(context.scene, report)
+        if candidate is None:
+            reason = report.get("reason", "扶手质量门槛未通过")
+            context.scene.smrn_handle_summary = f"已拒绝：{reason}"
+            _set_status(context.scene, context.scene.smrn_handle_summary)
+            self.report({"WARNING"}, reason)
+            return {"CANCELLED"}
+        qa = report["coverage_qa"]
+        context.scene.smrn_handle_summary = (
+            f"候选 {candidate.name} · 密集覆盖 {qa['samples']} 点 · 封闭流形"
+        )
+        _set_status(context.scene, context.scene.smrn_handle_summary)
+        return {"FINISHED"}
+
+
+class SMRN_OT_remove_handle_candidate(bpy.types.Operator):
+    bl_idname = "smrn.remove_handle_candidate"
+    bl_label = "移除扶手候选"
+    bl_description = "只移除最近生成的扶手候选，不影响源模型"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        removed = remove_handle_candidate(context.scene)
+        context.scene.smrn_handle_summary = (
+            "扶手候选已移除；源网格保持不变" if removed else "没有可移除的扶手候选"
+        )
+        _set_status(context.scene, context.scene.smrn_handle_summary)
+        return {"FINISHED" if removed else "CANCELLED"}
+
+
 CLASSES = (
     SMRN_OT_setup_source,
     SMRN_OT_mark_surface,
@@ -300,4 +371,7 @@ CLASSES = (
     SMRN_OT_analyze_rotational,
     SMRN_OT_build_rotational_candidate,
     SMRN_OT_remove_rotational_candidate,
+    SMRN_OT_analyze_handle,
+    SMRN_OT_build_handle_candidate,
+    SMRN_OT_remove_handle_candidate,
 )

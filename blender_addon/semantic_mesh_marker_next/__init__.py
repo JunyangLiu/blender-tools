@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Semantic Mesh Marker Next",
     "author": "Local developer",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > 语义标记 Next",
     "description": "Non-destructive target and exclude surface marking",
@@ -50,6 +50,21 @@ def register():
     bpy.types.Scene.smrn_rotational_summary = bpy.props.StringProperty(
         name="旋转曲面结果", default="尚未分析本轮标记",
     )
+    bpy.types.Scene.smrn_handle_path_segments = bpy.props.IntProperty(
+        name="扶手路径细分", default=96, min=32, max=384,
+    )
+    bpy.types.Scene.smrn_handle_section_segments = bpy.props.IntProperty(
+        name="扶手截面细分", default=16, min=8, max=64,
+    )
+    bpy.types.Scene.smrn_handle_min_diameter = bpy.props.FloatProperty(
+        name="最小打印直径", default=0.0, min=0.0, max=100.0, precision=4,
+    )
+    bpy.types.Scene.smrn_handle_clearance = bpy.props.FloatProperty(
+        name="扶手额外外扩", default=0.0, min=0.0, max=10.0, precision=4,
+    )
+    bpy.types.Scene.smrn_handle_summary = bpy.props.StringProperty(
+        name="扶手还原结果", default="尚未分析本轮扶手标记",
+    )
     try:
         migration = migrate_scene_anchors(bpy.context.scene)
         bpy.context.scene.smrn_status = (
@@ -62,6 +77,9 @@ def register():
 
 def unregister():
     for name in (
+        "smrn_handle_summary", "smrn_handle_clearance",
+        "smrn_handle_min_diameter", "smrn_handle_section_segments",
+        "smrn_handle_path_segments",
         "smrn_rotational_summary", "smrn_rotational_clearance",
         "smrn_rotational_thickness", "smrn_rotational_segments",
         "smrn_status", "smrn_magnetic_radius_px", "smrn_marker_size",
