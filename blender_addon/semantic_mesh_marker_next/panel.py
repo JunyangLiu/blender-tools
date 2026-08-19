@@ -40,6 +40,16 @@ class SMRN_PT_marking(bpy.types.Panel):
         )
         counts = marks_summary(scene)["role_counts"]
         marks_box.label(text=f"目标 {counts[TARGET_ROLE]} ｜ 排除 {counts[EXCLUDE_ROLE]}", icon="INFO")
+        rotational = layout.box()
+        rotational.label(text="圆柱 / 圆锥圆润候选", icon="MOD_SCREW")
+        rotational.prop(scene, "smrn_rotational_segments", text="圆周细分")
+        rotational.prop(scene, "smrn_rotational_thickness", text="壳体厚度（0=自动）")
+        rotational.prop(scene, "smrn_rotational_clearance", text="额外外扩")
+        row = rotational.row(align=True)
+        row.operator("smrn.analyze_rotational", icon="VIEWZOOM")
+        row.operator("smrn.build_rotational_candidate", icon="MESH_CYLINDER")
+        rotational.operator("smrn.remove_rotational_candidate", icon="TRASH")
+        rotational.label(text=scene.smrn_rotational_summary, icon="INFO")
         layout.label(text=scene.smrn_status, icon="INFO")
 
 

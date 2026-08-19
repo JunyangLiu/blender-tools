@@ -32,6 +32,19 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn('DOCUMENT_KEY = "smrn_document_json"', storage)
         self.assertIn("CHUNK_SIZE = 128", storage)
 
+    def test_rotational_feature_stays_non_destructive(self):
+        adapter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "rotational_blender.py").read_text(encoding="utf-8")
+        self.assertIn('CANDIDATE_PREFIX = "SMRN_ROTATIONAL_CANDIDATE_"', adapter)
+        self.assertIn("source_unchanged", (ROOT / "scripts" / "live_build_gate_test.py").read_text(encoding="utf-8"))
+        self.assertNotIn("bpy.ops.object.delete", adapter)
+
+    def test_rotational_axis_candidates_are_data_derived(self):
+        fitter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "rotational_fit.py").read_text(encoding="utf-8")
+        section = fitter.split("def candidate_axes", 1)[1].split("def _robust_linear", 1)[0]
+        self.assertIn("centered_points", section)
+        self.assertIn("centered_normals", section)
+        self.assertNotIn("np.eye", section)
+
 
 if __name__ == "__main__":
     unittest.main()

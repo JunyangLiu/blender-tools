@@ -16,6 +16,7 @@ from .raycast import magnetic_scene_hit
 from .records import MarkRecord
 from .anchors import enrich_hit_anchor, source_snapshot
 from .storage import append_mark, clear_task_marks, document_summary, next_id, pop_last_mark, set_active_source
+from .rotational_blender import analyze_scene, build_scene_candidate, remove_last_candidate, store_analysis
 from .scene_state import (
     ensure_scene_roots,
     keep_model_visible,
@@ -225,6 +226,70 @@ class SMRN_OT_stop_marking(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SMRN_OT_analyze_rotational(bpy.types.Operator):
+    bl_idname = "smrn.analyze_rotational"
+    bl_label = "分析圆柱 / 圆锥证据"
+    bl_description = "只读分析本轮目标与排除标记；不会生成几何或修改源网格"
+
+    def execute(self, context):
+        try:
+            fit, _source, _targets, _excludes, report = analyze_scene(context.scene)
+        except (ValueError, RuntimeError) as error:
+            self.report({"ERROR"}, str(error))
+            _set_status(context.scene, f"旋转曲面分析失败：{error}")
+            return {"CANCELLED"}
+        report.update({"status": fit.status, "fit": fit.to_dict()})
+        store_analysis(context.scene, report)
+        context.scene.smrn_rotational_summary = (
+            f"{fit.profile_kind} · {fit.coverage_mode} · 置信度 {fit.confidence:.2f}"
+            if fit.status == "candidate_ready" else f"证据不足：{fit.reason}"
+        )
+        _set_status(context.scene, context.scene.smrn_rotational_summary)
+        return {"FINISHED"}
+
+
+class SMRN_OT_build_rotational_candidate(bpy.types.Operator):
+    bl_idname = "smrn.build_rotational_candidate"
+    bl_label = "生成圆润候选"
+    bl_description = "通过拟合与质量门槛后生成独立封闭候选；源网格保持不变"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        try:
+            candidate, report = build_scene_candidate(context.scene)
+        except (ValueError, RuntimeError) as error:
+            self.report({"ERROR"}, str(error))
+            _set_status(context.scene, f"候选生成失败：{error}")
+            return {"CANCELLED"}
+        store_analysis(context.scene, report)
+        if candidate is None:
+            reason = report.get("reason", "质量门槛未通过")
+            context.scene.smrn_rotational_summary = f"已拒绝：{reason}"
+            _set_status(context.scene, context.scene.smrn_rotational_summary)
+            self.report({"WARNING"}, reason)
+            return {"CANCELLED"}
+        fit = report["fit"]
+        context.scene.smrn_rotational_summary = (
+            f"候选 {candidate.name} · {fit['profile_kind']} · "
+            f"覆盖 {report['coverage_qa']['samples']} 点 · 拓扑封闭"
+        )
+        _set_status(context.scene, context.scene.smrn_rotational_summary)
+        return {"FINISHED"}
+
+
+class SMRN_OT_remove_rotational_candidate(bpy.types.Operator):
+    bl_idname = "smrn.remove_rotational_candidate"
+    bl_label = "移除圆润候选"
+    bl_description = "只移除本插件最近生成的候选，不影响源网格"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        removed = remove_last_candidate(context.scene)
+        context.scene.smrn_rotational_summary = "候选已移除；源网格保持不变" if removed else "没有可移除的圆润候选"
+        _set_status(context.scene, context.scene.smrn_rotational_summary)
+        return {"FINISHED" if removed else "CANCELLED"}
+
+
 CLASSES = (
     SMRN_OT_setup_source,
     SMRN_OT_mark_surface,
@@ -232,4 +297,7 @@ CLASSES = (
     SMRN_OT_clear_marks,
     SMRN_OT_toggle_helpers,
     SMRN_OT_stop_marking,
+    SMRN_OT_analyze_rotational,
+    SMRN_OT_build_rotational_candidate,
+    SMRN_OT_remove_rotational_candidate,
 )
