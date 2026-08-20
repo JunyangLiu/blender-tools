@@ -344,6 +344,32 @@ class SMRN_OT_clear_marks(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SMRN_OT_accept_current_surface(bpy.types.Operator):
+    bl_idname = "smrn.accept_current_surface"
+    bl_label = "确认当前效果并清除标记"
+    bl_description = "不替换网面；保留当前源模型，清除本轮标记并恢复普通选择"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        if not bpy.data.filepath:
+            self.report({"ERROR"}, "请先保存当前 Blender 工程")
+            return {"CANCELLED"}
+        removed = clear_task_marks(context.scene)
+        if not removed:
+            self.report({"WARNING"}, "当前没有可确认的标记")
+            return {"CANCELLED"}
+        for record in removed:
+            remove_overlay(record.overlay_object_name)
+        source = bpy.data.objects.get(str(context.scene.get("smrn_source_name", "")))
+        _restore_normal_selection(context, source)
+        context.scene.smrn_surface_summary = "尚未生成局部网面候选"
+        message = f"已保留当前网面；清除本轮 {len(removed)} 个标记，普通选择已恢复"
+        _set_status(context.scene, message)
+        self.report({"INFO"}, message)
+        bpy.ops.wm.save_mainfile()
+        return {"FINISHED"}
+
+
 class SMRN_OT_toggle_helpers(bpy.types.Operator):
     bl_idname = "smrn.toggle_helpers"
     bl_label = "显示/隐藏标记辅助"
@@ -652,6 +678,7 @@ CLASSES = (
     SMRN_OT_mark_surface,
     SMRN_OT_undo_mark,
     SMRN_OT_clear_marks,
+    SMRN_OT_accept_current_surface,
     SMRN_OT_toggle_helpers,
     SMRN_OT_stop_marking,
     SMRN_OT_analyze_rotational,

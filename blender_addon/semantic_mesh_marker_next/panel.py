@@ -110,17 +110,24 @@ class SMRN_PT_marking(bpy.types.Panel):
             )
             apply.mode = mode
 
-        confirm_text = {
-            "flatten": "确认平整并清除标记",
-            "smooth": "确认平滑并清除标记",
-        }.get(mode, "确认平整/平滑并清除标记")
         confirm_row = surface.row()
-        confirm_row.enabled = has_surface_candidate
-        confirm_row.operator(
-            "smrn.confirm_surface_replacement",
-            text=confirm_text,
-            icon="CHECKMARK",
-        )
+        if has_surface_candidate:
+            confirm_text = {
+                "flatten": "确认平整并清除标记",
+                "smooth": "确认平滑并清除标记",
+            }.get(mode, "确认候选并清除标记")
+            confirm_row.operator(
+                "smrn.confirm_surface_replacement",
+                text=confirm_text,
+                icon="CHECKMARK",
+            )
+        else:
+            confirm_row.enabled = bool(counts[TARGET_ROLE] or counts[EXCLUDE_ROLE])
+            confirm_row.operator(
+                "smrn.accept_current_surface",
+                text="确认当前效果并清除标记",
+                icon="CHECKMARK",
+            )
         if has_surface_candidate:
             surface.operator("smrn.remove_surface_candidate", text="移除当前网面候选", icon="TRASH")
 
