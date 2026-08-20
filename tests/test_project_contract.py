@@ -29,6 +29,15 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn('obj.get("smr_annotation_only", False)', scene_state)
         self.assertIn('obj.get("smr_source_name", "")', scene_state)
 
+    def test_unaccepted_candidates_cannot_steal_brush_hits(self):
+        scene_state = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "scene_state.py").read_text(encoding="utf-8")
+        raycast = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "raycast.py").read_text(encoding="utf-8")
+        self.assertIn("def is_unaccepted_candidate_object", scene_state)
+        self.assertIn('owner.name == CANDIDATE_COLLECTION_NAME', scene_state)
+        self.assertIn('bool(obj.get("smrn_accepted", False))', scene_state)
+        self.assertIn("is_unaccepted_candidate_object(obj)", raycast)
+        self.assertIn("passthrough_objects", raycast)
+
     def test_panel_uses_lightweight_summary(self):
         panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
         self.assertIn("marks_summary(scene)", panel)
@@ -128,8 +137,12 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn('"selection_method": "exact_brushed_faces"', adapter)
         self.assertIn('"display_radius_used_for_growth": False', adapter)
         self.assertIn('def _normal_hint_from_records', adapter)
+        self.assertIn('def _height_reference_from_records', adapter)
+        self.assertIn('height_mode == "RED_REFERENCE"', adapter)
         self.assertIn('hard_edges if mode != "flatten" else set()', adapter)
-        self.assertIn("locked_edges = boundary_edges | protected_feature_edges", adapter)
+        self.assertIn("else excluded_edges", adapter)
+        self.assertIn("transition_faces_checked", adapter)
+        self.assertIn("flatten_projection_fraction >= 0.5", adapter)
         self.assertIn("max_allowed_displacement", adapter)
         self.assertIn("source.data = new_mesh", adapter)
         self.assertIn("set_active_source(scene, source_snapshot(source))", adapter)

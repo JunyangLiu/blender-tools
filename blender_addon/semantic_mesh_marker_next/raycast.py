@@ -4,7 +4,11 @@ import bpy
 from bpy_extras import view3d_utils
 from mathutils import Vector
 
-from .scene_state import is_helper_object, semantic_source_object
+from .scene_state import (
+    is_helper_object,
+    is_unaccepted_candidate_object,
+    semantic_source_object,
+)
 
 
 def scene_hit_at(context, region, region_3d, coordinate):
@@ -53,17 +57,17 @@ def _sample_offsets(radius_px):
 
 
 def magnetic_scene_hit(context, region, region_3d, coordinate, radius_px):
-    helpers = [
+    passthrough_objects = [
         obj
         for obj in context.view_layer.objects
         if obj.type == "MESH"
-        and is_helper_object(obj)
+        and (is_helper_object(obj) or is_unaccepted_candidate_object(obj))
         and obj.visible_get(view_layer=context.view_layer)
     ]
-    previous_hidden = {obj.name: obj.hide_get() for obj in helpers}
-    for obj in helpers:
+    previous_hidden = {obj.name: obj.hide_get() for obj in passthrough_objects}
+    for obj in passthrough_objects:
         obj.hide_set(True)
-    if helpers:
+    if passthrough_objects:
         context.view_layer.update()
     candidates = []
     try:
@@ -73,9 +77,9 @@ def magnetic_scene_hit(context, region, region_3d, coordinate, radius_px):
                 hit["screen_offset_px"] = float(math.hypot(dx, dy))
                 candidates.append(hit)
     finally:
-        for obj in helpers:
+        for obj in passthrough_objects:
             obj.hide_set(previous_hidden[obj.name])
-        if helpers:
+        if passthrough_objects:
             context.view_layer.update()
     if not candidates:
         return None
@@ -83,4 +87,3 @@ def magnetic_scene_hit(context, region, region_3d, coordinate, radius_px):
     depth_window = max(0.35, nearest_depth * 0.0025)
     foreground = [item for item in candidates if item["ray_distance"] <= nearest_depth + depth_window]
     return min(foreground, key=lambda item: (item["screen_offset_px"], item["ray_distance"]))
-

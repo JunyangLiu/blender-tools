@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Semantic Mesh Marker Next",
     "author": "Local developer",
-    "version": (0, 5, 3),
+    "version": (0, 5, 4),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > 语义标记 Next",
     "description": "Non-destructive target and exclude surface marking",
@@ -96,6 +96,7 @@ def register():
             ("LOW", "贴最低点", "沿所选法向贴到绿色标记区域的最低点"),
             ("MEDIAN", "居中拟合", "使用绿色标记区域的中间高度"),
             ("HIGH", "贴最高点", "沿所选法向贴到绿色标记区域的最高点"),
+            ("RED_REFERENCE", "红面高度", "让平整面经过红色标记面的稳健中间高度；红色面保持不动"),
         ),
         default="MEDIAN",
     )

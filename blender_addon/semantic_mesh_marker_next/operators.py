@@ -541,7 +541,7 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
         protection = "外边界与红色面已锁定" if report["mode"] == "flatten" else "边界与硬边已锁定"
         reference = ""
         if report["mode"] == "flatten":
-            labels = {"LOW": "最低点", "MEDIAN": "居中", "HIGH": "最高点"}
+            labels = {"LOW": "最低点", "MEDIAN": "居中", "HIGH": "最高点", "RED_REFERENCE": "红面高度"}
             normal_labels = {"AUTO": "自动法向", "FIRST_TARGET": "首个绿面法向", "RED_REFERENCE": "红面法向"}
             choice = report.get("flatten_reference") or {}
             reference = f" · {labels.get(choice.get('height_mode'), '居中')} / {normal_labels.get(choice.get('normal_mode'), '自动法向')}"

@@ -49,6 +49,27 @@ def is_helper_object(obj):
     )
 
 
+def is_unaccepted_candidate_object(obj):
+    """Return True for previews/working copies that must not receive marks."""
+    if obj is None:
+        return False
+    if bool(obj.get("smrn_accepted", False)):
+        return False
+    candidate_prefixes = (
+        "SMRN_SURFACE_CANDIDATE_",
+        "SMRN_SURFACE_WORKING_FULL_",
+        "SMRN_ROTATIONAL_CANDIDATE_",
+        "SMRN_HANDLE_CANDIDATE_",
+    )
+    if obj.name.startswith(candidate_prefixes):
+        return True
+    return any(
+        owner.name == CANDIDATE_COLLECTION_NAME
+        or str(owner.get("smrn_collection_role", "")) == "working_candidates"
+        for owner in obj.users_collection
+    )
+
+
 def link_helper_object(obj, scene):
     _model, _candidates, helpers = ensure_scene_roots(scene, reveal_helpers=True)
     if helpers.objects.get(obj.name) is None:
@@ -137,4 +158,5 @@ def visible_meshes(context):
         if obj.type == "MESH"
         and obj.visible_get(view_layer=context.view_layer)
         and not is_helper_object(obj)
+        and not is_unaccepted_candidate_object(obj)
     ]
