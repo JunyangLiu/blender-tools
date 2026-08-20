@@ -395,6 +395,189 @@ def _canvas_boundary_fades(region_vertices, locked_vertices):
     }
 
 
+def _physics_canvas_attachment_chain(source, region_vertices, boundary_edges, local_scale):
+    """Infer one coherent upper suspension chain from the marked patch only."""
+    boundary_vertices = {vertex for edge in boundary_edges for vertex in edge.verts}
+    if len(boundary_vertices) < 3:
+        raise ValueError("物理帆布无法从当前绿色区域解析连续外边界")
+    heights = {
+        vertex: float((source.matrix_world @ vertex.co).z)
+        for vertex in boundary_vertices
+    }
+    ordered = sorted(heights.values())
+    threshold = ordered[int(0.70 * (len(ordered) - 1))]
+    high = {vertex for vertex, height in heights.items() if height >= threshold}
+    adjacency = defaultdict(set)
+    for edge in boundary_edges:
+        first, second = edge.verts
+        adjacency[first].add(second)
+        adjacency[second].add(first)
+    components = []
+    remaining = set(high)
+    while remaining:
+        seed = remaining.pop()
+        component = {seed}
+        queue = deque([seed])
+        while queue:
+            vertex = queue.popleft()
+            for neighbor in adjacency[vertex]:
+                if neighbor in high and neighbor not in component:
+                    component.add(neighbor)
+                    remaining.discard(neighbor)
+                    queue.append(neighbor)
+        components.append(component)
+
+    def span(vertices):
+        points = [source.matrix_world @ vertex.co for vertex in vertices]
+        if not points:
+            return 0.0
+        return max(
+            max(point[axis] for point in points) - min(point[axis] for point in points)
+            for axis in range(3)
+        )
+
+    total_span = max(span(boundary_vertices), 1.0e-12)
+    components.sort(key=lambda item: (span(item), len(item)), reverse=True)
+    attachment = components[0] if components else set()
+    span_ratio = span(attachment) / total_span
+    if len(attachment) < 3 or span_ratio < 0.18:
+        raise ValueError("绿色区域存在，但上侧绳挂固定边不连续；请只补标绳侧边界")
+    gravity_local = source.matrix_world.inverted_safe().to_3x3() @ Vector((0.0, 0.0, -1.0))
+    if not gravity_local.length_squared:
+        gravity_local = Vector((0.0, 0.0, -1.0))
+    gravity_local.normalize()
+    return attachment, gravity_local, {
+        "method": "coherent_upper_boundary_chain_from_green_roi_v1",
+        "boundary_vertices": len(boundary_vertices),
+        "upper_candidates": len(high),
+        "upper_components": sorted((len(item) for item in components), reverse=True),
+        "attachment_vertices": len(attachment),
+        "attachment_span_ratio": span_ratio,
+        "minimum_span_ratio": 0.18,
+        "confidence_passed": True,
+        "local_scale": local_scale,
+        "whole_vehicle_search": False,
+        "source_objects_scanned": 1,
+    }
+
+
+def _solve_physics_canvas(
+    bm, source, region_vertices, region_faces, movable, locked_vertices,
+    attachment_points, attachment_report, gravity, original_coordinates,
+    local_scale, strength,
+):
+    """Deterministic quasi-static PBD cloth solve on the exact green ROI."""
+    movable_set = set(movable)
+    region_set = set(region_vertices)
+    attachment_tolerance = max(local_scale * 1.0e-5, 1.0e-8)
+    attachment = {
+        vertex for vertex in locked_vertices
+        if any((vertex.co - point).length <= attachment_tolerance for point in attachment_points)
+    }
+    if len(attachment) < 3:
+        raise ValueError("物理帆布细分后未能保留已验证的绳挂固定链")
+    fades = _canvas_boundary_fades(region_vertices, locked_vertices)
+    fairing = _taubin_fair_canvas(
+        bm, movable, region_faces, original_coordinates, local_scale, iterations=58,
+    )
+    bm.normal_update()
+    base = {vertex: vertex.co.copy() for vertex in region_vertices}
+    edges = {
+        edge for face in region_faces for edge in face.edges
+        if all(vertex in region_set for vertex in edge.verts)
+    }
+    constraints = [(edge.verts[0], edge.verts[1], edge.calc_length()) for edge in edges]
+
+    # Topological distance from the inferred suspension chain controls where
+    # gravity and rope-side compression are strongest, without looking beyond
+    # the marked source object.
+    distance = {vertex: 0 for vertex in attachment}
+    queue = deque(attachment)
+    while queue:
+        vertex = queue.popleft()
+        for edge in vertex.link_edges:
+            neighbor = edge.other_vert(vertex)
+            if neighbor in region_set and neighbor not in distance:
+                distance[neighbor] = distance[vertex] + 1
+                queue.append(neighbor)
+    maximum_distance = max(distance.values(), default=1)
+    bounded_strength = max(0.0, min(1.0, float(strength)))
+    frame = _canvas_frame(region_vertices, region_faces, local_scale)
+    normal = frame["normal"].copy()
+    if normal.dot(sum((face.normal for face in region_faces), Vector((0.0, 0.0, 0.0)))) < 0.0:
+        normal.negate()
+
+    # A tiny source-aligned imperfection chooses the buckle direction.  The
+    # structural solver creates the final folds; this is not random surface noise.
+    seed_amplitude = local_scale * (0.010 + 0.014 * bounded_strength)
+    for vertex in movable:
+        relative = vertex.co - frame["center"]
+        cross_coordinate = relative.dot(frame["cross"]) / max(frame["cross_span"], 1.0e-12)
+        support = 1.0 - min(1.0, distance.get(vertex, maximum_distance) / max(maximum_distance, 1))
+        seed = math.sin(2.0 * math.pi * (2.25 + 2.0 * support) * cross_coordinate)
+        vertex.co += normal * seed_amplitude * fades.get(vertex, 0.0) * (0.35 + 0.65 * support) * seed
+
+    iterations = 64
+    gravity_step = local_scale * (0.00042 + 0.00058 * bounded_strength)
+    maximum_displacement = local_scale * (0.42 + 0.08 * bounded_strength)
+    for _iteration in range(iterations):
+        for vertex in movable:
+            depth = distance.get(vertex, maximum_distance) / max(maximum_distance, 1)
+            vertex.co += gravity * gravity_step * fades.get(vertex, 0.0) * (0.25 + 0.75 * depth)
+        for _pass in range(3):
+            for first, second, rest_length in constraints:
+                delta = second.co - first.co
+                length = delta.length
+                if length <= 1.0e-12:
+                    continue
+                first_free = first in movable_set
+                second_free = second in movable_set
+                if not first_free and not second_free:
+                    continue
+                correction = delta * ((length - rest_length) / length)
+                if first_free and second_free:
+                    first.co += correction * 0.5
+                    second.co -= correction * 0.5
+                elif first_free:
+                    first.co += correction
+                else:
+                    second.co -= correction
+        # Low bending stiffness plus a weak base tether gives thin cloth, not clay.
+        laplacian = {}
+        for vertex in movable:
+            neighbors = [edge.other_vert(vertex) for edge in vertex.link_edges if edge.other_vert(vertex) in region_set]
+            if neighbors:
+                average = sum(
+                    (neighbor.co for neighbor in neighbors), Vector((0.0, 0.0, 0.0))
+                ) / len(neighbors)
+                laplacian[vertex] = average - vertex.co
+        for vertex in movable:
+            vertex.co += laplacian.get(vertex, Vector((0.0, 0.0, 0.0))) * 0.018
+            vertex.co = vertex.co.lerp(base[vertex], 0.006)
+            displacement = vertex.co - original_coordinates[vertex]
+            if displacement.length > maximum_displacement:
+                vertex.co = original_coordinates[vertex] + displacement.normalized() * maximum_displacement
+    bm.normal_update()
+    return fairing, {
+        "method": "quasi_static_position_based_cloth_v1",
+        "semantic_class": "marked_rope_hung_thin_canvas",
+        "iterations": iterations,
+        "constraint_passes_per_iteration": 3,
+        "structural_constraints": len(constraints),
+        "bending_relaxation": 0.018,
+        "base_shape_tether": 0.006,
+        "gravity_local": list(gravity),
+        "gravity_step": gravity_step,
+        "seed_amplitude": seed_amplitude,
+        "random_displacement": False,
+        "attachment_inference": attachment_report,
+        "locked_seam_vertices": len(locked_vertices),
+        "maximum_allowed_displacement": maximum_displacement,
+        "whole_vehicle_search": False,
+        "source_objects_scanned": 1,
+    }, maximum_displacement
+
+
 def _canvas_macro_fold_edges(selected_edges, hard_angle, local_scale):
     """Protect only source-supported major folds, not coarse triangulation."""
     threshold = max(math.radians(70.0), float(hard_angle) + math.radians(25.0))
@@ -491,7 +674,7 @@ def _multifold_chart_frame(region_vertices, region_faces, orientation_hint, loca
 
 def _multifold_safe_fraction(
     bm, movable, before_coordinates, proposed_coordinates, before_face_geometry,
-    matched_dihedral_edges, before_p95,
+    matched_dihedral_edges, before_p95, tolerance_degrees=8.0,
 ):
     """Backtrack the complete local deformation until all safety gates pass."""
     attempts = []
@@ -512,7 +695,7 @@ def _multifold_safe_fraction(
             and not degenerate
             and (
                 not matched_dihedral_edges
-                or after_p95 <= before_p95 + math.radians(8.0)
+                or after_p95 <= before_p95 + math.radians(float(tolerance_degrees))
             )
         )
         attempts.append({
@@ -884,6 +1067,9 @@ def _rebuild_working_mesh(
     canvas_fold_threshold = None
     canvas_fold_report = None
     canvas_attachment_vertices = set()
+    physics_attachment_points = []
+    physics_attachment_report = None
+    physics_gravity = None
     if mode == "canvas":
         canvas_macro_folds, canvas_fold_threshold = _canvas_macro_fold_edges(
             selected_edges, hard_angle, local_scale
@@ -895,13 +1081,23 @@ def _rebuild_working_mesh(
         canvas_attachment_vertices = _multifold_attachment_points(
             canvas_macro_folds, boundary_edges, local_scale
         )
+    elif mode == "canvas_physics":
+        physics_attachment_vertices, physics_gravity, physics_attachment_report = (
+            _physics_canvas_attachment_chain(
+                source,
+                {vertex for edge in selected_edges for vertex in edge.verts},
+                boundary_edges,
+                local_scale,
+            )
+        )
+        physics_attachment_points = [vertex.co.copy() for vertex in physics_attachment_vertices]
     canvas_attachment_points = [vertex.co.copy() for vertex in canvas_attachment_vertices]
     # Green faces are the complete editable scope.  Both modes hard-lock the
     # green outer boundary, every red face, and (for smoothing) hard features.
     # Never borrow unmarked neighbours as a transition band: if the marked
     # patch has no editable interior, fail closed and ask for a wider mark.
     protected_feature_edges = (
-        canvas_macro_folds if mode in {"canvas", "canvas_multifold"}
+        canvas_macro_folds if mode in {"canvas", "canvas_multifold", "canvas_physics"}
         else (hard_edges if mode != "flatten" else set())
     )
     excluded_edges = {edge for face in excluded for edge in face.edges}
@@ -914,12 +1110,12 @@ def _rebuild_working_mesh(
         if edge not in locked_edges
         and len(edge.link_faces) == 2
         and all(face in selected_set for face in edge.link_faces)
-    ] if mode in {"canvas", "canvas_multifold"} else []
+    ] if mode in {"canvas", "canvas_multifold", "canvas_physics"} else []
     before_topology = _topology_signature(bm)
 
     cuts = (
         _canvas_subdivision_cuts(len(selected_indices))
-        if mode in {"canvas", "canvas_multifold"}
+        if mode in {"canvas", "canvas_multifold", "canvas_physics"}
         else (2 ** max(1, min(2, int(level)))) - 1
     )
     bmesh.ops.subdivide_edges(
@@ -978,13 +1174,13 @@ def _rebuild_working_mesh(
         region_faces,
         canvas_facet_segments,
         max(1.0e-8, local_scale * 1.0e-5),
-    ) if mode in {"canvas", "canvas_multifold"} else set()
+    ) if mode in {"canvas", "canvas_multifold", "canvas_physics"} else set()
     movable = list(region_vertices - locked_vertices)
     if mode == "flatten" and not movable:
         bm.free()
         _remove_object(working)
         raise ValueError("绿色区域没有内部可移动顶点；请把需要平整的绿色范围多刷一圈")
-    if mode in {"canvas", "canvas_multifold"} and not movable:
+    if mode in {"canvas", "canvas_multifold", "canvas_physics"} and not movable:
         bm.free()
         _remove_object(working)
         raise ValueError("帆布区域没有可重建的内部网面；请沿帆布长度和宽度多刷一圈")
@@ -1471,6 +1667,81 @@ def _rebuild_working_mesh(
             "outer_envelope_qa": canvas_outer_envelope,
             "large_fold_policy": "preserve_coherent_source_ridges_and_only_fair_normal_microfacets",
         }
+    elif mode == "canvas_physics" and movable:
+        bounded_strength = max(0.0, min(1.0, float(strength)))
+        qa_faces = {
+            face
+            for vertex in movable
+            for face in vertex.link_faces
+        } | set(region_faces)
+        before_face_geometry = {
+            face: (face.normal.copy(), max(float(face.calc_area()), 1.0e-20))
+            for face in qa_faces
+        }
+        facet_before = _edge_dihedrals(canvas_facet_edges)
+        canvas_base_fairing, canvas_wave, max_allowed = _solve_physics_canvas(
+            bm,
+            source,
+            region_vertices,
+            region_faces,
+            movable,
+            locked_vertices,
+            physics_attachment_points,
+            physics_attachment_report,
+            physics_gravity,
+            before_coordinates,
+            local_scale,
+            bounded_strength,
+        )
+        smoothing_factor = canvas_base_fairing["lambda"]
+        smoothing_iterations = canvas_base_fairing["completed_iterations"]
+        proposed_coordinates = {vertex: vertex.co.copy() for vertex in movable}
+        safe_fraction, safety_attempts = _multifold_safe_fraction(
+            bm,
+            movable,
+            before_coordinates,
+            proposed_coordinates,
+            before_face_geometry,
+            matched_dihedral_edges,
+            before_p95,
+            tolerance_degrees=4.0,
+        )
+        canvas_outer_envelope = _canvas_outer_envelope_shift(
+            movable,
+            region_vertices,
+            source_region_coordinates,
+            _canvas_frame(region_vertices, region_faces, local_scale)["normal"],
+            local_scale,
+        )
+        bm.normal_update()
+        facet_after = _edge_dihedrals(canvas_facet_edges)
+        facet_before_p95 = _percentile(facet_before, 0.95)
+        facet_after_p95 = _percentile(facet_after, 0.95)
+        meaningful_faceting = facet_before_p95 >= math.radians(2.0)
+        canvas_base_fairing.update({
+            "facet_edges_sampled": len(canvas_facet_edges),
+            "before_facet_dihedral_p95_degrees": math.degrees(facet_before_p95),
+            "after_fairing_facet_dihedral_p95_degrees": math.degrees(facet_after_p95),
+            "meaningful_source_faceting": meaningful_faceting,
+            "safe_deformation_fraction": safe_fraction,
+            "safety_attempts": safety_attempts,
+            "passed": (
+                safe_fraction > 0.0
+                and (
+                    not meaningful_faceting
+                    or facet_after_p95 <= facet_before_p95 + math.radians(0.5)
+                )
+            ),
+        })
+        canvas_wave.update({
+            "wave_strength": bounded_strength,
+            "safe_deformation_fraction": safe_fraction,
+            "automatic_subdivision": True,
+            "automatic_subdivision_cuts": cuts,
+            "base_surface_fairing": canvas_base_fairing,
+            "outer_envelope_qa": canvas_outer_envelope,
+            "scope_policy": "exact_green_faces_only_no_vehicle_scan",
+        })
     elif strength > 0.0 and movable:
         bounded_strength = max(0.0, min(1.0, float(strength)))
         # Keep 0.00-0.50 exactly compatible with the old two-pass control.
@@ -1533,7 +1804,7 @@ def _rebuild_working_mesh(
         "matched_dihedral_within_limit": (
             not dihedral_comparable
             or after_p95 <= before_p95 + math.radians(
-                8.0 if mode in {"canvas", "canvas_multifold"} else 2.0
+                8.0 if mode in {"canvas", "canvas_multifold", "canvas_physics"} else 2.0
             )
         ),
         "planarity_improved": True,
@@ -1569,12 +1840,12 @@ def _rebuild_working_mesh(
         )
     topology_passed = all(quality_gates.values())
 
-    if mode in {"canvas", "canvas_multifold"}:
+    if mode in {"canvas", "canvas_multifold", "canvas_physics"}:
         for face in region_faces:
             # The ordinary canvas mode keeps its established smooth shading.
             # Dense multifold cloth stays finely faceted so its small wrinkles
             # remain readable instead of merging into a clay-like broad gloss.
-            face.smooth = mode == "canvas"
+            face.smooth = mode in {"canvas", "canvas_physics"}
 
     preview_vertices = []
     preview_faces = []
@@ -1601,7 +1872,7 @@ def _rebuild_working_mesh(
         "local_vertices_after": len(preview_vertices),
         "subdivision_level": int(level),
         "subdivision_cuts": cuts,
-        "automatic_canvas_subdivision": mode in {"canvas", "canvas_multifold"},
+        "automatic_canvas_subdivision": mode in {"canvas", "canvas_multifold", "canvas_physics"},
         "smoothing_strength": float(strength),
         "smoothing_factor": smoothing_factor,
         "smoothing_iterations": smoothing_iterations,
@@ -1728,7 +1999,7 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
     }
     if mode == "smooth":
         settings["smooth_strength"] = round(float(scene.smrn_surface_smooth_strength), 6)
-    elif mode in {"canvas", "canvas_multifold"}:
+    elif mode in {"canvas", "canvas_multifold", "canvas_physics"}:
         settings["canvas_wave_strength"] = round(float(scene.smrn_canvas_wave_strength), 6)
     else:
         settings.update({
@@ -1736,13 +2007,16 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
             "normal_mode": str(getattr(scene, "smrn_surface_normal_mode", "AUTO")),
         })
     payload = {
-        "schema": 10,
+        "schema": 11,
         "canvas_pipeline": (
             "fair_base_then_source_aligned_wave_outer_envelope_v3"
             if mode == "canvas"
             else (
                 "fold_preserving_microfacet_fairing_attachment_wrinkle_outer_envelope_v2"
-                if mode == "canvas_multifold" else None
+                if mode == "canvas_multifold" else (
+                    "quasi_static_position_based_cloth_v1"
+                    if mode == "canvas_physics" else None
+                )
             )
         ),
         "source_fingerprint": str(source_snapshot_value.get("fingerprint", "")),
@@ -1791,10 +2065,10 @@ def _matching_existing_candidate(scene, source, source_snapshot_value, request_s
 
 
 def build_scene_candidate(scene, mode="smooth"):
-    if mode not in {"smooth", "flatten", "canvas", "canvas_multifold"}:
+    if mode not in {"smooth", "flatten", "canvas", "canvas_multifold", "canvas_physics"}:
         raise ValueError("不支持的局部网面重构模式")
     source, targets, excludes, before_snapshot = _source_and_records(scene)
-    if mode in {"canvas", "canvas_multifold"} and len(targets) < 3:
+    if mode in {"canvas", "canvas_multifold", "canvas_physics"} and len(targets) < 3:
         raise ValueError("帆布波浪重建至少需要 3 处绿色标记，并沿帆布表面分散刷选")
     request_signature = _candidate_request_signature(
         scene, before_snapshot, targets, excludes, mode
@@ -1820,14 +2094,14 @@ def build_scene_candidate(scene, mode="smooth"):
     probe.free()
     if not selected_indices:
         raise ValueError("没有可重构的局部网面；请检查绿色与红色标记是否冲突")
-    if mode in {"canvas", "canvas_multifold"} and len(selected_indices) < 6:
+    if mode in {"canvas", "canvas_multifold", "canvas_physics"} and len(selected_indices) < 6:
         raise ValueError("帆布绿色区域过小；请沿帆布长度和宽度多刷一些表面")
 
     working = preview = None
     try:
         strength = (
             float(scene.smrn_canvas_wave_strength)
-            if mode in {"canvas", "canvas_multifold"}
+            if mode in {"canvas", "canvas_multifold", "canvas_physics"}
             else float(scene.smrn_surface_smooth_strength)
         )
         working, vertices, faces, topology = _rebuild_working_mesh(
@@ -1913,7 +2187,7 @@ def build_scene_candidate(scene, mode="smooth"):
                 "passed": True,
                 "method": (
                     "strict_green_surface_with_dense_outer_envelope"
-                    if mode in {"canvas", "canvas_multifold"} else "exact_brushed_faces_only"
+                    if mode in {"canvas", "canvas_multifold", "canvas_physics"} else "exact_brushed_faces_only"
                 ),
                 "source_objects_scanned": 1,
                 "whole_vehicle_search": False,

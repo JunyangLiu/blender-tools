@@ -589,6 +589,7 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
             ("flatten", "一键平整", ""),
             ("canvas", "帆布波浪重建", ""),
             ("canvas_multifold", "多折面帆布优化", ""),
+            ("canvas_physics", "物理帆布重建（绳挂）", ""),
         ),
         default="smooth",
     )
@@ -618,6 +619,7 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
             "smooth": "细化平滑",
             "canvas": "帆布波浪重建",
             "canvas_multifold": "多折面帆布优化",
+            "canvas_physics": "物理帆布重建",
         }.get(report["mode"], "局部重建")
         protection = (
             "外边界与红色面已锁定"
