@@ -584,7 +584,11 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     mode: bpy.props.EnumProperty(
-        items=(("smooth", "细化平滑", ""), ("flatten", "一键平整", "")),
+        items=(
+            ("smooth", "细化平滑", ""),
+            ("flatten", "一键平整", ""),
+            ("canvas", "帆布波浪重建", ""),
+        ),
         default="smooth",
     )
 
@@ -608,8 +612,16 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
             return {"CANCELLED"}
         topology = report["topology_qa"]
         region = report["semantic_region"]
-        action = "平整" if report["mode"] == "flatten" else "细化平滑"
-        protection = "外边界与红色面已锁定" if report["mode"] == "flatten" else "边界与硬边已锁定"
+        action = {
+            "flatten": "平整",
+            "smooth": "细化平滑",
+            "canvas": "帆布波浪重建",
+        }.get(report["mode"], "局部重建")
+        protection = (
+            "外边界与红色面已锁定"
+            if report["mode"] == "flatten"
+            else "边界、红色面与大折线已锁定"
+        )
         reference = ""
         if report["mode"] == "flatten":
             labels = {"LOW": "最低点", "MEDIAN": "居中", "HIGH": "最高点", "RED_REFERENCE": "红面高度"}

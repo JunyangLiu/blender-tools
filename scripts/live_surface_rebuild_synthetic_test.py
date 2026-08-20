@@ -47,7 +47,7 @@ source = bpy.data.objects.new("SMRN_SYNTHETIC_SOURCE", mesh)
 results = {}
 created = []
 try:
-    for mode in ("smooth", "flatten"):
+    for mode in ("smooth", "flatten", "canvas"):
         try:
             working, preview_vertices, preview_faces, report = _rebuild_working_mesh(
                 source, [0, 1, 2, 3], [], 1, 0.22, 0.9, mode
@@ -61,6 +61,7 @@ try:
             "faces": len(preview_faces),
             "vertices": len(preview_vertices),
             "planarity": report["planarity_qa"],
+            "canvas_wave": report["canvas_wave_qa"],
             "topology_before": report["before_topology"],
             "topology_after": report["after_topology"],
             "dihedral_before": report["before_dihedral_p95_degrees"],
@@ -79,6 +80,21 @@ try:
             "height_mode": component["height_mode"],
             "normal_mode": component["normal_mode"],
             "plane_normal": component["plane_normal_local"],
+            "flipped_faces": report["flipped_faces"],
+            "degenerate_faces": report["degenerate_faces"],
+        }
+
+    for wave_strength in (0.0, 0.45, 1.0):
+        working, _preview_vertices, _preview_faces, report = _rebuild_working_mesh(
+            source, [0, 1, 2, 3], [], 1, wave_strength, 0.9, "canvas"
+        )
+        created.append(working)
+        canvas = report["canvas_wave_qa"]
+        results[f"canvas_strength_{wave_strength:.2f}"] = {
+            "passed": report["passed"],
+            "wave_strength": canvas["wave_strength"],
+            "wave_amplitude": canvas["wave_amplitude"],
+            "max_displacement": report["max_actual_displacement"],
             "flipped_faces": report["flipped_faces"],
             "degenerate_faces": report["degenerate_faces"],
         }

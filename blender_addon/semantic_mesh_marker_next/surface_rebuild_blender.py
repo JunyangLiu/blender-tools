@@ -8,6 +8,7 @@ external references.
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime
 import hashlib
 import json
@@ -280,6 +281,107 @@ def _region_face_components(region_faces, locked_region_edges):
     return components
 
 
+def _canvas_frame(region_vertices, region_faces, local_scale):
+    """Derive a deterministic cloth frame and source wave from marked geometry."""
+    points = np.asarray([tuple(vertex.co) for vertex in region_vertices], dtype=float)
+    if len(points) < 6:
+        raise ValueError("帆布波浪重建至少需要覆盖 6 个网格顶点")
+    center = np.median(points, axis=0)
+    centered = points - center
+    covariance = np.cov(centered, rowvar=False)
+    values, vectors = np.linalg.eigh(covariance)
+    order = np.argsort(values)[::-1]
+    axes = vectors[:, order]
+    major = axes[:, 0]
+    cross = axes[:, 1]
+    normal = axes[:, 2]
+    average_normal = np.zeros(3, dtype=float)
+    for face in region_faces:
+        average_normal += np.asarray(tuple(face.normal), dtype=float) * max(float(face.calc_area()), 1.0e-20)
+    if float(np.dot(normal, average_normal)) < 0.0:
+        normal = -normal
+    coordinates = centered @ np.column_stack((major, cross, normal))
+    spans = np.percentile(coordinates, 95.0, axis=0) - np.percentile(coordinates, 5.0, axis=0)
+    if spans[1] < max(local_scale * 1.5, 1.0e-8):
+        raise ValueError("绿色帆布区域过窄；请沿帆布宽度再多刷一些表面")
+
+    # Remove a low-order drape trend before fitting periodic detail.  This
+    # protects the source's large folds instead of misreading them as texture.
+    u = coordinates[:, 0] / max(float(spans[0]), 1.0e-12)
+    v = coordinates[:, 1] / max(float(spans[1]), 1.0e-12)
+    height = coordinates[:, 2]
+    trend = np.column_stack((np.ones(len(points)), u, v, u * u, v * v, u * v))
+    trend_coefficients, *_ = np.linalg.lstsq(trend, height, rcond=None)
+    residual = height - trend @ trend_coefficients
+    residual_variance = float(np.mean(np.square(residual)))
+
+    best = None
+    for cycles in (1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5):
+        phase_coordinate = 2.0 * math.pi * cycles * v
+        basis = np.column_stack((
+            np.sin(phase_coordinate), np.cos(phase_coordinate),
+            np.sin(2.0 * phase_coordinate), np.cos(2.0 * phase_coordinate),
+        ))
+        coefficients, *_ = np.linalg.lstsq(basis, residual, rcond=None)
+        fitted = basis @ coefficients
+        explained = 1.0 - float(np.mean(np.square(residual - fitted))) / max(residual_variance, 1.0e-20)
+        amplitude = float(math.hypot(coefficients[0], coefficients[1]))
+        score = explained * min(1.0, amplitude / max(local_scale * 0.02, 1.0e-12))
+        if best is None or score > best[0]:
+            best = (score, cycles, coefficients, explained, amplitude)
+
+    _score, cycles, coefficients, explained, fitted_amplitude = best
+    cap = local_scale * 0.14
+    if fitted_amplitude > local_scale * 0.01 and explained > 0.03:
+        amplitude = min(cap, max(local_scale * 0.025, fitted_amplitude * 0.35))
+        phase_source = "fitted_source_residual"
+        phase = math.atan2(float(coefficients[1]), float(coefficients[0]))
+        harmonic_ratio = min(0.28, math.hypot(float(coefficients[2]), float(coefficients[3])) / max(fitted_amplitude, 1.0e-12))
+        harmonic_phase = math.atan2(float(coefficients[3]), float(coefficients[2]))
+    else:
+        amplitude = local_scale * 0.035
+        phase_source = "deterministic_marked_roi_anchor"
+        phase = 0.0
+        harmonic_ratio = 0.18
+        harmonic_phase = 0.0
+    return {
+        "center": Vector(center),
+        "major": Vector(major),
+        "cross": Vector(cross),
+        "normal": Vector(normal),
+        "major_span": float(spans[0]),
+        "cross_span": float(spans[1]),
+        "thickness_span": float(spans[2]),
+        "cycles": float(cycles),
+        "wavelength": float(spans[1] / cycles),
+        "base_amplitude": float(amplitude),
+        "phase": float(phase),
+        "harmonic_ratio": float(harmonic_ratio),
+        "harmonic_phase": float(harmonic_phase),
+        "source_fit_explained_fraction": float(max(0.0, explained)),
+        "phase_source": phase_source,
+    }
+
+
+def _canvas_boundary_fades(region_vertices, locked_vertices):
+    """Topological fade keeps generated waves exactly off marked boundaries."""
+    region_set = set(region_vertices)
+    distance = {vertex: 0 for vertex in locked_vertices if vertex in region_set}
+    frontier = deque(distance)
+    while frontier:
+        vertex = frontier.popleft()
+        next_distance = distance[vertex] + 1
+        for edge in vertex.link_edges:
+            neighbor = edge.other_vert(vertex)
+            if neighbor in region_set and neighbor not in distance:
+                distance[neighbor] = next_distance
+                frontier.append(neighbor)
+    return {
+        vertex: min(1.0, max(0.0, float(distance.get(vertex, 3)) / 3.0))
+        for vertex in region_vertices
+    }
+
+
 def _rebuild_working_mesh(
     source, selected_indices, excluded_indices, level, strength, hard_angle, mode="smooth",
     height_mode="MEDIAN", normal_hint=None, normal_mode="AUTO", height_reference_points=None,
@@ -397,6 +499,10 @@ def _rebuild_working_mesh(
         bm.free()
         _remove_object(working)
         raise ValueError("绿色区域没有内部可移动顶点；请把需要平整的绿色范围多刷一圈")
+    if mode == "canvas" and not movable:
+        bm.free()
+        _remove_object(working)
+        raise ValueError("帆布区域没有可重建的内部网面；请沿帆布长度和宽度多刷一圈")
     # Compare the exact same post-subdivision edges before and after fitting.
     # Comparing original coarse edges against new triangulation edges mixes
     # different populations and can falsely reject an otherwise safe result.
@@ -419,6 +525,7 @@ def _rebuild_working_mesh(
     flatten_safety_attempts = []
     smoothing_factor = 0.0
     smoothing_iterations = 0
+    canvas_wave = None
     if mode == "flatten" and movable:
         components = _region_face_components(region_faces, locked_region_edges)
         component_reports = []
@@ -593,6 +700,83 @@ def _rebuild_working_mesh(
             flatten_projection_fraction >= 0.5
             and planarity["after_rms"] < planarity["before_rms"] * 0.25
         )
+    elif mode == "canvas" and movable:
+        bounded_strength = max(0.0, min(1.0, float(strength)))
+        frame = _canvas_frame(region_vertices, region_faces, local_scale)
+        fades = _canvas_boundary_fades(region_vertices, locked_vertices)
+        qa_faces = {
+            face
+            for vertex in movable
+            for face in vertex.link_faces
+        } | set(region_faces)
+        before_face_geometry = {
+            face: (face.normal.copy(), max(float(face.calc_area()), 1.0e-20))
+            for face in qa_faces
+        }
+        # Only soften undersampled facets.  The protected hard edges and the
+        # small displacement cap keep source large folds intact.
+        smoothing_factor = bounded_strength * (0.08 + 0.10 * bounded_strength)
+        smoothing_iterations = 0 if bounded_strength <= 0.0 else 1 + int(math.ceil(bounded_strength * 2.0))
+        for _iteration in range(smoothing_iterations):
+            bmesh.ops.smooth_vert(
+                bm,
+                verts=movable,
+                factor=smoothing_factor,
+                use_axis_x=True,
+                use_axis_y=True,
+                use_axis_z=True,
+            )
+        bm.normal_update()
+        wave_amplitude = frame["base_amplitude"] * bounded_strength
+        maximum_wave = 0.0
+        for vertex in movable:
+            relative = vertex.co - frame["center"]
+            v = float(relative.dot(frame["cross"])) / max(frame["cross_span"], 1.0e-12)
+            theta = 2.0 * math.pi * frame["cycles"] * v
+            wave = math.sin(theta + frame["phase"])
+            wave += frame["harmonic_ratio"] * math.sin(2.0 * theta + frame["harmonic_phase"])
+            displacement = wave_amplitude * fades.get(vertex, 0.0) * wave
+            direction = vertex.normal.copy()
+            if not direction.length_squared:
+                direction = frame["normal"].copy()
+            else:
+                direction.normalize()
+                if direction.dot(frame["normal"]) < 0.0:
+                    direction.negate()
+            vertex.co += direction * displacement
+            maximum_wave = max(maximum_wave, abs(displacement))
+        # Includes both gentle facet smoothing and generated wave displacement.
+        max_allowed = local_scale * (0.12 + 0.16 * bounded_strength)
+        for vertex, original in before_coordinates.items():
+            displacement = vertex.co - original
+            if displacement.length > max_allowed:
+                vertex.co = original + displacement.normalized() * max_allowed
+        canvas_wave = {
+            "method": "source_aligned_periodic_residual_fit_v1",
+            "semantic_class": "marked_draped_or_folded_canvas_surface",
+            "coordinate_frame": {
+                "center_local": list(frame["center"]),
+                "major_axis_local": list(frame["major"]),
+                "cross_axis_local": list(frame["cross"]),
+                "surface_normal_local": list(frame["normal"]),
+            },
+            "major_span": frame["major_span"],
+            "cross_span": frame["cross_span"],
+            "thickness_span": frame["thickness_span"],
+            "wavelength": frame["wavelength"],
+            "cycles_across_cross_axis": frame["cycles"],
+            "source_fit_explained_fraction": frame["source_fit_explained_fraction"],
+            "phase_source": frame["phase_source"],
+            "wave_strength": bounded_strength,
+            "wave_amplitude": wave_amplitude,
+            "wave_amplitude_cap": local_scale * 0.14,
+            "maximum_generated_wave_displacement": maximum_wave,
+            "boundary_fade_rings": 3,
+            "random_displacement": False,
+            "whole_vehicle_search": False,
+            "source_objects_scanned": 1,
+            "large_fold_policy": "preserve_hard_features_and_fit_only_residual_detail",
+        }
     elif strength > 0.0 and movable:
         bounded_strength = max(0.0, min(1.0, float(strength)))
         # Keep 0.00-0.50 exactly compatible with the old two-pass control.
@@ -653,7 +837,8 @@ def _rebuild_working_mesh(
             after_topology["boundary_components"] <= before_topology["boundary_components"]
         ),
         "matched_dihedral_within_limit": (
-            not dihedral_comparable or after_p95 <= before_p95 + math.radians(2.0)
+            not dihedral_comparable
+            or after_p95 <= before_p95 + math.radians(8.0 if mode == "canvas" else 2.0)
         ),
         "planarity_improved": True,
         "displacement_within_limit": True,
@@ -669,6 +854,17 @@ def _rebuild_working_mesh(
             (max(moved) if moved else 0.0) <= max_allowed
         )
         quality_gates["flatten_progress_sufficient"] = flatten_progress_passed
+    if canvas_wave is not None:
+        quality_gates["canvas_source_proximity"] = (
+            (max(moved) if moved else 0.0) <= max_allowed + 1.0e-12
+        )
+        canvas_wave["dense_source_proximity_qa"] = {
+            "passed": quality_gates["canvas_source_proximity"],
+            "sampled_vertices": len(movable),
+            "maximum_source_displacement": max(moved) if moved else 0.0,
+            "maximum_allowed_displacement": max_allowed,
+            "scope": "strict_green_interior_only",
+        }
     topology_passed = all(quality_gates.values())
 
     preview_vertices = []
@@ -701,6 +897,7 @@ def _rebuild_working_mesh(
         "smoothing_iterations": smoothing_iterations,
         "mode": mode,
         "planarity_qa": planarity,
+        "canvas_wave_qa": canvas_wave,
         "local_edge_scale": local_scale,
         "max_allowed_displacement": max_allowed,
         "max_actual_displacement": max(moved) if moved else 0.0,
@@ -816,13 +1013,15 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
     }
     if mode == "smooth":
         settings["smooth_strength"] = round(float(scene.smrn_surface_smooth_strength), 6)
+    elif mode == "canvas":
+        settings["canvas_wave_strength"] = round(float(scene.smrn_canvas_wave_strength), 6)
     else:
         settings.update({
             "height_mode": str(getattr(scene, "smrn_surface_height_mode", "MEDIAN")),
             "normal_mode": str(getattr(scene, "smrn_surface_normal_mode", "AUTO")),
         })
     payload = {
-        "schema": 4,
+        "schema": 5,
         "source_fingerprint": str(source_snapshot_value.get("fingerprint", "")),
         "mode": mode,
         "scope_policy": "strict_green_faces_only_v2",
@@ -868,9 +1067,11 @@ def _matching_existing_candidate(scene, source, source_snapshot_value, request_s
 
 
 def build_scene_candidate(scene, mode="smooth"):
-    if mode not in {"smooth", "flatten"}:
+    if mode not in {"smooth", "flatten", "canvas"}:
         raise ValueError("不支持的局部网面重构模式")
     source, targets, excludes, before_snapshot = _source_and_records(scene)
+    if mode == "canvas" and len(targets) < 3:
+        raise ValueError("帆布波浪重建至少需要 3 处绿色标记，并沿帆布表面分散刷选")
     request_signature = _candidate_request_signature(
         scene, before_snapshot, targets, excludes, mode
     )
@@ -895,15 +1096,22 @@ def build_scene_candidate(scene, mode="smooth"):
     probe.free()
     if not selected_indices:
         raise ValueError("没有可重构的局部网面；请检查绿色与红色标记是否冲突")
+    if mode == "canvas" and len(selected_indices) < 6:
+        raise ValueError("帆布绿色区域过小；请沿帆布长度和宽度多刷一些表面")
 
     working = preview = None
     try:
+        strength = (
+            float(scene.smrn_canvas_wave_strength)
+            if mode == "canvas"
+            else float(scene.smrn_surface_smooth_strength)
+        )
         working, vertices, faces, topology = _rebuild_working_mesh(
             source,
             sorted(selected_indices),
             sorted(excluded_indices),
             int(scene.smrn_surface_subdivision_level),
-            float(scene.smrn_surface_smooth_strength),
+            strength,
             hard_angle,
             mode,
             height_mode,
@@ -960,7 +1168,10 @@ def build_scene_candidate(scene, mode="smooth"):
             "topology_qa": topology,
             "coverage_qa": {
                 "passed": True,
-                "method": "exact_brushed_faces_only",
+                "method": (
+                    "strict_green_surface_with_dense_source_proximity"
+                    if mode == "canvas" else "exact_brushed_faces_only"
+                ),
                 "source_objects_scanned": 1,
                 "whole_vehicle_search": False,
             },

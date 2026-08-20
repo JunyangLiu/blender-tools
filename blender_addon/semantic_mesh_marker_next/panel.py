@@ -98,6 +98,12 @@ class SMRN_PT_marking(bpy.types.Panel):
             icon="SNAP_FACE",
         )
         flatten.mode = "flatten"
+        canvas = surface.operator(
+            "smrn.build_surface_candidate",
+            text="帆布波浪重建",
+            icon="MOD_WAVE",
+        )
+        canvas.mode = "canvas"
         has_surface_candidate = _candidate_exists(
             scene, "smrn_surface_candidate_name", "SMRN_SURFACE_CANDIDATE_"
         )
@@ -108,6 +114,11 @@ class SMRN_PT_marking(bpy.types.Panel):
                 hint = surface.row()
                 hint.scale_y = 0.75
                 hint.label(text="0.50 = 旧版最高 · 1.00 = 强平滑", icon="INFO")
+            elif mode == "canvas":
+                surface.prop(scene, "smrn_canvas_wave_strength", text="自然波纹程度", slider=True)
+                hint = surface.row()
+                hint.scale_y = 0.75
+                hint.label(text="从绿色帆布自身拟合方向与波长，不使用随机噪声", icon="INFO")
             apply = surface.operator(
                 "smrn.build_surface_candidate", text="重新应用（只重算标记附近）", icon="FILE_REFRESH"
             )
@@ -118,6 +129,7 @@ class SMRN_PT_marking(bpy.types.Panel):
             confirm_text = {
                 "flatten": "确认平整并清除标记",
                 "smooth": "确认平滑并清除标记",
+                "canvas": "确认帆布波浪并清除标记",
             }.get(mode, "确认候选并清除标记")
             confirm_row.operator(
                 "smrn.confirm_surface_replacement",
