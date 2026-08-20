@@ -9,6 +9,7 @@ external references.
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -774,10 +775,96 @@ def remove_last_candidate(scene):
     return found
 
 
+def _rounded_vector(value, precision=6):
+    if value is None:
+        return None
+    return [round(float(item), precision) for item in value]
+
+
+def _candidate_request_signature(scene, source_snapshot_value, targets, excludes, mode):
+    """Identify the effective local rebuild request without scanning other objects."""
+    records = []
+    for record in sorted(
+        targets + excludes,
+        key=lambda item: (item.role, item.hit_object_name, item.face_index, item.id),
+    ):
+        records.append({
+            "role": record.role,
+            "hit_object_name": record.hit_object_name,
+            "face_index": int(record.face_index),
+            "local_location": _rounded_vector(record.local_location),
+            "local_normal": _rounded_vector(record.local_normal),
+            "world_location": _rounded_vector(record.world_location),
+            "world_normal": _rounded_vector(record.world_normal),
+            "semantic_radius": (
+                round(float(record.semantic_radius), 6) if record.semantic_radius is not None else None
+            ),
+        })
+    settings = {
+        "subdivision_level": int(scene.smrn_surface_subdivision_level),
+        "hard_angle_degrees": round(float(scene.smrn_surface_hard_angle), 6),
+    }
+    if mode == "smooth":
+        settings["smooth_strength"] = round(float(scene.smrn_surface_smooth_strength), 6)
+    else:
+        settings.update({
+            "height_mode": str(getattr(scene, "smrn_surface_height_mode", "MEDIAN")),
+            "normal_mode": str(getattr(scene, "smrn_surface_normal_mode", "AUTO")),
+        })
+    payload = {
+        "schema": 1,
+        "source_fingerprint": str(source_snapshot_value.get("fingerprint", "")),
+        "mode": mode,
+        "settings": settings,
+        "marks": records,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _matching_existing_candidate(scene, source, source_snapshot_value, request_signature):
+    preview_name = str(scene.get("smrn_surface_candidate_name", ""))
+    working_name = str(scene.get("smrn_surface_working_name", ""))
+    preview = bpy.data.objects.get(preview_name)
+    working = bpy.data.objects.get(working_name)
+    if (
+        preview is None
+        or working is None
+        or not preview_name.startswith(CANDIDATE_PREFIX)
+        or not working_name.startswith(WORKING_PREFIX)
+    ):
+        return None
+    try:
+        report = json.loads(str(preview.get(REPORT_KEY, "{}")))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        report.get("status") != "candidate_ready"
+        or not report.get("topology_qa", {}).get("passed")
+        or report.get("request_signature") != request_signature
+        or report.get("source", {}).get("fingerprint") != source_snapshot_value.get("fingerprint")
+        or str(preview.get("smrn_source_name", "")) != source.name
+        or str(working.get("smrn_source_name", "")) != source.name
+    ):
+        return None
+    reused_report = dict(report)
+    reused_report["reused_existing"] = True
+    keep_model_visible(scene, (source, preview))
+    return preview, reused_report
+
+
 def build_scene_candidate(scene, mode="smooth"):
     if mode not in {"smooth", "flatten"}:
         raise ValueError("不支持的局部网面重构模式")
     source, targets, excludes, before_snapshot = _source_and_records(scene)
+    request_signature = _candidate_request_signature(
+        scene, before_snapshot, targets, excludes, mode
+    )
+    existing = _matching_existing_candidate(
+        scene, source, before_snapshot, request_signature
+    )
+    if existing is not None:
+        return existing
     height_mode = str(getattr(scene, "smrn_surface_height_mode", "MEDIAN"))
     normal_mode = str(getattr(scene, "smrn_surface_normal_mode", "AUTO"))
     normal_hint = _normal_hint_from_records(source, targets, excludes, normal_mode) if mode == "flatten" else None
@@ -841,6 +928,8 @@ def build_scene_candidate(scene, mode="smooth"):
             "working_object": working.name,
             "preview_object": preview.name,
             "mode": mode,
+            "request_signature": request_signature,
+            "reused_existing": False,
             "flatten_reference": {
                 "height_mode": height_mode,
                 "normal_mode": normal_mode,
@@ -871,7 +960,8 @@ def build_scene_candidate(scene, mode="smooth"):
             _remove_object(preview)
         if working is not None:
             _remove_object(working)
-        keep_model_visible(scene, (source,))
+        old_preview = bpy.data.objects.get(str(scene.get("smrn_surface_candidate_name", "")))
+        keep_model_visible(scene, (source, old_preview))
         raise
 
 

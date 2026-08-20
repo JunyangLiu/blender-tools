@@ -160,6 +160,13 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("def _region_face_components", adapter)
         self.assertIn('"flipped_faces"', adapter)
         self.assertIn('"degenerate_faces"', adapter)
+        self.assertIn("def _candidate_request_signature", adapter)
+        self.assertIn("def _matching_existing_candidate", adapter)
+        self.assertIn('report["reused_existing"] = True', adapter)
+        self.assertIn('"request_signature": request_signature', adapter)
+        self.assertIn("已保留上一版候选", operators)
+        self.assertIn("无需重复生成", operators)
+        self.assertTrue((ROOT / "scripts" / "live_surface_repeat_click_test.py").is_file())
 
 
 if __name__ == "__main__":

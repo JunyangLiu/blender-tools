@@ -528,11 +528,21 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
     )
 
     def execute(self, context):
+        previous_candidate_name = str(context.scene.get("smrn_surface_candidate_name", ""))
+        previous_candidate = bpy.data.objects.get(previous_candidate_name)
+        had_previous_candidate = bool(
+            previous_candidate is not None
+            and previous_candidate_name.startswith("SMRN_SURFACE_CANDIDATE_")
+        )
         try:
             candidate, report = build_surface_candidate(context.scene, self.mode)
         except (ValueError, RuntimeError) as error:
-            self.report({"ERROR"}, str(error))
-            context.scene.smrn_surface_summary = f"生成失败：{error}"
+            if had_previous_candidate and bpy.data.objects.get(previous_candidate_name) is not None:
+                message = f"新设置未通过，已保留上一版候选；源网格未修改：{error}"
+            else:
+                message = f"生成失败：{error}"
+            self.report({"ERROR"}, message)
+            context.scene.smrn_surface_summary = message
             _set_status(context.scene, context.scene.smrn_surface_summary)
             return {"CANCELLED"}
         topology = report["topology_qa"]
@@ -545,6 +555,11 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
             normal_labels = {"AUTO": "自动法向", "FIRST_TARGET": "首个绿面法向", "RED_REFERENCE": "红面法向"}
             choice = report.get("flatten_reference") or {}
             reference = f" · {labels.get(choice.get('height_mode'), '居中')} / {normal_labels.get(choice.get('normal_mode'), '自动法向')}"
+        if report.get("reused_existing"):
+            context.scene.smrn_surface_summary = f"当前{action}候选已经是最新结果，无需重复生成{reference}"
+            self.report({"INFO"}, context.scene.smrn_surface_summary)
+            _set_status(context.scene, context.scene.smrn_surface_summary)
+            return {"FINISHED"}
         context.scene.smrn_surface_summary = (
             f"{action}候选 · {region['selected_faces']} 面 → "
             f"{topology['region_faces_after']} 面 · {protection}{reference}"
