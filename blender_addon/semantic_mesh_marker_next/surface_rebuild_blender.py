@@ -337,13 +337,6 @@ def _rebuild_working_mesh(
     locked_segments = [(edge.verts[0].co.copy(), edge.verts[1].co.copy()) for edge in locked_edges]
     local_lengths = [edge.calc_length() for edge in selected_edges if edge.calc_length() > 1.0e-9]
     local_scale = _percentile(local_lengths, 0.5) if local_lengths else 1.0e-4
-    before_inner_edges = {
-        edge for edge in selected_edges
-        if len(edge.link_faces) == 2
-        and all(face in selected_set for face in edge.link_faces)
-        and all(vertex not in locked_initial_vertices for vertex in edge.verts)
-    }
-    before_p95 = _percentile(_edge_dihedrals(before_inner_edges), 0.95)
     before_topology = _topology_signature(bm)
 
     cuts = (2 ** max(1, min(2, int(level)))) - 1
@@ -404,6 +397,17 @@ def _rebuild_working_mesh(
         bm.free()
         _remove_object(working)
         raise ValueError("绿色区域没有内部可移动顶点；请把需要平整的绿色范围多刷一圈")
+    # Compare the exact same post-subdivision edges before and after fitting.
+    # Comparing original coarse edges against new triangulation edges mixes
+    # different populations and can falsely reject an otherwise safe result.
+    region_set = set(region_faces)
+    matched_dihedral_edges = {
+        edge for face in region_faces for edge in face.edges
+        if len(edge.link_faces) == 2
+        and all(linked in region_set for linked in edge.link_faces)
+        and all(vertex not in locked_vertices for vertex in edge.verts)
+    }
+    before_p95 = _percentile(_edge_dihedrals(matched_dihedral_edges), 0.95)
     before_coordinates = {vertex: vertex.co.copy() for vertex in movable}
     qa_faces = set(region_faces)
     before_face_geometry = {}
@@ -624,31 +628,34 @@ def _rebuild_working_mesh(
             degenerate_faces += 1
         if before_normal.length_squared and face.normal.length_squared and before_normal.dot(face.normal) <= 0.0:
             flipped_faces += 1
-    region_set = set(region_faces)
-    region_edges = {
-        edge for face in region_faces for edge in face.edges
-        if len(edge.link_faces) == 2 and all(linked in region_set for linked in edge.link_faces)
-    }
-    qa_region_edges = {
-        edge for edge in region_edges
-        if all(vertex not in locked_vertices for vertex in edge.verts)
-    }
-    after_p95 = _percentile(_edge_dihedrals(qa_region_edges), 0.95)
-    dihedral_comparable = bool(before_inner_edges) and bool(qa_region_edges)
+    after_p95 = _percentile(_edge_dihedrals(matched_dihedral_edges), 0.95)
+    dihedral_comparable = bool(matched_dihedral_edges)
     after_topology = _topology_signature(bm)
-    topology_passed = (
-        after_topology["invalid_edges"] <= before_topology["invalid_edges"]
-        and after_topology["boundary_components"] <= before_topology["boundary_components"]
-        and (not dihedral_comparable or after_p95 <= before_p95 + math.radians(2.0))
-    )
+    quality_gates = {
+        "non_manifold_not_worse": (
+            after_topology["invalid_edges"] <= before_topology["invalid_edges"]
+        ),
+        "boundary_components_not_worse": (
+            after_topology["boundary_components"] <= before_topology["boundary_components"]
+        ),
+        "matched_dihedral_within_limit": (
+            not dihedral_comparable or after_p95 <= before_p95 + math.radians(2.0)
+        ),
+        "planarity_improved": True,
+        "displacement_within_limit": True,
+        "flatten_progress_sufficient": True,
+        "no_flipped_faces": flipped_faces == 0,
+        "no_degenerate_faces": degenerate_faces == 0,
+    }
     if planarity is not None:
-        topology_passed = (
-            topology_passed
-            and planarity["after_rms"] <= planarity["before_rms"] + 1.0e-9
-            and (max(moved) if moved else 0.0) <= max_allowed
-            and flatten_progress_passed
+        quality_gates["planarity_improved"] = (
+            planarity["after_rms"] <= planarity["before_rms"] + 1.0e-9
         )
-    topology_passed = topology_passed and flipped_faces == 0 and degenerate_faces == 0
+        quality_gates["displacement_within_limit"] = (
+            (max(moved) if moved else 0.0) <= max_allowed
+        )
+        quality_gates["flatten_progress_sufficient"] = flatten_progress_passed
+    topology_passed = all(quality_gates.values())
 
     preview_vertices = []
     preview_faces = []
@@ -698,8 +705,10 @@ def _rebuild_working_mesh(
         "before_dihedral_p95_degrees": math.degrees(before_p95),
         "after_dihedral_p95_degrees": math.degrees(after_p95),
         "dihedral_qa_comparable": dihedral_comparable,
-        "dihedral_edges_before": len(before_inner_edges),
-        "dihedral_edges_after": len(qa_region_edges),
+        "dihedral_sample_matched": True,
+        "dihedral_edges_before": len(matched_dihedral_edges),
+        "dihedral_edges_after": len(matched_dihedral_edges),
+        "quality_gates": quality_gates,
         "passed": topology_passed,
     }
     return working, preview_vertices, preview_faces, report
@@ -794,7 +803,7 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
             "normal_mode": str(getattr(scene, "smrn_surface_normal_mode", "AUTO")),
         })
     payload = {
-        "schema": 3,
+        "schema": 4,
         "source_fingerprint": str(source_snapshot_value.get("fingerprint", "")),
         "mode": mode,
         "scope_policy": "strict_green_faces_only_v2",
@@ -882,13 +891,38 @@ def build_scene_candidate(scene, mode="smooth"):
         )
         if not topology["passed"]:
             failures = []
+            gates = topology.get("quality_gates", {})
+            before_topology = topology.get("before_topology", {})
+            after_topology = topology.get("after_topology", {})
+            if gates.get("non_manifold_not_worse") is False:
+                failures.append(
+                    "非流形边 "
+                    f"{before_topology.get('invalid_edges', '?')}→"
+                    f"{after_topology.get('invalid_edges', '?')}"
+                )
+            if gates.get("boundary_components_not_worse") is False:
+                failures.append(
+                    "边界连通块 "
+                    f"{before_topology.get('boundary_components', '?')}→"
+                    f"{after_topology.get('boundary_components', '?')}"
+                )
+            if gates.get("matched_dihedral_within_limit") is False:
+                failures.append(
+                    f"同批 {topology.get('dihedral_edges_before', 0)} 条边的折角 "
+                    f"{topology.get('before_dihedral_p95_degrees', 0.0):.2f}°→"
+                    f"{topology.get('after_dihedral_p95_degrees', 0.0):.2f}°"
+                )
             if topology.get("flipped_faces"):
                 failures.append(f"{topology['flipped_faces']} 个面翻转")
             if topology.get("degenerate_faces"):
                 failures.append(f"{topology['degenerate_faces']} 个面退化")
             if topology.get("max_actual_displacement", 0.0) > topology.get("max_allowed_displacement", 0.0):
                 failures.append("拟合位移超过局部网格尺度")
-            detail = "、".join(failures) or "非流形边或局部折角变差"
+            if gates.get("planarity_improved") is False:
+                failures.append("平面误差没有改善")
+            if gates.get("flatten_progress_sufficient") is False:
+                failures.append("安全回退后平整进度不足")
+            detail = "、".join(failures) or "未识别的局部质量门失败"
             raise ValueError(f"平整质量检查未通过（{detail}），已拒绝生成；源网格未修改")
         checkpoint = _checkpoint(scene, source)
         _link_hidden_working(scene, working)

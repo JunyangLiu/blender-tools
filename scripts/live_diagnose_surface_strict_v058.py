@@ -28,7 +28,12 @@ height_points = _height_reference_from_records(source, excludes, height_mode)
 probe = bmesh.new()
 probe.from_mesh(source.data)
 selected, growth = _grow_marked_region(probe, source, targets, excludes, hard_angle)
-excluded = set(_seed_face_indices(excludes, len(probe.faces)))
+excluded = set(
+    _seed_face_indices(
+        [record for record in excludes if record.hit_object_name == source.name],
+        len(probe.faces),
+    )
+)
 probe.free()
 
 working = None
