@@ -382,6 +382,113 @@ def _canvas_boundary_fades(region_vertices, locked_vertices):
     }
 
 
+def _canvas_macro_fold_edges(selected_edges, hard_angle, local_scale):
+    """Protect only source-supported major folds, not coarse triangulation."""
+    threshold = max(math.radians(70.0), float(hard_angle) + math.radians(25.0))
+    minimum_length = max(local_scale * 0.35, 1.0e-10)
+    folds = set()
+    for edge in selected_edges:
+        if len(edge.link_faces) != 2 or edge.calc_length() < minimum_length:
+            continue
+        try:
+            if edge.calc_face_angle(0.0) >= threshold:
+                folds.add(edge)
+        except ValueError:
+            continue
+    return folds, threshold
+
+
+def _canvas_subdivision_cuts(selected_face_count):
+    """Choose enough density for waves while keeping the local job bounded."""
+    count = max(1, int(selected_face_count))
+    for cuts in (7, 3, 1):
+        if count * ((cuts + 1) ** 2) <= 24000:
+            return cuts
+    return 1
+
+
+def _canvas_facet_edge_samples(region_faces, source_facet_segments, tolerance):
+    """Find subdivided descendants of unlocked coarse source facet edges."""
+    if not source_facet_segments:
+        return set()
+    candidates = {
+        edge for face in region_faces for edge in face.edges
+        if len(edge.link_faces) == 2
+    }
+    matched = set()
+    for edge in candidates:
+        first, second = edge.verts
+        for start, end in source_facet_segments:
+            if (
+                _point_segment_distance(first.co, start, end) <= tolerance
+                and _point_segment_distance(second.co, start, end) <= tolerance
+            ):
+                matched.add(edge)
+                break
+    return matched
+
+
+def _taubin_fair_canvas(
+    bm, movable, region_faces, original_coordinates, local_scale, iterations=44,
+):
+    """Fair the dense cloth base without shrinking its locked silhouette."""
+    movable_set = set(movable)
+    reference_geometry = {
+        face: (face.normal.copy(), max(float(face.calc_area()), 1.0e-20))
+        for face in region_faces
+    }
+    maximum_base_displacement = local_scale * 0.42
+    completed = 0
+    rollback_count = 0
+
+    def laplacian_targets():
+        targets = {}
+        for vertex in movable_set:
+            neighbors = [edge.other_vert(vertex) for edge in vertex.link_edges]
+            if not neighbors:
+                continue
+            average = sum((neighbor.co for neighbor in neighbors), Vector((0.0, 0.0, 0.0)))
+            targets[vertex] = average / len(neighbors) - vertex.co
+        return targets
+
+    for _iteration in range(max(0, int(iterations))):
+        before_iteration = {vertex: vertex.co.copy() for vertex in movable_set}
+        for factor in (0.45, -0.46):
+            offsets = laplacian_targets()
+            for vertex, offset in offsets.items():
+                vertex.co += offset * factor
+            for vertex, original in original_coordinates.items():
+                displacement = vertex.co - original
+                if displacement.length > maximum_base_displacement:
+                    vertex.co = original + displacement.normalized() * maximum_base_displacement
+        bm.normal_update()
+        unsafe = False
+        for face, (before_normal, before_area) in reference_geometry.items():
+            if float(face.calc_area()) <= before_area * 0.05:
+                unsafe = True
+                break
+            if before_normal.length_squared and face.normal.length_squared:
+                if before_normal.dot(face.normal) <= 0.0:
+                    unsafe = True
+                    break
+        if unsafe:
+            for vertex, coordinate in before_iteration.items():
+                vertex.co = coordinate
+            bm.normal_update()
+            rollback_count += 1
+            break
+        completed += 1
+    return {
+        "method": "bounded_taubin_fairing_before_wave_v1",
+        "requested_iterations": int(iterations),
+        "completed_iterations": completed,
+        "rollback_count": rollback_count,
+        "lambda": 0.45,
+        "mu": -0.46,
+        "maximum_base_displacement": maximum_base_displacement,
+    }
+
+
 def _rebuild_working_mesh(
     source, selected_indices, excluded_indices, level, strength, hard_angle, mode="smooth",
     height_mode="MEDIAN", normal_hint=None, normal_mode="AUTO", height_reference_points=None,
@@ -428,20 +535,40 @@ def _rebuild_working_mesh(
                 hard_edges.add(edge)
         except ValueError:
             hard_edges.add(edge)
+    local_lengths = [edge.calc_length() for edge in selected_edges if edge.calc_length() > 1.0e-9]
+    local_scale = _percentile(local_lengths, 0.5) if local_lengths else 1.0e-4
+    canvas_macro_folds = set()
+    canvas_fold_threshold = None
+    if mode == "canvas":
+        canvas_macro_folds, canvas_fold_threshold = _canvas_macro_fold_edges(
+            selected_edges, hard_angle, local_scale
+        )
     # Green faces are the complete editable scope.  Both modes hard-lock the
     # green outer boundary, every red face, and (for smoothing) hard features.
     # Never borrow unmarked neighbours as a transition band: if the marked
     # patch has no editable interior, fail closed and ask for a wider mark.
-    protected_feature_edges = hard_edges if mode != "flatten" else set()
+    protected_feature_edges = (
+        canvas_macro_folds if mode == "canvas"
+        else (hard_edges if mode != "flatten" else set())
+    )
     excluded_edges = {edge for face in excluded for edge in face.edges}
     locked_edges = boundary_edges | protected_feature_edges | excluded_edges
     locked_initial_vertices = {vertex for edge in locked_edges for vertex in edge.verts}
     locked_segments = [(edge.verts[0].co.copy(), edge.verts[1].co.copy()) for edge in locked_edges]
-    local_lengths = [edge.calc_length() for edge in selected_edges if edge.calc_length() > 1.0e-9]
-    local_scale = _percentile(local_lengths, 0.5) if local_lengths else 1.0e-4
+    canvas_facet_segments = [
+        (edge.verts[0].co.copy(), edge.verts[1].co.copy())
+        for edge in selected_edges
+        if edge not in locked_edges
+        and len(edge.link_faces) == 2
+        and all(face in selected_set for face in edge.link_faces)
+    ] if mode == "canvas" else []
     before_topology = _topology_signature(bm)
 
-    cuts = (2 ** max(1, min(2, int(level)))) - 1
+    cuts = (
+        _canvas_subdivision_cuts(len(selected_indices))
+        if mode == "canvas"
+        else (2 ** max(1, min(2, int(level)))) - 1
+    )
     bmesh.ops.subdivide_edges(
         bm,
         edges=list(selected_edges),
@@ -494,6 +621,11 @@ def _rebuild_working_mesh(
             for first, second in locked_segments
         )
     }
+    canvas_facet_edges = _canvas_facet_edge_samples(
+        region_faces,
+        canvas_facet_segments,
+        max(1.0e-8, local_scale * 1.0e-5),
+    ) if mode == "canvas" else set()
     movable = list(region_vertices - locked_vertices)
     if mode == "flatten" and not movable:
         bm.free()
@@ -526,6 +658,7 @@ def _rebuild_working_mesh(
     smoothing_factor = 0.0
     smoothing_iterations = 0
     canvas_wave = None
+    canvas_base_fairing = None
     if mode == "flatten" and movable:
         components = _region_face_components(region_faces, locked_region_edges)
         component_reports = []
@@ -713,20 +846,34 @@ def _rebuild_working_mesh(
             face: (face.normal.copy(), max(float(face.calc_area()), 1.0e-20))
             for face in qa_faces
         }
-        # Only soften undersampled facets.  The protected hard edges and the
-        # small displacement cap keep source large folds intact.
-        smoothing_factor = bounded_strength * (0.08 + 0.10 * bounded_strength)
-        smoothing_iterations = 0 if bounded_strength <= 0.0 else 1 + int(math.ceil(bounded_strength * 2.0))
-        for _iteration in range(smoothing_iterations):
-            bmesh.ops.smooth_vert(
-                bm,
-                verts=movable,
-                factor=smoothing_factor,
-                use_axis_x=True,
-                use_axis_y=True,
-                use_axis_z=True,
-            )
+        facet_before = _edge_dihedrals(canvas_facet_edges)
+        canvas_base_fairing = _taubin_fair_canvas(
+            bm, movable, region_faces, before_coordinates, local_scale, iterations=44,
+        )
+        smoothing_factor = canvas_base_fairing["lambda"]
+        smoothing_iterations = canvas_base_fairing["completed_iterations"]
         bm.normal_update()
+        facet_after_base = _edge_dihedrals(canvas_facet_edges)
+        facet_before_p95 = _percentile(facet_before, 0.95)
+        facet_after_p95 = _percentile(facet_after_base, 0.95)
+        meaningful_faceting = facet_before_p95 >= math.radians(2.0)
+        canvas_base_fairing.update({
+            "facet_edges_sampled": len(canvas_facet_edges),
+            "before_facet_dihedral_p95_degrees": math.degrees(facet_before_p95),
+            "after_fairing_facet_dihedral_p95_degrees": math.degrees(facet_after_p95),
+            "faceting_reduction_fraction": (
+                1.0 - facet_after_p95 / facet_before_p95
+                if facet_before_p95 > 1.0e-20 else 0.0
+            ),
+            "meaningful_source_faceting": meaningful_faceting,
+            "passed": (
+                not meaningful_faceting
+                or (
+                    facet_after_p95 <= facet_before_p95 * 0.65
+                    and facet_after_p95 <= math.radians(18.0)
+                )
+            ),
+        })
         wave_amplitude = frame["base_amplitude"] * bounded_strength
         maximum_wave = 0.0
         for vertex in movable:
@@ -746,13 +893,13 @@ def _rebuild_working_mesh(
             vertex.co += direction * displacement
             maximum_wave = max(maximum_wave, abs(displacement))
         # Includes both gentle facet smoothing and generated wave displacement.
-        max_allowed = local_scale * (0.12 + 0.16 * bounded_strength)
+        max_allowed = local_scale * (0.44 + 0.10 * bounded_strength)
         for vertex, original in before_coordinates.items():
             displacement = vertex.co - original
             if displacement.length > max_allowed:
                 vertex.co = original + displacement.normalized() * max_allowed
         canvas_wave = {
-            "method": "source_aligned_periodic_residual_fit_v1",
+            "method": "fair_base_then_source_aligned_wave_v2",
             "semantic_class": "marked_draped_or_folded_canvas_surface",
             "coordinate_frame": {
                 "center_local": list(frame["center"]),
@@ -775,7 +922,12 @@ def _rebuild_working_mesh(
             "random_displacement": False,
             "whole_vehicle_search": False,
             "source_objects_scanned": 1,
-            "large_fold_policy": "preserve_hard_features_and_fit_only_residual_detail",
+            "automatic_subdivision": True,
+            "automatic_subdivision_cuts": cuts,
+            "large_fold_threshold_degrees": math.degrees(canvas_fold_threshold),
+            "protected_large_fold_edges": len(canvas_macro_folds),
+            "base_surface_fairing": canvas_base_fairing,
+            "large_fold_policy": "lock_only_major_folds_then_fair_coarse_facet_edges",
         }
     elif strength > 0.0 and movable:
         bounded_strength = max(0.0, min(1.0, float(strength)))
@@ -865,7 +1017,14 @@ def _rebuild_working_mesh(
             "maximum_allowed_displacement": max_allowed,
             "scope": "strict_green_interior_only",
         }
+        quality_gates["canvas_base_faceting_reduced"] = bool(
+            canvas_base_fairing and canvas_base_fairing.get("passed")
+        )
     topology_passed = all(quality_gates.values())
+
+    if mode == "canvas":
+        for face in region_faces:
+            face.smooth = True
 
     preview_vertices = []
     preview_faces = []
@@ -892,12 +1051,14 @@ def _rebuild_working_mesh(
         "local_vertices_after": len(preview_vertices),
         "subdivision_level": int(level),
         "subdivision_cuts": cuts,
+        "automatic_canvas_subdivision": mode == "canvas",
         "smoothing_strength": float(strength),
         "smoothing_factor": smoothing_factor,
         "smoothing_iterations": smoothing_iterations,
         "mode": mode,
         "planarity_qa": planarity,
         "canvas_wave_qa": canvas_wave,
+        "canvas_base_fairing_qa": canvas_base_fairing,
         "local_edge_scale": local_scale,
         "max_allowed_displacement": max_allowed,
         "max_actual_displacement": max(moved) if moved else 0.0,
@@ -932,6 +1093,8 @@ def _preview_object(scene, source, vertices, faces):
     mesh = bpy.data.meshes.new(CANDIDATE_PREFIX + "MESH")
     mesh.from_pydata(vertices, [], faces)
     mesh.update(calc_edges=True)
+    for polygon in mesh.polygons:
+        polygon.use_smooth = True
     obj = bpy.data.objects.new(CANDIDATE_PREFIX + source.name, mesh)
     candidates.objects.link(obj)
     obj.matrix_world = source.matrix_world.copy()
@@ -1021,7 +1184,8 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
             "normal_mode": str(getattr(scene, "smrn_surface_normal_mode", "AUTO")),
         })
     payload = {
-        "schema": 5,
+        "schema": 7,
+        "canvas_pipeline": "fair_base_then_source_aligned_wave_v2" if mode == "canvas" else None,
         "source_fingerprint": str(source_snapshot_value.get("fingerprint", "")),
         "mode": mode,
         "scope_policy": "strict_green_faces_only_v2",
@@ -1141,6 +1305,13 @@ def build_scene_candidate(scene, mode="smooth"):
                     f"同批 {topology.get('dihedral_edges_before', 0)} 条边的折角 "
                     f"{topology.get('before_dihedral_p95_degrees', 0.0):.2f}°→"
                     f"{topology.get('after_dihedral_p95_degrees', 0.0):.2f}°"
+                )
+            if gates.get("canvas_base_faceting_reduced") is False:
+                fairing = topology.get("canvas_base_fairing_qa") or {}
+                failures.append(
+                    "帆布低模棱面仍偏强 "
+                    f"{fairing.get('before_facet_dihedral_p95_degrees', 0.0):.2f}°→"
+                    f"{fairing.get('after_fairing_facet_dihedral_p95_degrees', 0.0):.2f}°"
                 )
             if topology.get("flipped_faces"):
                 failures.append(f"{topology['flipped_faces']} 个面翻转")
