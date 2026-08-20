@@ -41,6 +41,19 @@ def _remove_object(obj):
         bpy.data.meshes.remove(mesh)
 
 
+def _set_current_mark_overlays_hidden(scene, hidden):
+    """Temporarily clear only this task's colored overlays from candidate view."""
+    changed = 0
+    for record in load_all_marks(scene):
+        overlay = bpy.data.objects.get(record.overlay_object_name)
+        if overlay is None:
+            continue
+        overlay.hide_set(bool(hidden))
+        overlay["smrn_hidden_for_surface_preview"] = bool(hidden)
+        changed += 1
+    return changed
+
+
 def _checkpoint(scene, source):
     current = Path(bpy.data.filepath) if bpy.data.filepath else None
     if current is None:
@@ -489,6 +502,74 @@ def _taubin_fair_canvas(
     }
 
 
+def _canvas_outer_envelope_shift(
+    movable, region_vertices, source_coordinates, outward_normal, local_scale,
+):
+    """Lift the fair cloth by the exact minimum needed to cover source peaks.
+
+    The locally subdivided candidate and the saved source coordinates share
+    the same parameterization.  A single calculated translation therefore
+    preserves the already-faired shape while making every movable source
+    sample lie behind the candidate.  Locked boundary vertices stay exactly
+    on the untouched source, so the replacement still joins the unmarked
+    mesh without a guessed transition band.
+    """
+    direction = outward_normal.copy()
+    if not direction.length_squared:
+        raise ValueError("帆布标记区无法确定稳定的外侧法向")
+    direction.normalize()
+    movable_set = set(movable)
+    clearance = max(float(local_scale) * 0.004, 1.0e-6)
+    maximum_shift = max(float(local_scale) * 0.18, clearance)
+    before_offsets = {
+        vertex: float((vertex.co - source_coordinates[vertex]).dot(direction))
+        for vertex in movable_set
+    }
+    required_shift = max(
+        (clearance - offset for offset in before_offsets.values()),
+        default=0.0,
+    )
+    applied_shift = min(max(0.0, required_shift), maximum_shift)
+    if applied_shift:
+        translation = direction * applied_shift
+        for vertex in movable_set:
+            vertex.co += translation
+    after_offsets = {
+        vertex: float((vertex.co - source_coordinates[vertex]).dot(direction))
+        for vertex in movable_set
+    }
+    tolerance = max(clearance * 0.1, 1.0e-7)
+    uncovered_before = sum(offset < -tolerance for offset in before_offsets.values())
+    uncovered_after = sum(offset < -tolerance for offset in after_offsets.values())
+    all_offsets_after = [
+        float((vertex.co - source_coordinates[vertex]).dot(direction))
+        for vertex in region_vertices
+    ]
+    passed = (
+        required_shift <= maximum_shift + 1.0e-12
+        and uncovered_after == 0
+        and min(after_offsets.values(), default=0.0) >= clearance - tolerance
+        and min(all_offsets_after, default=0.0) >= -tolerance
+    )
+    return {
+        "method": "exact_minimum_frame_normal_outer_shift_v1",
+        "parameterization": "same_locally_subdivided_marked_surface",
+        "source_vertices_sampled": len(region_vertices),
+        "movable_vertices_sampled": len(movable_set),
+        "outer_clearance": clearance,
+        "minimum_signed_offset_before": min(before_offsets.values(), default=0.0),
+        "minimum_signed_offset_after": min(after_offsets.values(), default=0.0),
+        "required_outer_shift": required_shift,
+        "applied_outer_shift": applied_shift,
+        "maximum_allowed_outer_shift": maximum_shift,
+        "uncovered_vertices_before": uncovered_before,
+        "uncovered_vertices_after": uncovered_after,
+        "locked_boundary_vertices_moved": 0,
+        "whole_vehicle_search": False,
+        "passed": passed,
+    }
+
+
 def _rebuild_working_mesh(
     source, selected_indices, excluded_indices, level, strength, hard_angle, mode="smooth",
     height_mode="MEDIAN", normal_hint=None, normal_mode="AUTO", height_reference_points=None,
@@ -646,6 +727,7 @@ def _rebuild_working_mesh(
         and all(vertex not in locked_vertices for vertex in edge.verts)
     }
     before_p95 = _percentile(_edge_dihedrals(matched_dihedral_edges), 0.95)
+    source_region_coordinates = {vertex: vertex.co.copy() for vertex in region_vertices}
     before_coordinates = {vertex: vertex.co.copy() for vertex in movable}
     qa_faces = set(region_faces)
     before_face_geometry = {}
@@ -659,6 +741,7 @@ def _rebuild_working_mesh(
     smoothing_iterations = 0
     canvas_wave = None
     canvas_base_fairing = None
+    canvas_outer_envelope = None
     if mode == "flatten" and movable:
         components = _region_face_components(region_faces, locked_region_edges)
         component_reports = []
@@ -898,8 +981,16 @@ def _rebuild_working_mesh(
             displacement = vertex.co - original
             if displacement.length > max_allowed:
                 vertex.co = original + displacement.normalized() * max_allowed
+        canvas_outer_envelope = _canvas_outer_envelope_shift(
+            movable,
+            region_vertices,
+            source_region_coordinates,
+            frame["normal"],
+            local_scale,
+        )
+        bm.normal_update()
         canvas_wave = {
-            "method": "fair_base_then_source_aligned_wave_v2",
+            "method": "fair_base_then_source_aligned_wave_outer_envelope_v3",
             "semantic_class": "marked_draped_or_folded_canvas_surface",
             "coordinate_frame": {
                 "center_local": list(frame["center"]),
@@ -927,6 +1018,7 @@ def _rebuild_working_mesh(
             "large_fold_threshold_degrees": math.degrees(canvas_fold_threshold),
             "protected_large_fold_edges": len(canvas_macro_folds),
             "base_surface_fairing": canvas_base_fairing,
+            "outer_envelope_qa": canvas_outer_envelope,
             "large_fold_policy": "lock_only_major_folds_then_fair_coarse_facet_edges",
         }
     elif strength > 0.0 and movable:
@@ -1020,6 +1112,9 @@ def _rebuild_working_mesh(
         quality_gates["canvas_base_faceting_reduced"] = bool(
             canvas_base_fairing and canvas_base_fairing.get("passed")
         )
+        quality_gates["canvas_outer_envelope_complete"] = bool(
+            canvas_outer_envelope and canvas_outer_envelope.get("passed")
+        )
     topology_passed = all(quality_gates.values())
 
     if mode == "canvas":
@@ -1059,6 +1154,7 @@ def _rebuild_working_mesh(
         "planarity_qa": planarity,
         "canvas_wave_qa": canvas_wave,
         "canvas_base_fairing_qa": canvas_base_fairing,
+        "canvas_outer_envelope_qa": canvas_outer_envelope,
         "local_edge_scale": local_scale,
         "max_allowed_displacement": max_allowed,
         "max_actual_displacement": max(moved) if moved else 0.0,
@@ -1141,6 +1237,7 @@ def remove_last_candidate(scene):
         _remove_object(working)
     scene["smrn_surface_candidate_name"] = ""
     scene["smrn_surface_working_name"] = ""
+    _set_current_mark_overlays_hidden(scene, False)
     keep_model_visible(scene)
     return found
 
@@ -1184,8 +1281,8 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
             "normal_mode": str(getattr(scene, "smrn_surface_normal_mode", "AUTO")),
         })
     payload = {
-        "schema": 7,
-        "canvas_pipeline": "fair_base_then_source_aligned_wave_v2" if mode == "canvas" else None,
+        "schema": 8,
+        "canvas_pipeline": "fair_base_then_source_aligned_wave_outer_envelope_v3" if mode == "canvas" else None,
         "source_fingerprint": str(source_snapshot_value.get("fingerprint", "")),
         "mode": mode,
         "scope_policy": "strict_green_faces_only_v2",
@@ -1226,6 +1323,7 @@ def _matching_existing_candidate(scene, source, source_snapshot_value, request_s
     # Normalize previews created by older add-on versions as soon as they are
     # reused; this is display-only and leaves both meshes untouched.
     preview.show_in_front = False
+    _set_current_mark_overlays_hidden(scene, True)
     keep_model_visible(scene, (source, preview))
     return preview, reused_report
 
@@ -1313,6 +1411,12 @@ def build_scene_candidate(scene, mode="smooth"):
                     f"{fairing.get('before_facet_dihedral_p95_degrees', 0.0):.2f}°→"
                     f"{fairing.get('after_fairing_facet_dihedral_p95_degrees', 0.0):.2f}°"
                 )
+            if gates.get("canvas_outer_envelope_complete") is False:
+                envelope = topology.get("canvas_outer_envelope_qa") or {}
+                failures.append(
+                    "帆布候选没有完整包住标记凸面 "
+                    f"（剩余 {envelope.get('uncovered_vertices_after', '?')} 个检查点）"
+                )
             if topology.get("flipped_faces"):
                 failures.append(f"{topology['flipped_faces']} 个面翻转")
             if topology.get("degenerate_faces"):
@@ -1340,7 +1444,7 @@ def build_scene_candidate(scene, mode="smooth"):
             "coverage_qa": {
                 "passed": True,
                 "method": (
-                    "strict_green_surface_with_dense_source_proximity"
+                    "strict_green_surface_with_dense_outer_envelope"
                     if mode == "canvas" else "exact_brushed_faces_only"
                 ),
                 "source_objects_scanned": 1,
@@ -1374,6 +1478,7 @@ def build_scene_candidate(scene, mode="smooth"):
         for old in (old_preview, old_working):
             if old is not None and old not in {preview, working}:
                 _remove_object(old)
+        _set_current_mark_overlays_hidden(scene, True)
         keep_model_visible(scene, (source, preview))
         return preview, report
     except Exception:
