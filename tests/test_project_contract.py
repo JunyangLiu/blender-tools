@@ -133,6 +133,8 @@ class ProjectContractTests(unittest.TestCase):
         operators = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "operators.py").read_text(encoding="utf-8")
         panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
         self.assertIn('CANDIDATE_PREFIX = "SMRN_SURFACE_CANDIDATE_"', adapter)
+        self.assertIn("obj.show_in_front = False", adapter)
+        self.assertIn("preview.show_in_front = False", adapter)
         self.assertIn('"global_geometry_scan": False', adapter)
         self.assertIn('"selection_method": "exact_brushed_faces"', adapter)
         self.assertIn('"display_radius_used_for_growth": False', adapter)

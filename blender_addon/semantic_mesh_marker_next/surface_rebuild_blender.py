@@ -731,7 +731,10 @@ def _preview_object(scene, source, vertices, faces):
     if obj.data.materials.get(material.name) is None:
         obj.data.materials.append(material)
     obj.display_type = "SOLID"
-    obj.show_in_front = True
+    # A reconstruction preview must obey normal viewport depth.  Drawing it
+    # through foreground armor or equipment makes the candidate look larger
+    # than its actual visible region and prevents a reliable visual review.
+    obj.show_in_front = False
     obj.show_wire = False
     obj.show_all_edges = False
     obj.color = (1.0, 0.28, 0.02, 1.0)
@@ -841,6 +844,9 @@ def _matching_existing_candidate(scene, source, source_snapshot_value, request_s
         return None
     reused_report = dict(report)
     reused_report["reused_existing"] = True
+    # Normalize previews created by older add-on versions as soon as they are
+    # reused; this is display-only and leaves both meshes untouched.
+    preview.show_in_front = False
     keep_model_visible(scene, (source, preview))
     return preview, reused_report
 
