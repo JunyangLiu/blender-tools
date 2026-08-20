@@ -98,19 +98,30 @@ class SMRN_PT_marking(bpy.types.Panel):
             icon="SNAP_FACE",
         )
         flatten.mode = "flatten"
-        if _candidate_exists(scene, "smrn_surface_candidate_name", "SMRN_SURFACE_CANDIDATE_"):
-            mode = str(scene.get("smrn_surface_candidate_mode", "smooth"))
+        has_surface_candidate = _candidate_exists(
+            scene, "smrn_surface_candidate_name", "SMRN_SURFACE_CANDIDATE_"
+        )
+        mode = str(scene.get("smrn_surface_candidate_mode", ""))
+        if has_surface_candidate:
             if mode == "smooth":
                 surface.prop(scene, "smrn_surface_smooth_strength", text="平滑程度", slider=True)
             apply = surface.operator(
                 "smrn.build_surface_candidate", text="重新应用（只重算标记附近）", icon="FILE_REFRESH"
             )
             apply.mode = mode
-            surface.operator(
-                "smrn.confirm_surface_replacement",
-                text="确认替换原网面并清除标记",
-                icon="CHECKMARK",
-            )
+
+        confirm_text = {
+            "flatten": "确认平整并清除标记",
+            "smooth": "确认平滑并清除标记",
+        }.get(mode, "确认平整/平滑并清除标记")
+        confirm_row = surface.row()
+        confirm_row.enabled = has_surface_candidate
+        confirm_row.operator(
+            "smrn.confirm_surface_replacement",
+            text=confirm_text,
+            icon="CHECKMARK",
+        )
+        if has_surface_candidate:
             surface.operator("smrn.remove_surface_candidate", text="移除当前网面候选", icon="TRASH")
 
         advanced = layout.box()

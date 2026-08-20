@@ -44,6 +44,37 @@ def _set_status(scene, text):
     scene.smrn_status = text
 
 
+def _restore_normal_selection(context, source=None):
+    """Exit semantic painting and return the viewport to ordinary object selection."""
+    context.scene[MODAL_TOKEN_KEY] = ""
+    try:
+        context.window.cursor_modal_restore()
+    except (AttributeError, RuntimeError):
+        pass
+
+    active = context.view_layer.objects.active
+    if active is not None and active.mode != "OBJECT":
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except RuntimeError:
+            pass
+
+    if source is not None:
+        for obj in tuple(context.selected_objects):
+            try:
+                obj.select_set(False)
+            except (AttributeError, ReferenceError):
+                pass
+        try:
+            source.select_set(True)
+            context.view_layer.objects.active = source
+        except (AttributeError, ReferenceError):
+            pass
+        keep_model_visible(context.scene, (source,))
+    else:
+        keep_model_visible(context.scene)
+
+
 def _accepted_collection(scene):
     model, _candidates, _helpers = ensure_scene_roots(scene)
     name = "SMR_01A_已确认修复_始终可见"
@@ -119,11 +150,16 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
     mark_value: bpy.props.IntProperty(default=1)
 
     def _finish(self, context):
-        if context.scene.get(MODAL_TOKEN_KEY, "") == getattr(self, "_token", ""):
+        owns_token = context.scene.get(MODAL_TOKEN_KEY, "") == getattr(self, "_token", "")
+        if owns_token:
             context.scene[MODAL_TOKEN_KEY] = ""
-        context.window.cursor_modal_restore()
-        counts = document_summary(context.scene)["role_counts"]
-        _set_status(context.scene, f"标记结束：目标 {counts['target']}，排除 {counts['exclude']}。")
+        try:
+            context.window.cursor_modal_restore()
+        except (AttributeError, RuntimeError):
+            pass
+        if owns_token:
+            counts = document_summary(context.scene)["role_counts"]
+            _set_status(context.scene, f"标记结束：目标 {counts['target']}，排除 {counts['exclude']}。")
 
     def _over_sidebar(self, mouse_x, mouse_y):
         return self._ui_region is not None and (
@@ -327,8 +363,7 @@ class SMRN_OT_stop_marking(bpy.types.Operator):
     bl_label = "退出标记 / 恢复普通选择"
 
     def execute(self, context):
-        context.scene[MODAL_TOKEN_KEY] = ""
-        keep_model_visible(context.scene)
+        _restore_normal_selection(context)
         _set_status(context.scene, "已退出标记模式；普通选择已恢复。")
         return {"FINISHED"}
 
@@ -598,7 +633,7 @@ class SMRN_OT_confirm_surface_replacement(bpy.types.Operator):
             removed = clear_task_marks(context.scene)
             for record in removed:
                 remove_overlay(record.overlay_object_name)
-            keep_model_visible(context.scene, (source,))
+            _restore_normal_selection(context, source)
             bpy.ops.wm.save_mainfile()
         except (ValueError, RuntimeError) as error:
             self.report({"ERROR"}, str(error))
@@ -607,7 +642,7 @@ class SMRN_OT_confirm_surface_replacement(bpy.types.Operator):
         context.scene.smrn_surface_summary = "尚未生成局部网面候选"
         _set_status(
             context.scene,
-            f"局部原网面已确认，旧网格归档为 {archive.name}；清除本轮 {len(removed)} 个标记",
+            f"局部原网面已确认，旧网格归档为 {archive.name}；清除本轮 {len(removed)} 个标记，普通选择已恢复",
         )
         return {"FINISHED"}
 
