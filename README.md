@@ -37,6 +37,7 @@
 - `docs/rotational_surface_v1.md`：新旋转曲面算法、门槛和限制。
 - `docs/handle_restoration_v1.md`：扶手路径、安装角、截面和质量门槛。
 - `docs/local_surface_rebuild_v1.md`：局部细化、平整、边界保护与确认替换规则。
+- 局部重构另提供独立的“多折面帆布优化”：保留连续折脊，并让靠悬挂/绳侧的皱褶更密；原帆布波浪入口保持不变。
 - `tests/`：不依赖 Blender 的记录、存储和数学回归测试。
 - `scripts/build_addon.ps1`：生成可安装 ZIP。
 

@@ -8,7 +8,7 @@ external references.
 
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime
 import hashlib
 import json
@@ -411,6 +411,125 @@ def _canvas_macro_fold_edges(selected_edges, hard_angle, local_scale):
     return folds, threshold
 
 
+def _multifold_canvas_edges(selected_edges, boundary_edges, hard_angle, local_scale):
+    """Keep coherent source fold ridges while rejecting triangulation noise."""
+    minimum_length = max(local_scale * 0.28, 1.0e-10)
+    samples = []
+    for edge in selected_edges:
+        if len(edge.link_faces) != 2 or edge.calc_length() < minimum_length:
+            continue
+        try:
+            samples.append((edge, float(edge.calc_face_angle(0.0))))
+        except ValueError:
+            continue
+    angles = [angle for _edge, angle in samples]
+    adaptive = _percentile(angles, 0.75) if angles else float(hard_angle)
+    threshold = max(
+        math.radians(34.0),
+        min(math.radians(58.0), adaptive),
+        float(hard_angle),
+    )
+    strong = {edge for edge, angle in samples if angle >= threshold}
+    boundary_vertices = {vertex for edge in boundary_edges for vertex in edge.verts}
+    strong_degree = defaultdict(int)
+    for edge in strong:
+        for vertex in edge.verts:
+            strong_degree[vertex] += 1
+    coherent = {
+        edge for edge in strong
+        if any(strong_degree[vertex] >= 2 or vertex in boundary_vertices for vertex in edge.verts)
+    }
+    return coherent, threshold, {
+        "sampled_internal_edges": len(samples),
+        "strong_edges_before_coherence": len(strong),
+        "protected_coherent_fold_edges": len(coherent),
+        "threshold_degrees": math.degrees(threshold),
+    }
+
+
+def _multifold_attachment_points(protected_edges, boundary_edges, local_scale):
+    """Infer hanging-side anchors only from marked boundary/fold intersections."""
+    boundary_vertices = {vertex for edge in boundary_edges for vertex in edge.verts}
+    protected_vertices = {vertex for edge in protected_edges for vertex in edge.verts}
+    direct = protected_vertices & boundary_vertices
+    if direct:
+        return direct
+    limit = max(local_scale * 0.75, 1.0e-10)
+    return {
+        vertex for vertex in protected_vertices
+        if any((vertex.co - boundary.co).length <= limit for boundary in boundary_vertices)
+    }
+
+
+def _multifold_chart_frame(region_vertices, region_faces, orientation_hint, local_scale):
+    """Build a stable local cloth frame for one fold-bounded chart."""
+    points = np.asarray([tuple(vertex.co) for vertex in region_vertices], dtype=float)
+    if len(points) < 3:
+        return None
+    center = np.median(points, axis=0)
+    centered = points - center
+    covariance = np.cov(centered, rowvar=False)
+    values, vectors = np.linalg.eigh(covariance)
+    axes = vectors[:, np.argsort(values)[::-1]]
+    major, cross, normal = axes[:, 0], axes[:, 1], axes[:, 2]
+    hint = np.asarray(tuple(orientation_hint), dtype=float)
+    if float(np.dot(normal, hint)) < 0.0:
+        normal = -normal
+    coordinates = centered @ np.column_stack((major, cross, normal))
+    spans = np.percentile(coordinates, 95.0, axis=0) - np.percentile(coordinates, 5.0, axis=0)
+    if max(float(spans[0]), float(spans[1])) < max(local_scale * 0.75, 1.0e-10):
+        return None
+    return {
+        "center": Vector(center),
+        "major": Vector(major),
+        "cross": Vector(cross),
+        "normal": Vector(normal),
+        "major_span": float(spans[0]),
+        "cross_span": float(spans[1]),
+    }
+
+
+def _multifold_safe_fraction(
+    bm, movable, before_coordinates, proposed_coordinates, before_face_geometry,
+    matched_dihedral_edges, before_p95,
+):
+    """Backtrack the complete local deformation until all safety gates pass."""
+    attempts = []
+    for fraction in (1.0, 0.75, 0.5, 0.35, 0.25, 0.125):
+        for vertex in movable:
+            vertex.co = before_coordinates[vertex].lerp(proposed_coordinates[vertex], fraction)
+        bm.normal_update()
+        flipped = 0
+        degenerate = 0
+        for face, (normal, area) in before_face_geometry.items():
+            if float(face.calc_area()) <= area * 0.05:
+                degenerate += 1
+            if normal.length_squared and face.normal.length_squared and normal.dot(face.normal) <= 0.0:
+                flipped += 1
+        after_p95 = _percentile(_edge_dihedrals(matched_dihedral_edges), 0.95)
+        passed = (
+            not flipped
+            and not degenerate
+            and (
+                not matched_dihedral_edges
+                or after_p95 <= before_p95 + math.radians(8.0)
+            )
+        )
+        attempts.append({
+            "fraction": fraction,
+            "flipped_faces": flipped,
+            "degenerate_faces": degenerate,
+            "after_dihedral_p95_degrees": math.degrees(after_p95),
+            "passed": passed,
+        })
+        if passed:
+            return fraction, attempts
+    for vertex in movable:
+        vertex.co = before_coordinates[vertex]
+    bm.normal_update()
+    return 0.0, attempts
+
+
 def _canvas_subdivision_cuts(selected_face_count):
     """Choose enough density for waves while keeping the local job bounded."""
     count = max(1, int(selected_face_count))
@@ -502,6 +621,94 @@ def _taubin_fair_canvas(
     }
 
 
+def _fair_multifold_canvas_microfacets(
+    bm, movable, region_vertices, original_coordinates, source_normals,
+    protected_edges, local_scale, iterations=5,
+):
+    """Suppress triangle-scale noise without erasing the cloth's main folds.
+
+    Unlike the broad canvas fairing, this solver moves vertices only along the
+    saved source normal, discounts neighbours across a source-normal break, and
+    never crosses a protected coherent fold ridge.  It therefore preserves the
+    drape silhouette and ridge layout while softening only high-frequency facet
+    stepping.
+    """
+    movable_set = set(movable)
+    region_set = set(region_vertices)
+    protected_set = set(protected_edges)
+    maximum_displacement = local_scale * 0.12
+    completed = 0
+    rollback_count = 0
+    normal_band = max(1.0 - math.cos(math.radians(32.0)), 1.0e-8)
+
+    def normal_only_offsets():
+        offsets = {}
+        for vertex in movable_set:
+            source_normal = source_normals.get(vertex, vertex.normal).copy()
+            if not source_normal.length_squared:
+                continue
+            source_normal.normalize()
+            weighted = Vector((0.0, 0.0, 0.0))
+            weight_total = 0.0
+            for edge in vertex.link_edges:
+                if edge in protected_set:
+                    continue
+                neighbor = edge.other_vert(vertex)
+                if neighbor not in region_set:
+                    continue
+                neighbor_normal = source_normals.get(neighbor, neighbor.normal).copy()
+                if not neighbor_normal.length_squared:
+                    continue
+                neighbor_normal.normalize()
+                if source_normal.dot(neighbor_normal) < 0.0:
+                    neighbor_normal.negate()
+                normal_delta = max(0.0, 1.0 - source_normal.dot(neighbor_normal))
+                weight = math.exp(-((normal_delta / normal_band) ** 2))
+                weighted += neighbor.co * weight
+                weight_total += weight
+            if weight_total <= 1.0e-12:
+                continue
+            delta = weighted / weight_total - vertex.co
+            offsets[vertex] = source_normal * delta.dot(source_normal)
+        return offsets
+
+    for _iteration in range(max(0, int(iterations))):
+        before_iteration = {vertex: vertex.co.copy() for vertex in movable_set}
+        for factor in (0.18, -0.19):
+            for vertex, offset in normal_only_offsets().items():
+                vertex.co += offset * factor
+            for vertex in movable_set:
+                original = original_coordinates[vertex]
+                displacement = vertex.co - original
+                if displacement.length > maximum_displacement:
+                    vertex.co = original + displacement.normalized() * maximum_displacement
+        bm.normal_update()
+        unsafe = any(
+            not math.isfinite(component)
+            for vertex in movable_set
+            for component in vertex.co
+        )
+        if unsafe:
+            for vertex, coordinate in before_iteration.items():
+                vertex.co = coordinate
+            bm.normal_update()
+            rollback_count += 1
+            break
+        completed += 1
+    return {
+        "method": "source_normal_bilateral_microfacet_fairing_v1",
+        "requested_iterations": int(iterations),
+        "completed_iterations": completed,
+        "rollback_count": rollback_count,
+        "lambda": 0.18,
+        "mu": -0.19,
+        "normal_band_degrees": 32.0,
+        "maximum_base_displacement": maximum_displacement,
+        "preserves_source_ridges": True,
+        "tangential_drift": False,
+    }
+
+
 def _canvas_outer_envelope_shift(
     movable, region_vertices, source_coordinates, outward_normal, local_scale,
 ):
@@ -570,6 +777,61 @@ def _canvas_outer_envelope_shift(
     }
 
 
+def _multifold_local_outer_envelope(
+    movable, region_vertices, source_coordinates, source_normals, local_scale, apply=True,
+):
+    """Cover each source sample along its own fold-following source normal."""
+    clearance = max(float(local_scale) * 0.0025, 1.0e-7)
+    maximum_shift = max(float(local_scale) * 0.12, clearance)
+    required = []
+    applied = []
+    for vertex in movable:
+        direction = source_normals[vertex].copy()
+        if not direction.length_squared:
+            required.append(0.0)
+            applied.append(0.0)
+            continue
+        direction.normalize()
+        offset = float((vertex.co - source_coordinates[vertex]).dot(direction))
+        shift = max(0.0, clearance - offset)
+        required.append(shift)
+        actual = min(shift, maximum_shift)
+        applied.append(actual)
+        if apply and actual:
+            vertex.co += direction * actual
+    tolerance = max(clearance * 0.1, 1.0e-8)
+    offsets = []
+    for vertex in movable:
+        direction = source_normals[vertex].copy()
+        if not direction.length_squared:
+            offsets.append(0.0)
+            continue
+        direction.normalize()
+        offsets.append(float((vertex.co - source_coordinates[vertex]).dot(direction)))
+    uncovered = sum(offset < -tolerance for offset in offsets)
+    passed = (
+        max(required, default=0.0) <= maximum_shift + 1.0e-12
+        and uncovered == 0
+        and min(offsets, default=0.0) >= -tolerance
+    )
+    return {
+        "method": "per_vertex_source_normal_outer_envelope_v1",
+        "parameterization": "same_locally_subdivided_marked_surface",
+        "source_vertices_sampled": len(region_vertices),
+        "movable_vertices_sampled": len(movable),
+        "outer_clearance": clearance,
+        "minimum_signed_offset_after": min(offsets, default=0.0),
+        "required_outer_shift": max(required, default=0.0),
+        "applied_outer_shift": max(applied, default=0.0) if apply else 0.0,
+        "maximum_allowed_outer_shift": maximum_shift,
+        "uncovered_vertices_after": uncovered,
+        "locked_boundary_vertices_moved": 0,
+        "normal_policy": "source_vertex_normal_per_dense_local_sample",
+        "whole_vehicle_search": False,
+        "passed": passed,
+    }
+
+
 def _rebuild_working_mesh(
     source, selected_indices, excluded_indices, level, strength, hard_angle, mode="smooth",
     height_mode="MEDIAN", normal_hint=None, normal_mode="AUTO", height_reference_points=None,
@@ -620,16 +882,26 @@ def _rebuild_working_mesh(
     local_scale = _percentile(local_lengths, 0.5) if local_lengths else 1.0e-4
     canvas_macro_folds = set()
     canvas_fold_threshold = None
+    canvas_fold_report = None
+    canvas_attachment_vertices = set()
     if mode == "canvas":
         canvas_macro_folds, canvas_fold_threshold = _canvas_macro_fold_edges(
             selected_edges, hard_angle, local_scale
         )
+    elif mode == "canvas_multifold":
+        canvas_macro_folds, canvas_fold_threshold, canvas_fold_report = _multifold_canvas_edges(
+            selected_edges, boundary_edges, hard_angle, local_scale
+        )
+        canvas_attachment_vertices = _multifold_attachment_points(
+            canvas_macro_folds, boundary_edges, local_scale
+        )
+    canvas_attachment_points = [vertex.co.copy() for vertex in canvas_attachment_vertices]
     # Green faces are the complete editable scope.  Both modes hard-lock the
     # green outer boundary, every red face, and (for smoothing) hard features.
     # Never borrow unmarked neighbours as a transition band: if the marked
     # patch has no editable interior, fail closed and ask for a wider mark.
     protected_feature_edges = (
-        canvas_macro_folds if mode == "canvas"
+        canvas_macro_folds if mode in {"canvas", "canvas_multifold"}
         else (hard_edges if mode != "flatten" else set())
     )
     excluded_edges = {edge for face in excluded for edge in face.edges}
@@ -642,12 +914,12 @@ def _rebuild_working_mesh(
         if edge not in locked_edges
         and len(edge.link_faces) == 2
         and all(face in selected_set for face in edge.link_faces)
-    ] if mode == "canvas" else []
+    ] if mode in {"canvas", "canvas_multifold"} else []
     before_topology = _topology_signature(bm)
 
     cuts = (
         _canvas_subdivision_cuts(len(selected_indices))
-        if mode == "canvas"
+        if mode in {"canvas", "canvas_multifold"}
         else (2 ** max(1, min(2, int(level)))) - 1
     )
     bmesh.ops.subdivide_edges(
@@ -706,13 +978,13 @@ def _rebuild_working_mesh(
         region_faces,
         canvas_facet_segments,
         max(1.0e-8, local_scale * 1.0e-5),
-    ) if mode == "canvas" else set()
+    ) if mode in {"canvas", "canvas_multifold"} else set()
     movable = list(region_vertices - locked_vertices)
     if mode == "flatten" and not movable:
         bm.free()
         _remove_object(working)
         raise ValueError("绿色区域没有内部可移动顶点；请把需要平整的绿色范围多刷一圈")
-    if mode == "canvas" and not movable:
+    if mode in {"canvas", "canvas_multifold"} and not movable:
         bm.free()
         _remove_object(working)
         raise ValueError("帆布区域没有可重建的内部网面；请沿帆布长度和宽度多刷一圈")
@@ -727,7 +999,9 @@ def _rebuild_working_mesh(
         and all(vertex not in locked_vertices for vertex in edge.verts)
     }
     before_p95 = _percentile(_edge_dihedrals(matched_dihedral_edges), 0.95)
+    bm.normal_update()
     source_region_coordinates = {vertex: vertex.co.copy() for vertex in region_vertices}
+    source_region_normals = {vertex: vertex.normal.copy() for vertex in region_vertices}
     before_coordinates = {vertex: vertex.co.copy() for vertex in movable}
     qa_faces = set(region_faces)
     before_face_geometry = {}
@@ -1021,6 +1295,182 @@ def _rebuild_working_mesh(
             "outer_envelope_qa": canvas_outer_envelope,
             "large_fold_policy": "lock_only_major_folds_then_fair_coarse_facet_edges",
         }
+    elif mode == "canvas_multifold" and movable:
+        bounded_strength = max(0.0, min(1.0, float(strength)))
+        fades = _canvas_boundary_fades(region_vertices, locked_vertices)
+        qa_faces = {
+            face
+            for vertex in movable
+            for face in vertex.link_faces
+        } | set(region_faces)
+        before_face_geometry = {
+            face: (face.normal.copy(), max(float(face.calc_area()), 1.0e-20))
+            for face in qa_faces
+        }
+        facet_before = _edge_dihedrals(canvas_facet_edges)
+        canvas_base_fairing = _fair_multifold_canvas_microfacets(
+            bm,
+            movable,
+            region_vertices,
+            before_coordinates,
+            source_region_normals,
+            locked_region_edges,
+            local_scale,
+            iterations=5,
+        )
+        smoothing_factor = canvas_base_fairing["lambda"]
+        smoothing_iterations = canvas_base_fairing["completed_iterations"]
+        bm.normal_update()
+
+        orientation = Vector((0.0, 0.0, 0.0))
+        for face in region_faces:
+            orientation += face.normal * max(float(face.calc_area()), 1.0e-20)
+        if not orientation.length_squared:
+            orientation = Vector((0.0, 0.0, 1.0))
+        else:
+            orientation.normalize()
+
+        fold_charts = _region_face_components(region_faces, locked_region_edges)
+        maximum_wave = 0.0
+        chart_reports = []
+        moved_by_chart = set()
+        base_amplitude = local_scale * min(0.065, 0.045 * bounded_strength)
+        anchor_falloff = max(local_scale * 3.2, 1.0e-12)
+        for chart_index, chart_faces in enumerate(fold_charts):
+            chart_vertices = {vertex for face in chart_faces for vertex in face.verts}
+            chart_movable = (chart_vertices - locked_vertices) - moved_by_chart
+            frame = _multifold_chart_frame(
+                chart_vertices, chart_faces, orientation, local_scale
+            )
+            if frame is None or not chart_movable:
+                continue
+            moved_by_chart.update(chart_movable)
+            chart_cross_span = max(frame["cross_span"], local_scale)
+            base_cycles = max(1.0, min(4.0, chart_cross_span / max(local_scale * 2.4, 1.0e-12)))
+            chart_maximum = 0.0
+            for vertex in chart_movable:
+                anchor_distance = min(
+                    ((vertex.co - point).length for point in canvas_attachment_points),
+                    default=anchor_falloff * 3.0,
+                )
+                attachment_weight = math.exp(-((anchor_distance / anchor_falloff) ** 2))
+                relative = vertex.co - frame["center"]
+                v = float(relative.dot(frame["cross"])) / chart_cross_span
+                cycles = base_cycles * (1.0 + 1.35 * attachment_weight)
+                theta = 2.0 * math.pi * cycles * v
+                wave = (
+                    math.sin(theta)
+                    + 0.18 * math.sin(2.0 * theta + math.pi * 0.25)
+                    + 0.34 * attachment_weight * math.sin(3.5 * theta + math.pi * 0.15)
+                )
+                displacement = (
+                    base_amplitude
+                    * fades.get(vertex, 0.0)
+                    * (0.52 + 1.28 * attachment_weight)
+                    * wave
+                )
+                direction = vertex.normal.copy()
+                if not direction.length_squared:
+                    direction = frame["normal"].copy()
+                else:
+                    direction.normalize()
+                    if direction.dot(frame["normal"]) < 0.0:
+                        direction.negate()
+                vertex.co += direction * displacement
+                chart_maximum = max(chart_maximum, abs(displacement))
+                maximum_wave = max(maximum_wave, abs(displacement))
+            chart_reports.append({
+                "index": chart_index,
+                "faces": len(chart_faces),
+                "movable_vertices": len(chart_movable),
+                "cross_span": frame["cross_span"],
+                "base_cycles": base_cycles,
+                "maximum_wave_displacement": chart_maximum,
+            })
+
+        max_allowed = local_scale * (0.34 + 0.10 * bounded_strength)
+        for vertex, original in before_coordinates.items():
+            displacement = vertex.co - original
+            if displacement.length > max_allowed:
+                vertex.co = original + displacement.normalized() * max_allowed
+        canvas_outer_envelope = _multifold_local_outer_envelope(
+            movable,
+            region_vertices,
+            source_region_coordinates,
+            source_region_normals,
+            local_scale,
+            apply=True,
+        )
+        proposed_coordinates = {vertex: vertex.co.copy() for vertex in movable}
+        safe_fraction, safety_attempts = _multifold_safe_fraction(
+            bm,
+            movable,
+            before_coordinates,
+            proposed_coordinates,
+            before_face_geometry,
+            matched_dihedral_edges,
+            before_p95,
+        )
+        maximum_wave *= safe_fraction
+        canvas_outer_envelope = _multifold_local_outer_envelope(
+            movable,
+            region_vertices,
+            source_region_coordinates,
+            source_region_normals,
+            local_scale,
+            apply=False,
+        )
+
+        facet_after_base = _edge_dihedrals(canvas_facet_edges)
+        facet_before_p95 = _percentile(facet_before, 0.95)
+        facet_after_p95 = _percentile(facet_after_base, 0.95)
+        facet_before_p50 = _percentile(facet_before, 0.50)
+        facet_after_p50 = _percentile(facet_after_base, 0.50)
+        meaningful_faceting = facet_before_p95 >= math.radians(2.0)
+        canvas_base_fairing.update({
+            "facet_edges_sampled": len(canvas_facet_edges),
+            "before_facet_dihedral_p95_degrees": math.degrees(facet_before_p95),
+            "after_fairing_facet_dihedral_p95_degrees": math.degrees(facet_after_p95),
+            "before_facet_dihedral_p50_degrees": math.degrees(facet_before_p50),
+            "after_fairing_facet_dihedral_p50_degrees": math.degrees(facet_after_p50),
+            "meaningful_source_faceting": meaningful_faceting,
+            "safe_deformation_fraction": safe_fraction,
+            "safety_attempts": safety_attempts,
+            "passed": (
+                safe_fraction > 0.0
+                and (
+                    not meaningful_faceting
+                    or facet_after_p95 <= facet_before_p95 + math.radians(0.5)
+                )
+            ),
+        })
+        bm.normal_update()
+        canvas_wave = {
+            "method": "fold_preserving_microfacet_fairing_attachment_wrinkle_outer_envelope_v2",
+            "semantic_class": "marked_hanging_multifold_canvas_surface",
+            "wave_strength": bounded_strength,
+            "wave_amplitude": base_amplitude,
+            "wave_amplitude_cap": local_scale * 0.065,
+            "maximum_generated_wave_displacement": maximum_wave,
+            "fold_chart_count": len(fold_charts),
+            "processed_fold_charts": len(chart_reports),
+            "fold_charts": chart_reports,
+            "attachment_anchor_count": len(canvas_attachment_points),
+            "attachment_falloff": anchor_falloff,
+            "attachment_policy": "marked_boundary_intersection_of_coherent_source_fold_ridges",
+            "wrinkle_density_policy": "denser_near_hanging_attachment_then_fade_inward",
+            "random_displacement": False,
+            "whole_vehicle_search": False,
+            "source_objects_scanned": 1,
+            "automatic_subdivision": True,
+            "automatic_subdivision_cuts": cuts,
+            "large_fold_threshold_degrees": math.degrees(canvas_fold_threshold),
+            "protected_large_fold_edges": len(canvas_macro_folds),
+            "fold_detection": canvas_fold_report,
+            "base_surface_fairing": canvas_base_fairing,
+            "outer_envelope_qa": canvas_outer_envelope,
+            "large_fold_policy": "preserve_coherent_source_ridges_and_only_fair_normal_microfacets",
+        }
     elif strength > 0.0 and movable:
         bounded_strength = max(0.0, min(1.0, float(strength)))
         # Keep 0.00-0.50 exactly compatible with the old two-pass control.
@@ -1082,7 +1532,9 @@ def _rebuild_working_mesh(
         ),
         "matched_dihedral_within_limit": (
             not dihedral_comparable
-            or after_p95 <= before_p95 + math.radians(8.0 if mode == "canvas" else 2.0)
+            or after_p95 <= before_p95 + math.radians(
+                8.0 if mode in {"canvas", "canvas_multifold"} else 2.0
+            )
         ),
         "planarity_improved": True,
         "displacement_within_limit": True,
@@ -1117,9 +1569,12 @@ def _rebuild_working_mesh(
         )
     topology_passed = all(quality_gates.values())
 
-    if mode == "canvas":
+    if mode in {"canvas", "canvas_multifold"}:
         for face in region_faces:
-            face.smooth = True
+            # The ordinary canvas mode keeps its established smooth shading.
+            # Dense multifold cloth stays finely faceted so its small wrinkles
+            # remain readable instead of merging into a clay-like broad gloss.
+            face.smooth = mode == "canvas"
 
     preview_vertices = []
     preview_faces = []
@@ -1146,7 +1601,7 @@ def _rebuild_working_mesh(
         "local_vertices_after": len(preview_vertices),
         "subdivision_level": int(level),
         "subdivision_cuts": cuts,
-        "automatic_canvas_subdivision": mode == "canvas",
+        "automatic_canvas_subdivision": mode in {"canvas", "canvas_multifold"},
         "smoothing_strength": float(strength),
         "smoothing_factor": smoothing_factor,
         "smoothing_iterations": smoothing_iterations,
@@ -1184,13 +1639,13 @@ def _rebuild_working_mesh(
     return working, preview_vertices, preview_faces, report
 
 
-def _preview_object(scene, source, vertices, faces):
+def _preview_object(scene, source, vertices, faces, smooth_preview=True):
     _model, candidates, _helpers = ensure_scene_roots(scene)
     mesh = bpy.data.meshes.new(CANDIDATE_PREFIX + "MESH")
     mesh.from_pydata(vertices, [], faces)
     mesh.update(calc_edges=True)
     for polygon in mesh.polygons:
-        polygon.use_smooth = True
+        polygon.use_smooth = bool(smooth_preview)
     obj = bpy.data.objects.new(CANDIDATE_PREFIX + source.name, mesh)
     candidates.objects.link(obj)
     obj.matrix_world = source.matrix_world.copy()
@@ -1273,7 +1728,7 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
     }
     if mode == "smooth":
         settings["smooth_strength"] = round(float(scene.smrn_surface_smooth_strength), 6)
-    elif mode == "canvas":
+    elif mode in {"canvas", "canvas_multifold"}:
         settings["canvas_wave_strength"] = round(float(scene.smrn_canvas_wave_strength), 6)
     else:
         settings.update({
@@ -1281,8 +1736,15 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
             "normal_mode": str(getattr(scene, "smrn_surface_normal_mode", "AUTO")),
         })
     payload = {
-        "schema": 8,
-        "canvas_pipeline": "fair_base_then_source_aligned_wave_outer_envelope_v3" if mode == "canvas" else None,
+        "schema": 10,
+        "canvas_pipeline": (
+            "fair_base_then_source_aligned_wave_outer_envelope_v3"
+            if mode == "canvas"
+            else (
+                "fold_preserving_microfacet_fairing_attachment_wrinkle_outer_envelope_v2"
+                if mode == "canvas_multifold" else None
+            )
+        ),
         "source_fingerprint": str(source_snapshot_value.get("fingerprint", "")),
         "mode": mode,
         "scope_policy": "strict_green_faces_only_v2",
@@ -1329,10 +1791,10 @@ def _matching_existing_candidate(scene, source, source_snapshot_value, request_s
 
 
 def build_scene_candidate(scene, mode="smooth"):
-    if mode not in {"smooth", "flatten", "canvas"}:
+    if mode not in {"smooth", "flatten", "canvas", "canvas_multifold"}:
         raise ValueError("不支持的局部网面重构模式")
     source, targets, excludes, before_snapshot = _source_and_records(scene)
-    if mode == "canvas" and len(targets) < 3:
+    if mode in {"canvas", "canvas_multifold"} and len(targets) < 3:
         raise ValueError("帆布波浪重建至少需要 3 处绿色标记，并沿帆布表面分散刷选")
     request_signature = _candidate_request_signature(
         scene, before_snapshot, targets, excludes, mode
@@ -1358,14 +1820,14 @@ def build_scene_candidate(scene, mode="smooth"):
     probe.free()
     if not selected_indices:
         raise ValueError("没有可重构的局部网面；请检查绿色与红色标记是否冲突")
-    if mode == "canvas" and len(selected_indices) < 6:
+    if mode in {"canvas", "canvas_multifold"} and len(selected_indices) < 6:
         raise ValueError("帆布绿色区域过小；请沿帆布长度和宽度多刷一些表面")
 
     working = preview = None
     try:
         strength = (
             float(scene.smrn_canvas_wave_strength)
-            if mode == "canvas"
+            if mode in {"canvas", "canvas_multifold"}
             else float(scene.smrn_surface_smooth_strength)
         )
         working, vertices, faces, topology = _rebuild_working_mesh(
@@ -1431,7 +1893,13 @@ def build_scene_candidate(scene, mode="smooth"):
             raise ValueError(f"平整质量检查未通过（{detail}），已拒绝生成；源网格未修改")
         checkpoint = _checkpoint(scene, source)
         _link_hidden_working(scene, working)
-        preview = _preview_object(scene, source, vertices, faces)
+        preview = _preview_object(
+            scene,
+            source,
+            vertices,
+            faces,
+            smooth_preview=mode != "canvas_multifold",
+        )
         after_source_snapshot = source_snapshot(source)
         source_unchanged = before_snapshot["fingerprint"] == after_source_snapshot["fingerprint"]
         report = {
@@ -1445,7 +1913,7 @@ def build_scene_candidate(scene, mode="smooth"):
                 "passed": True,
                 "method": (
                     "strict_green_surface_with_dense_outer_envelope"
-                    if mode == "canvas" else "exact_brushed_faces_only"
+                    if mode in {"canvas", "canvas_multifold"} else "exact_brushed_faces_only"
                 ),
                 "source_objects_scanned": 1,
                 "whole_vehicle_search": False,
