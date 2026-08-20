@@ -580,7 +580,7 @@ class SMRN_OT_confirm_candidate(bpy.types.Operator):
 class SMRN_OT_build_surface_candidate(bpy.types.Operator):
     bl_idname = "smrn.build_surface_candidate"
     bl_label = "生成局部网面重构候选"
-    bl_description = "只读取当前语义源及绿色标记附近的局部拓扑；锁定红色面、硬边与区域边界"
+    bl_description = "只处理绿色标记面；未标记面、红色面与绿色区域边界保持不变"
     bl_options = {"REGISTER", "UNDO"}
 
     mode: bpy.props.EnumProperty(

@@ -326,19 +326,13 @@ def _rebuild_working_mesh(
                 hard_edges.add(edge)
         except ValueError:
             hard_edges.add(edge)
-    # Smoothing preserves every detected crease and the patch boundary.
-    # Flattening must be able to move the brushed boundary vertices too;
-    # otherwise long narrow source polygons remain as ridges and a nominally
-    # "flat" preview changes almost nothing.  Shared vertices keep the mesh
-    # watertight, while the adjacent unmarked faces form the transition band.
-    # Explicit red faces are the only immutable flatten constraint.
+    # Green faces are the complete editable scope.  Both modes hard-lock the
+    # green outer boundary, every red face, and (for smoothing) hard features.
+    # Never borrow unmarked neighbours as a transition band: if the marked
+    # patch has no editable interior, fail closed and ask for a wider mark.
     protected_feature_edges = hard_edges if mode != "flatten" else set()
     excluded_edges = {edge for face in excluded for edge in face.edges}
-    locked_edges = (
-        boundary_edges | protected_feature_edges | excluded_edges
-        if mode != "flatten"
-        else excluded_edges
-    )
+    locked_edges = boundary_edges | protected_feature_edges | excluded_edges
     locked_initial_vertices = {vertex for edge in locked_edges for vertex in edge.verts}
     locked_segments = [(edge.verts[0].co.copy(), edge.verts[1].co.copy()) for edge in locked_edges]
     local_lengths = [edge.calc_length() for edge in selected_edges if edge.calc_length() > 1.0e-9]
@@ -383,12 +377,20 @@ def _rebuild_working_mesh(
         region_faces = [face for face in bm.faces if int(face[region_layer]) == 1]
 
     region_vertices = {vertex for face in region_faces for vertex in face.verts}
+    region_face_set = set(region_faces)
     lock_tolerance = max(1.0e-8, local_scale * 1.0e-6)
     locked_vertices = {
         vertex for vertex in region_vertices
         if any(_point_segment_distance(vertex.co, first, second) <= lock_tolerance
                for first, second in locked_segments)
     }
+    # A non-manifold source can share a vertex without sharing a normal
+    # two-face boundary edge.  Lock every green vertex touched by any
+    # unmarked face so no unmarked polygon can move even in that topology.
+    locked_vertices.update({
+        vertex for vertex in region_vertices
+        if any(face not in region_face_set for face in vertex.link_faces)
+    })
     locked_region_edges = {
         edge for face in region_faces for edge in face.edges
         if any(
@@ -398,6 +400,10 @@ def _rebuild_working_mesh(
         )
     }
     movable = list(region_vertices - locked_vertices)
+    if mode == "flatten" and not movable:
+        bm.free()
+        _remove_object(working)
+        raise ValueError("绿色区域没有内部可移动顶点；请把需要平整的绿色范围多刷一圈")
     before_coordinates = {vertex: vertex.co.copy() for vertex in movable}
     qa_faces = set(region_faces)
     before_face_geometry = {}
@@ -429,43 +435,53 @@ def _rebuild_working_mesh(
                 orientation_hint=orientation if orientation.length_squared else None,
                 height_reference_points=height_reference_points,
             )
+            editable_before_distances = np.asarray([
+                float((vertex.co - plane_center).dot(plane_normal))
+                for vertex in component_movable
+            ])
             for vertex in component_movable:
                 signed_distance = (vertex.co - plane_center).dot(plane_normal)
                 vertex.co -= plane_normal * signed_distance
             moved_vertices.update(component_movable)
-            after_distances = np.asarray([
+            editable_after_distances = np.asarray([
+                float((vertex.co - plane_center).dot(plane_normal))
+                for vertex in component_movable
+            ])
+            whole_after_distances = np.asarray([
                 float((vertex.co - plane_center).dot(plane_normal)) for vertex in component_vertices
             ])
-            before_squares.extend(float(value * value) for value in before_distances)
-            after_squares.extend(float(value * value) for value in after_distances)
+            before_squares.extend(float(value * value) for value in editable_before_distances)
+            after_squares.extend(float(value * value) for value in editable_after_distances)
             component_reports.append({
                 "index": component_index,
                 "faces": len(component_faces),
                 "vertices": len(component_vertices),
                 "movable_vertices": len(component_movable),
-                "before_rms": float(np.sqrt(np.mean(np.square(before_distances)))),
-                "after_rms": float(np.sqrt(np.mean(np.square(after_distances)))),
+                "before_rms": float(np.sqrt(np.mean(np.square(editable_before_distances)))),
+                "after_rms": float(np.sqrt(np.mean(np.square(editable_after_distances)))),
+                "whole_region_before_rms": float(np.sqrt(np.mean(np.square(before_distances)))),
+                "whole_region_after_rms": float(np.sqrt(np.mean(np.square(whole_after_distances)))),
                 "plane_center_local": list(plane_center),
                 "plane_normal_local": list(plane_normal),
                 "height_mode": height_mode,
                 "normal_mode": normal_mode,
             })
-            component_geometry.append((component_reports[-1], component_vertices, plane_center, plane_normal))
+            component_geometry.append((
+                component_reports[-1], component_movable, component_vertices, plane_center, plane_normal
+            ))
         before_rms = float(math.sqrt(sum(before_squares) / len(before_squares))) if before_squares else 0.0
         after_rms = float(math.sqrt(sum(after_squares) / len(after_squares))) if after_squares else 0.0
         planarity = {
             "method": "local_region_robust_center_pca_per_feature_component",
+            "progress_metric_scope": "editable_green_interior_vertices",
             "component_count": len(components),
             "fitted_component_count": len(component_reports),
             "before_rms": before_rms,
             "after_rms": after_rms,
             "components": component_reports,
         }
-        # Preserve a fully planar core, then spread its displacement through
-        # a bounded topological transition band.  Moving only shared boundary
-        # vertices can invert the first unmarked face; backtracking the whole
-        # operation instead produced the old misleading "almost unchanged"
-        # preview.
+        # Preserve a planar green core while the green outer boundary remains
+        # fixed.  Only these green interior vertices may receive a target.
         core_movable = list(movable)
         core_before = dict(before_coordinates)
         full_targets = {vertex: vertex.co.copy() for vertex in core_movable}
@@ -476,56 +492,8 @@ def _rebuild_working_mesh(
         for vertex in core_movable:
             vertex.co = core_before[vertex]
         bm.normal_update()
-
-        transition_ring_count = max(
-            1,
-            min(4, int(math.ceil(full_maximum / max(local_scale, 1.0e-12))) + 1),
-        )
-        known_vertices = set(region_vertices) | set(locked_vertices)
-        frontier = set(region_vertices)
-        previous_layer = set(core_movable)
-        propagated_displacements = {
-            vertex: full_targets[vertex] - core_before[vertex]
-            for vertex in core_movable
-        }
-        for ring_index in range(1, transition_ring_count + 1):
-            ring = {
-                edge.other_vert(vertex)
-                for vertex in frontier
-                for edge in vertex.link_edges
-                if edge.other_vert(vertex) not in known_vertices
-            }
-            ring.difference_update(locked_vertices)
-            if not ring:
-                break
-            transition_rings.append(ring)
-            known_vertices.update(ring)
-            falloff = (transition_ring_count - ring_index + 1) / (transition_ring_count + 1)
-            for vertex in ring:
-                contributing = [
-                    edge.other_vert(vertex)
-                    for edge in vertex.link_edges
-                    if edge.other_vert(vertex) in previous_layer
-                    and edge.other_vert(vertex) in propagated_displacements
-                ]
-                if not contributing:
-                    continue
-                displacement = Vector((0.0, 0.0, 0.0))
-                for neighbor in contributing:
-                    displacement += propagated_displacements[neighbor]
-                displacement /= len(contributing)
-                before_coordinates[vertex] = vertex.co.copy()
-                propagated_displacements[vertex] = displacement
-                full_targets[vertex] = vertex.co + displacement * falloff
-            previous_layer = ring
-            frontier = ring
-
-        movable = list(full_targets)
-        qa_faces = {
-            face
-            for vertex in movable
-            for face in vertex.link_faces
-        } | set(region_faces)
+        movable = core_movable
+        qa_faces = set(region_faces)
         minimum_qa_area = max(local_scale * local_scale * 1.0e-10, 1.0e-18)
         ignored_preexisting_tiny_faces = sum(
             1 for face in qa_faces if float(face.calc_area()) <= minimum_qa_area
@@ -591,12 +559,24 @@ def _rebuild_working_mesh(
             for vertex in movable:
                 vertex.co = before_coordinates[vertex]
         final_after_squares = []
-        for component_report, component_vertices, plane_center, plane_normal in component_geometry:
+        for (
+            component_report,
+            component_movable,
+            component_vertices,
+            plane_center,
+            plane_normal,
+        ) in component_geometry:
             final_distances = np.asarray([
+                float((vertex.co - plane_center).dot(plane_normal)) for vertex in component_movable
+            ])
+            whole_final_distances = np.asarray([
                 float((vertex.co - plane_center).dot(plane_normal)) for vertex in component_vertices
             ])
             final_after_squares.extend(float(value * value) for value in final_distances)
             component_report["after_rms"] = float(np.sqrt(np.mean(np.square(final_distances))))
+            component_report["whole_region_after_rms"] = float(
+                np.sqrt(np.mean(np.square(whole_final_distances)))
+            )
         planarity["after_rms"] = (
             float(math.sqrt(sum(final_after_squares) / len(final_after_squares)))
             if final_after_squares else planarity["before_rms"]
@@ -673,7 +653,7 @@ def _rebuild_working_mesh(
     preview_vertices = []
     preview_faces = []
     preview_map = {}
-    preview_source_faces = qa_faces if mode == "flatten" else set(region_faces)
+    preview_source_faces = set(region_faces)
     for face in preview_source_faces:
         indices = []
         for vertex in face.verts:
@@ -708,6 +688,8 @@ def _rebuild_working_mesh(
         "degenerate_faces": degenerate_faces,
         "ignored_preexisting_tiny_faces": ignored_preexisting_tiny_faces,
         "locked_boundary_or_feature_vertices": len(locked_vertices),
+        "strict_marked_scope": True,
+        "unmarked_vertices_moved": 0,
         "transition_faces_checked": len(qa_faces - set(region_faces)),
         "transition_ring_count": len(transition_rings),
         "transition_vertices": sum(len(ring) for ring in transition_rings),
@@ -812,9 +794,10 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
             "normal_mode": str(getattr(scene, "smrn_surface_normal_mode", "AUTO")),
         })
     payload = {
-        "schema": 1,
+        "schema": 3,
         "source_fingerprint": str(source_snapshot_value.get("fingerprint", "")),
         "mode": mode,
+        "scope_policy": "strict_green_faces_only_v2",
         "settings": settings,
         "marks": records,
     }
