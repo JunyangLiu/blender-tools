@@ -105,6 +105,9 @@ class SMRN_PT_marking(bpy.types.Panel):
         if has_surface_candidate:
             if mode == "smooth":
                 surface.prop(scene, "smrn_surface_smooth_strength", text="平滑程度", slider=True)
+                hint = surface.row()
+                hint.scale_y = 0.75
+                hint.label(text="0.50 = 旧版最高 · 1.00 = 强平滑", icon="INFO")
             apply = surface.operator(
                 "smrn.build_surface_candidate", text="重新应用（只重算标记附近）", icon="FILE_REFRESH"
             )

@@ -417,6 +417,8 @@ def _rebuild_working_mesh(
     flatten_projection_fraction = 1.0
     flatten_progress_passed = True
     flatten_safety_attempts = []
+    smoothing_factor = 0.0
+    smoothing_iterations = 0
     if mode == "flatten" and movable:
         components = _region_face_components(region_faces, locked_region_edges)
         component_reports = []
@@ -592,6 +594,12 @@ def _rebuild_working_mesh(
             and planarity["after_rms"] < planarity["before_rms"] * 0.25
         )
     elif strength > 0.0 and movable:
+        bounded_strength = max(0.0, min(1.0, float(strength)))
+        # Keep 0.00-0.50 exactly compatible with the old two-pass control.
+        # The new upper half adds bounded passes instead of raising the
+        # per-pass factor, which is much less likely to fold thin triangles.
+        smoothing_factor = min(0.5, bounded_strength)
+        smoothing_iterations = 2 + int(math.ceil(max(0.0, bounded_strength - 0.5) * 8.0))
         qa_faces = {
             face
             for vertex in movable
@@ -601,16 +609,22 @@ def _rebuild_working_mesh(
             face: (face.normal.copy(), max(float(face.calc_area()), 1.0e-20))
             for face in qa_faces
         }
-        for _iteration in range(2):
+        for _iteration in range(smoothing_iterations):
             bmesh.ops.smooth_vert(
                 bm,
                 verts=movable,
-                factor=max(0.0, min(0.5, float(strength))),
+                factor=smoothing_factor,
                 use_axis_x=True,
                 use_axis_y=True,
                 use_axis_z=True,
             )
-        max_allowed = local_scale * (0.04 + 0.24 * max(0.0, min(0.5, float(strength))))
+        # At 0.50 this is the old 0.16 * local scale limit.  The stronger
+        # range grows only to 0.24, so extra passes cannot run away.
+        max_allowed = local_scale * (
+            0.04
+            + 0.24 * min(0.5, bounded_strength)
+            + 0.16 * max(0.0, bounded_strength - 0.5)
+        )
         for vertex, original in before_coordinates.items():
             displacement = vertex.co - original
             if displacement.length > max_allowed:
@@ -683,6 +697,8 @@ def _rebuild_working_mesh(
         "subdivision_level": int(level),
         "subdivision_cuts": cuts,
         "smoothing_strength": float(strength),
+        "smoothing_factor": smoothing_factor,
+        "smoothing_iterations": smoothing_iterations,
         "mode": mode,
         "planarity_qa": planarity,
         "local_edge_scale": local_scale,

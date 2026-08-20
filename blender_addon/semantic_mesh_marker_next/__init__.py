@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Semantic Mesh Marker Next",
     "author": "Local developer",
-    "version": (0, 5, 10),
+    "version": (0, 5, 11),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > 语义标记 Next",
     "description": "Non-destructive target and exclude surface marking",
@@ -83,8 +83,9 @@ def register():
         name="局部细化等级", description="只细分绿色标记附近的局部网面", default=1, min=1, max=2,
     )
     bpy.types.Scene.smrn_surface_smooth_strength = bpy.props.FloatProperty(
-        name="局部平滑强度", description="锁定红色面、硬边和区域边界后的受限平滑",
-        default=0.22, min=0.0, max=0.5, step=1, precision=2,
+        name="局部平滑强度",
+        description="0.50 为旧版最高强度；继续增大时只增加标记内部的受限平滑轮数",
+        default=0.22, min=0.0, max=1.0, step=1, precision=2,
     )
     bpy.types.Scene.smrn_surface_hard_angle = bpy.props.FloatProperty(
         name="硬边保护角度", default=35.0, min=5.0, max=85.0, precision=1,
