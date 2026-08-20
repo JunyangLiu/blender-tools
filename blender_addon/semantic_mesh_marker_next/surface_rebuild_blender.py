@@ -28,6 +28,7 @@ CANDIDATE_PREFIX = "SMRN_SURFACE_CANDIDATE_"
 WORKING_PREFIX = "SMRN_SURFACE_WORKING_FULL_"
 ARCHIVE_COLLECTION_NAME = "SMR_01B_原网面恢复检查点"
 REPORT_KEY = "smrn_surface_rebuild_report_json"
+PREVIEW_MATERIAL_NAME = "SMRN_局部网面候选_橙色半透明"
 
 
 def _remove_object(obj):
@@ -93,8 +94,36 @@ def _seed_face_indices(records, face_count):
     return sorted({int(record.face_index) for record in records if 0 <= int(record.face_index) < face_count})
 
 
+def _normal_hint_from_records(source, targets, excludes, normal_mode):
+    if normal_mode == "AUTO":
+        return None
+    records = sorted(targets, key=lambda record: record.id)[:1]
+    if normal_mode == "RED_REFERENCE":
+        records = [record for record in excludes if record.hit_object_name == source.name]
+        if not records:
+            raise ValueError("法向选择了红色参考面，但当前语义源上没有红色标记")
+    normals = []
+    world_to_local_normal = source.matrix_world.to_3x3().transposed()
+    for record in records:
+        normal = Vector(record.local_normal) if record.local_normal is not None else (
+            world_to_local_normal @ Vector(record.world_normal)
+        )
+        if normal.length_squared:
+            normals.append(normal.normalized())
+    if not normals:
+        raise ValueError("所选法向依据没有可用的表面法向，请重新标记参考面")
+    reference = normals[0].copy()
+    aligned = []
+    for normal in normals:
+        aligned.append(-normal if normal.dot(reference) < 0.0 else normal)
+    result = sum(aligned, Vector((0.0, 0.0, 0.0)))
+    if not result.length_squared:
+        raise ValueError("参考面的法向互相抵消，请只标记朝向一致的参考面")
+    return result.normalized()
+
+
 def _grow_marked_region(bm, source, targets, excludes, hard_angle_radians):
-    """Bounded local adjacency growth; never searches other objects or the car."""
+    """Use only explicitly brushed faces; never expand a display radius into geometry."""
     bm.faces.ensure_lookup_table()
     target_indices = _seed_face_indices(targets, len(bm.faces))
     if not target_indices:
@@ -106,49 +135,14 @@ def _grow_marked_region(bm, source, targets, excludes, hard_angle_radians):
     if not target_indices:
         raise ValueError("绿色目标全部与红色保留面冲突")
 
-    record_by_face = {int(record.face_index): record for record in targets}
-    scale = _object_scale(source)
-    selected = set()
-    capped = False
-    for seed_index in target_indices:
-        seed = bm.faces[seed_index]
-        edge_lengths = [edge.calc_length() for edge in seed.edges if edge.calc_length() > 1.0e-9]
-        local_edge = sorted(edge_lengths)[len(edge_lengths) // 2] if edge_lengths else 1.0e-4
-        marker_radius = float(record_by_face[seed_index].semantic_radius or 0.0) / scale
-        radius = max(marker_radius, local_edge * 1.35)
-        origin = _face_center(seed)
-        queue = [seed]
-        visited = {seed.index}
-        accepted_for_seed = 0
-        while queue:
-            face = queue.pop(0)
-            if face.index in excluded:
-                continue
-            if (_face_center(face) - origin).length > radius:
-                continue
-            selected.add(face.index)
-            accepted_for_seed += 1
-            if accepted_for_seed >= 384:
-                capped = True
-                break
-            for edge in face.edges:
-                if len(edge.link_faces) == 2:
-                    try:
-                        if edge.calc_face_angle(0.0) > hard_angle_radians:
-                            continue
-                    except ValueError:
-                        continue
-                for neighbor in edge.link_faces:
-                    if neighbor.index not in visited:
-                        visited.add(neighbor.index)
-                        queue.append(neighbor)
+    selected = set(target_indices)
     selected.difference_update(excluded)
     return selected, {
         "seed_faces": len(target_indices),
         "selected_faces": len(selected),
         "red_locked_faces": len(excluded),
-        "per_seed_face_cap": 384,
-        "growth_capped": capped,
+        "selection_method": "exact_brushed_faces",
+        "display_radius_used_for_growth": False,
         "global_geometry_scan": False,
     }
 
@@ -203,20 +197,60 @@ def _point_segment_distance(point, first, second):
     return (point - (first + direction * parameter)).length
 
 
-def _best_fit_plane(vertices):
+def _best_fit_plane(vertices, normal_hint=None, height_mode="MEDIAN", orientation_hint=None):
     points = np.asarray([tuple(vertex.co) for vertex in vertices], dtype=float)
     center = np.median(points, axis=0)
     centered = points - center
-    covariance = centered.T @ centered / max(1, len(points))
-    _values, vectors = np.linalg.eigh(covariance)
-    normal = vectors[:, 0]
+    if normal_hint is None:
+        covariance = centered.T @ centered / max(1, len(points))
+        _values, vectors = np.linalg.eigh(covariance)
+        normal = vectors[:, 0]
+    else:
+        normal = np.asarray(tuple(normal_hint), dtype=float)
     normal /= max(float(np.linalg.norm(normal)), 1.0e-12)
+    if orientation_hint is not None and np.dot(normal, np.asarray(tuple(orientation_hint), dtype=float)) < 0.0:
+        normal = -normal
+    heights = points @ normal
+    if height_mode == "LOW":
+        plane_height = float(np.min(heights))
+    elif height_mode == "HIGH":
+        plane_height = float(np.max(heights))
+    else:
+        plane_height = float(np.median(heights))
+    center += normal * (plane_height - float(center @ normal))
+    centered = points - center
     distances = centered @ normal
     return Vector(center), Vector(normal), distances
 
 
+def _region_face_components(region_faces, locked_region_edges):
+    """Split a marked region at its real boundary and protected feature edges."""
+    region_set = set(region_faces)
+    unseen = set(region_faces)
+    components = []
+    while unseen:
+        seed = unseen.pop()
+        component = {seed}
+        stack = [seed]
+        while stack:
+            face = stack.pop()
+            for edge in face.edges:
+                # A hard edge is represented by a locked segment after local
+                # subdivision.  Do not fit one plane across that crease.
+                if edge in locked_region_edges:
+                    continue
+                for neighbor in edge.link_faces:
+                    if neighbor in region_set and neighbor in unseen:
+                        unseen.remove(neighbor)
+                        component.add(neighbor)
+                        stack.append(neighbor)
+        components.append(component)
+    return components
+
+
 def _rebuild_working_mesh(
-    source, selected_indices, excluded_indices, level, strength, hard_angle, mode="smooth"
+    source, selected_indices, excluded_indices, level, strength, hard_angle, mode="smooth",
+    height_mode="MEDIAN", normal_hint=None, normal_mode="AUTO",
 ):
     working = source.copy()
     working.data = source.data.copy()
@@ -260,7 +294,12 @@ def _rebuild_working_mesh(
                 hard_edges.add(edge)
         except ValueError:
             hard_edges.add(edge)
-    locked_edges = boundary_edges | hard_edges | {edge for face in excluded for edge in face.edges}
+    # Smoothing preserves every detected crease.  Flattening has different
+    # semantics: an internal crease fully covered by green marks is usually
+    # the faceting defect the user asked us to remove, so only the outer patch
+    # boundary and explicit red protection remain fixed.
+    protected_feature_edges = hard_edges if mode != "flatten" else set()
+    locked_edges = boundary_edges | protected_feature_edges | {edge for face in excluded for edge in face.edges}
     locked_initial_vertices = {vertex for edge in locked_edges for vertex in edge.verts}
     locked_segments = [(edge.verts[0].co.copy(), edge.verts[1].co.copy()) for edge in locked_edges]
     local_lengths = [edge.calc_length() for edge in selected_edges if edge.calc_length() > 1.0e-9]
@@ -290,6 +329,20 @@ def _rebuild_working_mesh(
         _remove_object(working)
         raise RuntimeError("细分后未能保留局部区域标签")
 
+    if mode == "flatten":
+        # Work with explicit triangles while solving planarity.  A warped quad
+        # has an ambiguous display normal and was the source of false-looking
+        # folds in the old preview; BEAUTY chooses the shorter, safer diagonal.
+        bmesh.ops.triangulate(
+            bm,
+            faces=region_faces,
+            quad_method="BEAUTY",
+            ngon_method="BEAUTY",
+        )
+        bm.faces.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        region_faces = [face for face in bm.faces if int(face[region_layer]) == 1]
+
     region_vertices = {vertex for face in region_faces for vertex in face.verts}
     lock_tolerance = max(1.0e-8, local_scale * 1.0e-6)
     locked_vertices = {
@@ -297,25 +350,130 @@ def _rebuild_working_mesh(
         if any(_point_segment_distance(vertex.co, first, second) <= lock_tolerance
                for first, second in locked_segments)
     }
+    locked_region_edges = {
+        edge for face in region_faces for edge in face.edges
+        if any(
+            _point_segment_distance(edge.verts[0].co, first, second) <= lock_tolerance
+            and _point_segment_distance(edge.verts[1].co, first, second) <= lock_tolerance
+            for first, second in locked_segments
+        )
+    }
     movable = list(region_vertices - locked_vertices)
     before_coordinates = {vertex: vertex.co.copy() for vertex in movable}
+    before_face_geometry = {
+        face: (face.normal.copy(), max(float(face.calc_area()), 1.0e-20))
+        for face in region_faces
+    }
     planarity = None
+    flatten_projection_fraction = 1.0
+    flatten_progress_passed = True
     if mode == "flatten" and movable:
-        plane_center, plane_normal, before_distances = _best_fit_plane(region_vertices)
-        for vertex in movable:
-            signed_distance = (vertex.co - plane_center).dot(plane_normal)
-            vertex.co -= plane_normal * signed_distance
-        _center, _normal, after_distances = _best_fit_plane(region_vertices)
+        components = _region_face_components(region_faces, locked_region_edges)
+        component_reports = []
+        component_geometry = []
+        before_squares = []
+        after_squares = []
+        moved_vertices = set()
+        for component_index, component_faces in enumerate(components):
+            component_vertices = {vertex for face in component_faces for vertex in face.verts}
+            component_movable = (component_vertices - locked_vertices) - moved_vertices
+            if not component_movable or len(component_vertices) < 3:
+                continue
+            orientation = Vector((0.0, 0.0, 0.0))
+            for face in component_faces:
+                orientation += face.normal
+            plane_center, plane_normal, before_distances = _best_fit_plane(
+                component_vertices,
+                normal_hint=normal_hint,
+                height_mode=height_mode,
+                orientation_hint=orientation if orientation.length_squared else None,
+            )
+            for vertex in component_movable:
+                signed_distance = (vertex.co - plane_center).dot(plane_normal)
+                vertex.co -= plane_normal * signed_distance
+            moved_vertices.update(component_movable)
+            after_distances = np.asarray([
+                float((vertex.co - plane_center).dot(plane_normal)) for vertex in component_vertices
+            ])
+            before_squares.extend(float(value * value) for value in before_distances)
+            after_squares.extend(float(value * value) for value in after_distances)
+            component_reports.append({
+                "index": component_index,
+                "faces": len(component_faces),
+                "vertices": len(component_vertices),
+                "movable_vertices": len(component_movable),
+                "before_rms": float(np.sqrt(np.mean(np.square(before_distances)))),
+                "after_rms": float(np.sqrt(np.mean(np.square(after_distances)))),
+                "plane_center_local": list(plane_center),
+                "plane_normal_local": list(plane_normal),
+                "height_mode": height_mode,
+                "normal_mode": normal_mode,
+            })
+            component_geometry.append((component_reports[-1], component_vertices, plane_center, plane_normal))
+        before_rms = float(math.sqrt(sum(before_squares) / len(before_squares))) if before_squares else 0.0
+        after_rms = float(math.sqrt(sum(after_squares) / len(after_squares))) if after_squares else 0.0
         planarity = {
-            "method": "local_region_robust_center_pca",
-            "before_rms": float(np.sqrt(np.mean(np.square(before_distances)))),
-            "after_rms": float(np.sqrt(np.mean(np.square(after_distances)))),
-            "plane_center_local": list(plane_center),
-            "plane_normal_local": list(plane_normal),
+            "method": "local_region_robust_center_pca_per_feature_component",
+            "component_count": len(components),
+            "fitted_component_count": len(component_reports),
+            "before_rms": before_rms,
+            "after_rms": after_rms,
+            "components": component_reports,
         }
-        max_allowed = max(
-            ((vertex.co - before_coordinates[vertex]).length for vertex in movable),
+        # This is a rejection gate, not a clamp.  A plane that would move a
+        # point several local triangles is almost certainly the wrong patch.
+        max_allowed = local_scale * 2.5
+        full_targets = {vertex: vertex.co.copy() for vertex in movable}
+        full_maximum = max(
+            ((full_targets[vertex] - before_coordinates[vertex]).length for vertex in movable),
             default=0.0,
+        )
+        flatten_projection_fraction = min(
+            1.0,
+            max_allowed / full_maximum if full_maximum > 1.0e-20 else 1.0,
+        )
+        # Backtrack to the strongest geometrically safe projection.  This is
+        # a deterministic orientation/area constraint, not a tuned brush
+        # strength: the first fraction with no flipped or collapsed face wins.
+        safe_fraction = 0.0
+        for _attempt in range(12):
+            for vertex in movable:
+                vertex.co = before_coordinates[vertex].lerp(
+                    full_targets[vertex], flatten_projection_fraction
+                )
+            bm.normal_update()
+            invalid = False
+            for face, (before_normal, before_area) in before_face_geometry.items():
+                if float(face.calc_area()) <= before_area * 0.05:
+                    invalid = True
+                    break
+                if before_normal.length_squared and face.normal.length_squared and before_normal.dot(face.normal) <= 0.0:
+                    invalid = True
+                    break
+            if not invalid:
+                safe_fraction = flatten_projection_fraction
+                break
+            flatten_projection_fraction *= 0.5
+        flatten_projection_fraction = safe_fraction
+        if not safe_fraction:
+            for vertex in movable:
+                vertex.co = before_coordinates[vertex]
+        final_after_squares = []
+        for component_report, component_vertices, plane_center, plane_normal in component_geometry:
+            final_distances = np.asarray([
+                float((vertex.co - plane_center).dot(plane_normal)) for vertex in component_vertices
+            ])
+            final_after_squares.extend(float(value * value) for value in final_distances)
+            component_report["after_rms"] = float(np.sqrt(np.mean(np.square(final_distances))))
+        planarity["after_rms"] = (
+            float(math.sqrt(sum(final_after_squares) / len(final_after_squares)))
+            if final_after_squares else planarity["before_rms"]
+        )
+        planarity["projection_fraction"] = flatten_projection_fraction
+        planarity["full_projection_max_displacement"] = full_maximum
+        flatten_progress_passed = (
+            flatten_projection_fraction > 0.0
+            and planarity["after_rms"] < planarity["before_rms"] * 0.995
         )
     elif strength > 0.0 and movable:
         for _iteration in range(2):
@@ -336,6 +494,15 @@ def _rebuild_working_mesh(
         max_allowed = 0.0
 
     moved = [(vertex.co - before_coordinates[vertex]).length for vertex in movable]
+    bm.normal_update()
+    flipped_faces = 0
+    degenerate_faces = 0
+    for face, (before_normal, before_area) in before_face_geometry.items():
+        after_area = float(face.calc_area())
+        if after_area <= before_area * 0.05:
+            degenerate_faces += 1
+        if before_normal.length_squared and face.normal.length_squared and before_normal.dot(face.normal) <= 0.0:
+            flipped_faces += 1
     region_set = set(region_faces)
     region_edges = {
         edge for face in region_faces for edge in face.edges
@@ -354,7 +521,13 @@ def _rebuild_working_mesh(
         and (not dihedral_comparable or after_p95 <= before_p95 + math.radians(2.0))
     )
     if planarity is not None:
-        topology_passed = topology_passed and planarity["after_rms"] <= planarity["before_rms"] + 1.0e-9
+        topology_passed = (
+            topology_passed
+            and planarity["after_rms"] <= planarity["before_rms"] + 1.0e-9
+            and (max(moved) if moved else 0.0) <= max_allowed
+            and flatten_progress_passed
+        )
+    topology_passed = topology_passed and flipped_faces == 0 and degenerate_faces == 0
 
     preview_vertices = []
     preview_faces = []
@@ -385,6 +558,10 @@ def _rebuild_working_mesh(
         "local_edge_scale": local_scale,
         "max_allowed_displacement": max_allowed,
         "max_actual_displacement": max(moved) if moved else 0.0,
+        "flatten_projection_fraction": flatten_projection_fraction if mode == "flatten" else None,
+        "flatten_progress_passed": flatten_progress_passed if mode == "flatten" else None,
+        "flipped_faces": flipped_faces,
+        "degenerate_faces": degenerate_faces,
         "locked_boundary_or_feature_vertices": len(locked_vertices),
         "before_topology": before_topology,
         "after_topology": after_topology,
@@ -406,10 +583,18 @@ def _preview_object(scene, source, vertices, faces):
     obj = bpy.data.objects.new(CANDIDATE_PREFIX + source.name, mesh)
     candidates.objects.link(obj)
     obj.matrix_world = source.matrix_world.copy()
-    obj.display_type = "WIRE"
+    material = bpy.data.materials.get(PREVIEW_MATERIAL_NAME)
+    if material is None:
+        material = bpy.data.materials.new(PREVIEW_MATERIAL_NAME)
+    material.diffuse_color = (1.0, 0.12, 0.015, 0.38)
+    if hasattr(material, "surface_render_method"):
+        material.surface_render_method = "DITHERED"
+    if obj.data.materials.get(material.name) is None:
+        obj.data.materials.append(material)
+    obj.display_type = "SOLID"
     obj.show_in_front = True
-    obj.show_wire = True
-    obj.show_all_edges = True
+    obj.show_wire = False
+    obj.show_all_edges = False
     obj.color = (1.0, 0.28, 0.02, 1.0)
     obj["smrn_candidate_only"] = True
     return obj
@@ -446,6 +631,9 @@ def build_scene_candidate(scene, mode="smooth"):
     if mode not in {"smooth", "flatten"}:
         raise ValueError("不支持的局部网面重构模式")
     source, targets, excludes, before_snapshot = _source_and_records(scene)
+    height_mode = str(getattr(scene, "smrn_surface_height_mode", "MEDIAN"))
+    normal_mode = str(getattr(scene, "smrn_surface_normal_mode", "AUTO"))
+    normal_hint = _normal_hint_from_records(source, targets, excludes, normal_mode) if mode == "flatten" else None
     hard_angle = math.radians(float(scene.smrn_surface_hard_angle))
     probe = bmesh.new()
     probe.from_mesh(source.data)
@@ -467,9 +655,20 @@ def build_scene_candidate(scene, mode="smooth"):
             float(scene.smrn_surface_smooth_strength),
             hard_angle,
             mode,
+            height_mode,
+            normal_hint,
+            normal_mode,
         )
         if not topology["passed"]:
-            raise ValueError("候选使非流形边或高百分位折角变差，已拒绝生成")
+            failures = []
+            if topology.get("flipped_faces"):
+                failures.append(f"{topology['flipped_faces']} 个面翻转")
+            if topology.get("degenerate_faces"):
+                failures.append(f"{topology['degenerate_faces']} 个面退化")
+            if topology.get("max_actual_displacement", 0.0) > topology.get("max_allowed_displacement", 0.0):
+                failures.append("拟合位移超过局部网格尺度")
+            detail = "、".join(failures) or "非流形边或局部折角变差"
+            raise ValueError(f"平整质量检查未通过（{detail}），已拒绝生成；源网格未修改")
         checkpoint = _checkpoint(scene, source)
         _link_hidden_working(scene, working)
         preview = _preview_object(scene, source, vertices, faces)
@@ -484,13 +683,18 @@ def build_scene_candidate(scene, mode="smooth"):
             "topology_qa": topology,
             "coverage_qa": {
                 "passed": True,
-                "method": "exact_mark_anchors_plus_bounded_local_adjacency",
+                "method": "exact_brushed_faces_only",
                 "source_objects_scanned": 1,
                 "whole_vehicle_search": False,
             },
             "working_object": working.name,
             "preview_object": preview.name,
             "mode": mode,
+            "flatten_reference": {
+                "height_mode": height_mode,
+                "normal_mode": normal_mode,
+                "normal_hint_local": list(normal_hint) if normal_hint is not None else None,
+            } if mode == "flatten" else None,
         }
         if not source_unchanged:
             raise RuntimeError("候选生成期间源网格发生变化，已中止")

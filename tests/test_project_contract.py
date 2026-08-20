@@ -17,6 +17,13 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn('bl_idname = "smrn.mark_surface"', operators)
         self.assertNotIn('bl_idname = "smr.', operators)
 
+    def test_marker_supports_continuous_drag_brushing(self):
+        operators = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "operators.py").read_text(encoding="utf-8")
+        self.assertIn('event.type == "MOUSEMOVE"', operators)
+        self.assertIn("def _paint_segment", operators)
+        self.assertIn("self._painting = True", operators)
+        self.assertIn("dragging=True", operators)
+
     def test_legacy_helpers_are_excluded_from_raycast(self):
         scene_state = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "scene_state.py").read_text(encoding="utf-8")
         self.assertIn('obj.get("smr_annotation_only", False)', scene_state)
@@ -118,7 +125,11 @@ class ProjectContractTests(unittest.TestCase):
         panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
         self.assertIn('CANDIDATE_PREFIX = "SMRN_SURFACE_CANDIDATE_"', adapter)
         self.assertIn('"global_geometry_scan": False', adapter)
-        self.assertIn("boundary_edges | hard_edges", adapter)
+        self.assertIn('"selection_method": "exact_brushed_faces"', adapter)
+        self.assertIn('"display_radius_used_for_growth": False', adapter)
+        self.assertIn('def _normal_hint_from_records', adapter)
+        self.assertIn('hard_edges if mode != "flatten" else set()', adapter)
+        self.assertIn("locked_edges = boundary_edges | protected_feature_edges", adapter)
         self.assertIn("max_allowed_displacement", adapter)
         self.assertIn("source.data = new_mesh", adapter)
         self.assertIn("set_active_source(scene, source_snapshot(source))", adapter)
@@ -128,9 +139,14 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn('bl_idname = "smrn.confirm_surface_replacement"', operators)
         self.assertIn('text="细化平滑"', panel)
         self.assertIn('text="一键平整"', panel)
+        self.assertIn('"smrn_surface_height_mode"', panel)
+        self.assertIn('"smrn_surface_normal_mode"', panel)
         self.assertIn('text="确认替换原网面并清除标记"', panel)
         self.assertIn('mode == "flatten"', adapter)
-        self.assertIn("local_region_robust_center_pca", adapter)
+        self.assertIn("local_region_robust_center_pca_per_feature_component", adapter)
+        self.assertIn("def _region_face_components", adapter)
+        self.assertIn('"flipped_faces"', adapter)
+        self.assertIn('"degenerate_faces"', adapter)
 
 
 if __name__ == "__main__":

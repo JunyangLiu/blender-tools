@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Semantic Mesh Marker Next",
     "author": "Local developer",
-    "version": (0, 5, 1),
+    "version": (0, 5, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > 语义标记 Next",
     "description": "Non-destructive target and exclude surface marking",
@@ -89,6 +89,26 @@ def register():
     bpy.types.Scene.smrn_surface_hard_angle = bpy.props.FloatProperty(
         name="硬边保护角度", default=35.0, min=5.0, max=85.0, precision=1,
     )
+    bpy.types.Scene.smrn_surface_height_mode = bpy.props.EnumProperty(
+        name="平整高度",
+        description="决定平整面经过绿色标记区域的最低点、中间位置或最高点",
+        items=(
+            ("LOW", "贴最低点", "沿所选法向贴到绿色标记区域的最低点"),
+            ("MEDIAN", "居中拟合", "使用绿色标记区域的中间高度"),
+            ("HIGH", "贴最高点", "沿所选法向贴到绿色标记区域的最高点"),
+        ),
+        default="MEDIAN",
+    )
+    bpy.types.Scene.smrn_surface_normal_mode = bpy.props.EnumProperty(
+        name="平整方向",
+        description="决定平直面的法向依据",
+        items=(
+            ("AUTO", "自动拟合", "分别从每个连续绿色区域拟合稳定法向"),
+            ("FIRST_TARGET", "第一处绿色面", "采用本轮第一处绿色标记面的法向"),
+            ("RED_REFERENCE", "红色参考面", "采用红色标记面的平均法向；红色面保持不动"),
+        ),
+        default="AUTO",
+    )
     bpy.types.Scene.smrn_surface_summary = bpy.props.StringProperty(
         name="局部网面重构结果", default="尚未生成局部网面候选",
     )
@@ -104,7 +124,8 @@ def register():
 
 def unregister():
     for name in (
-        "smrn_surface_summary", "smrn_surface_hard_angle",
+        "smrn_surface_summary", "smrn_surface_normal_mode", "smrn_surface_height_mode",
+        "smrn_surface_hard_angle",
         "smrn_surface_smooth_strength", "smrn_surface_subdivision_level",
         "smrn_handle_summary", "smrn_handle_clearance", "smrn_handle_thickness_scale",
         "smrn_handle_min_diameter", "smrn_handle_section_segments",

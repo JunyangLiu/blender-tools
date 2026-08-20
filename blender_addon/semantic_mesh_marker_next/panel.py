@@ -34,9 +34,9 @@ class SMRN_PT_marking(bpy.types.Panel):
         marks_box = layout.box()
         marks_box.label(text="1. 标记表面", icon="GREASEPENCIL")
         row = marks_box.row(align=True)
-        target = row.operator("smrn.mark_surface", text="绿色：要处理", icon="BRUSH_DATA")
+        target = row.operator("smrn.mark_surface", text="绿色刷选：要处理", icon="BRUSH_DATA")
         target.mark_value = 1
-        exclude = row.operator("smrn.mark_surface", text="红色：要保留", icon="BRUSH_DATA")
+        exclude = row.operator("smrn.mark_surface", text="红色刷选：要保留", icon="BRUSH_DATA")
         exclude.mark_value = -1
         row = marks_box.row(align=True)
         row.operator("smrn.undo_mark", text="撤销", icon="LOOP_BACK")
@@ -82,6 +82,9 @@ class SMRN_PT_marking(bpy.types.Panel):
         surface = layout.box()
         surface.label(text="4. 局部原网面重构", icon="MOD_REMESH")
         surface.label(text="绿色：重构区域  ·  红色：锁定保留")
+        direction = surface.row(align=True)
+        direction.prop(scene, "smrn_surface_height_mode", text="高度")
+        direction.prop(scene, "smrn_surface_normal_mode", text="法向")
         row = surface.row(align=True)
         smooth = row.operator(
             "smrn.build_surface_candidate",

@@ -1,4 +1,5 @@
 import json
+import math
 import uuid
 from datetime import datetime, timezone
 
@@ -124,21 +125,34 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         counts = document_summary(context.scene)["role_counts"]
         _set_status(context.scene, f"标记结束：目标 {counts['target']}，排除 {counts['exclude']}。")
 
-    def _click(self, context, event):
-        x = event.mouse_x - self._window_region.x
-        y = event.mouse_y - self._window_region.y
+    def _over_sidebar(self, mouse_x, mouse_y):
+        return self._ui_region is not None and (
+            self._ui_region.x <= mouse_x < self._ui_region.x + self._ui_region.width
+            and self._ui_region.y <= mouse_y < self._ui_region.y + self._ui_region.height
+        )
+
+    def _paint_at(self, context, mouse_x, mouse_y, *, dragging=False):
+        x = mouse_x - self._window_region.x
+        y = mouse_y - self._window_region.y
         if not (0 <= x < self._window_region.width and 0 <= y < self._window_region.height):
-            return
+            return False
+        # A full magnetic ring is useful for the first dab on a narrow recess.
+        # During a stroke a smaller ring keeps feedback fluid on dense models;
+        # neighboring samples still cover the stroke continuously.
+        magnetic_radius = int(context.scene.smrn_magnetic_radius_px)
+        if dragging:
+            magnetic_radius = min(magnetic_radius, 4)
         hit = magnetic_scene_hit(
             context,
             self._window_region,
             self._region_3d,
             (x, y),
-            context.scene.smrn_magnetic_radius_px,
+            magnetic_radius,
         )
         if hit is None:
-            _set_status(context.scene, "未找到可见表面；请靠近零件点击或增大磁吸半径。")
-            return
+            if not dragging:
+                _set_status(context.scene, "未找到可见表面；请靠近零件点击或增大磁吸半径。")
+            return False
         summary = document_summary(context.scene)
         number = next_id(context.scene)
         role = TARGET_ROLE if self.mark_value == 1 else EXCLUDE_ROLE
@@ -150,7 +164,7 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
             )
         except RuntimeError as error:
             self.report({"ERROR"}, str(error))
-            return
+            return False
         source = bpy.data.objects.get(hit["source_object_name"])
         hit_object = bpy.data.objects.get(hit["hit_object_name"])
         if source is not None:
@@ -182,12 +196,28 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         )
         if not append_mark(context.scene, record):
             remove_overlay(name)
-            _set_status(context.scene, "该位置已有标记；未创建重复记录。")
-            return
+            if not dragging:
+                _set_status(context.scene, "该位置已有标记；可按住左键继续刷过相邻网面。")
+            return False
         _set_status(
             context.scene,
             f"已标记 {hit['hit_object_name']} 面 {hit['face_index']}；磁吸偏移 {hit['screen_offset_px']:.1f}px。",
         )
+        return True
+
+    def _paint_segment(self, context, start, end):
+        distance = math.hypot(end[0] - start[0], end[1] - start[1])
+        spacing = max(6.0, min(18.0, float(context.scene.smrn_magnetic_radius_px)))
+        steps = max(1, int(math.ceil(distance / spacing)))
+        painted = False
+        for step in range(1, steps + 1):
+            factor = step / steps
+            mouse_x = start[0] + (end[0] - start[0]) * factor
+            mouse_y = start[1] + (end[1] - start[1]) * factor
+            if self._over_sidebar(mouse_x, mouse_y):
+                continue
+            painted = self._paint_at(context, mouse_x, mouse_y, dragging=True) or painted
+        return painted
 
     def invoke(self, context, event):
         if context.area is None or context.area.type != "VIEW_3D":
@@ -203,11 +233,13 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
             self.report({"ERROR"}, "找不到 3D 视图窗口")
             return {"CANCELLED"}
         self._region_3d = context.space_data.region_3d
+        self._painting = False
+        self._last_paint_window = None
         self._token = uuid.uuid4().hex
         context.scene[MODAL_TOKEN_KEY] = self._token
         context.window.cursor_modal_set("PAINT_BRUSH")
         context.window_manager.modal_handler_add(self)
-        _set_status(context.scene, f"标记已启动：检测 {len(meshes)} 个可见网格；左键标记，Z 撤销，右键结束。")
+        _set_status(context.scene, f"刷选已启动：检测 {len(meshes)} 个可见网格；按住左键拖动，Z 撤销，右键结束。")
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
@@ -221,14 +253,27 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
             self._finish(context)
             return {"FINISHED"}
         if event.type == "LEFTMOUSE" and event.value == "PRESS":
-            over_sidebar = self._ui_region is not None and (
-                self._ui_region.x <= event.mouse_x < self._ui_region.x + self._ui_region.width
-                and self._ui_region.y <= event.mouse_y < self._ui_region.y + self._ui_region.height
-            )
-            if over_sidebar:
+            if self._over_sidebar(event.mouse_x, event.mouse_y):
                 self._finish(context)
                 return {"FINISHED"}
-            self._click(context, event)
+            self._painting = True
+            self._last_paint_window = (event.mouse_x, event.mouse_y)
+            self._paint_at(context, event.mouse_x, event.mouse_y)
+            return {"RUNNING_MODAL"}
+        if event.type == "MOUSEMOVE" and getattr(self, "_painting", False):
+            current = (event.mouse_x, event.mouse_y)
+            previous = self._last_paint_window or current
+            if math.hypot(current[0] - previous[0], current[1] - previous[1]) >= 6.0:
+                self._paint_segment(context, previous, current)
+                self._last_paint_window = current
+            return {"RUNNING_MODAL"}
+        if event.type == "LEFTMOUSE" and event.value == "RELEASE" and getattr(self, "_painting", False):
+            current = (event.mouse_x, event.mouse_y)
+            previous = self._last_paint_window or current
+            if current != previous:
+                self._paint_segment(context, previous, current)
+            self._painting = False
+            self._last_paint_window = None
             return {"RUNNING_MODAL"}
         return {"PASS_THROUGH"}
 
@@ -493,9 +538,16 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
         topology = report["topology_qa"]
         region = report["semantic_region"]
         action = "平整" if report["mode"] == "flatten" else "细化平滑"
+        protection = "外边界与红色面已锁定" if report["mode"] == "flatten" else "边界与硬边已锁定"
+        reference = ""
+        if report["mode"] == "flatten":
+            labels = {"LOW": "最低点", "MEDIAN": "居中", "HIGH": "最高点"}
+            normal_labels = {"AUTO": "自动法向", "FIRST_TARGET": "首个绿面法向", "RED_REFERENCE": "红面法向"}
+            choice = report.get("flatten_reference") or {}
+            reference = f" · {labels.get(choice.get('height_mode'), '居中')} / {normal_labels.get(choice.get('normal_mode'), '自动法向')}"
         context.scene.smrn_surface_summary = (
             f"{action}候选 · {region['selected_faces']} 面 → "
-            f"{topology['region_faces_after']} 面 · 边界与硬边已锁定"
+            f"{topology['region_faces_after']} 面 · {protection}{reference}"
         )
         _set_status(context.scene, context.scene.smrn_surface_summary)
         return {"FINISHED"}
