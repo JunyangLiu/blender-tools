@@ -521,13 +521,21 @@ def build_scene_candidate(scene, mode="smooth"):
 
 
 def _archive_collection(scene):
-    model, _candidates, _helpers = ensure_scene_roots(scene)
+    model, candidates, _helpers = ensure_scene_roots(scene)
     collection = bpy.data.collections.get(ARCHIVE_COLLECTION_NAME)
     if collection is None:
         collection = bpy.data.collections.new(ARCHIVE_COLLECTION_NAME)
-    if model.children.get(collection.name) is None:
-        model.children.link(collection)
+    # A rollback checkpoint is not a second current model.  Keep it outside
+    # the always-visible model root so visibility restoration cannot create a
+    # full-vehicle overlap.  The explicit object flag below remains the second
+    # guard for files created by older versions.
+    if model.children.get(collection.name) is not None:
+        model.children.unlink(collection)
+    if candidates.children.get(collection.name) is None:
+        candidates.children.link(collection)
     collection["smrn_collection_role"] = "recoverable_source_mesh_checkpoints"
+    collection.hide_viewport = True
+    collection.hide_render = True
     return collection
 
 
@@ -576,6 +584,9 @@ def confirm_replacement(scene):
         scene["smrn_surface_working_name"] = ""
         set_active_source(scene, source_snapshot(source))
         keep_model_visible(scene, (source,))
+        archive.hide_viewport = True
+        archive.hide_render = True
+        archive.hide_set(True)
         return source, archive, report
     except Exception:
         source.data = old_mesh

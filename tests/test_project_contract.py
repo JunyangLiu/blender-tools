@@ -58,13 +58,16 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("radius * 0.005", auto_thickness)
         self.assertNotIn("radius * 0.08", auto_thickness)
 
-    def test_visibility_guard_skips_stale_recursive_objects(self):
+    def test_visibility_guard_only_reveals_authoritative_objects(self):
         scene_state = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "scene_state.py").read_text(encoding="utf-8")
         visibility = scene_state.split("def keep_model_visible", 1)[1].split("def set_helpers_hidden", 1)[0]
-        self.assertIn("list(model.all_objects)", visibility)
+        self.assertNotIn("model.all_objects", visibility)
         self.assertIn("if obj is None", visibility)
         self.assertIn("required_objects", visibility)
         self.assertIn("except (AttributeError, ReferenceError)", visibility)
+        self.assertIn('obj.get("smrn_archive_only", False)', visibility)
+        self.assertIn('obj.get("smrn_superseded_source_only", False)', visibility)
+        self.assertIn("obj.hide_set(True)", visibility)
 
     def test_rotational_axis_candidates_are_data_derived(self):
         fitter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "rotational_fit.py").read_text(encoding="utf-8")
@@ -119,6 +122,9 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("max_allowed_displacement", adapter)
         self.assertIn("source.data = new_mesh", adapter)
         self.assertIn("set_active_source(scene, source_snapshot(source))", adapter)
+        self.assertIn("model.children.unlink(collection)", adapter)
+        self.assertIn("candidates.children.link(collection)", adapter)
+        self.assertIn("collection.hide_viewport = True", adapter)
         self.assertIn('bl_idname = "smrn.confirm_surface_replacement"', operators)
         self.assertIn('text="细化平滑"', panel)
         self.assertIn('text="一键平整"', panel)

@@ -84,15 +84,13 @@ def keep_model_visible(scene, required_objects=()):
     model, _candidates, _helpers = ensure_scene_roots(scene)
     model.hide_viewport = False
     model.hide_render = False
-    # The complete model must remain in context. Blender can briefly expose a
-    # stale/None RNA entry here immediately after an object is unlinked, so
-    # recursive visibility restoration must be defensive.
-    try:
-        objects = list(model.all_objects)
-    except ReferenceError:
-        objects = list(model.objects)
+    # Only the active semantic source and explicitly required repair objects
+    # are authoritative. Recursively unhiding every descendant can resurrect
+    # a superseded full-model object stored in a nested source collection and
+    # create an apparently restored/overlapping vehicle.
+    objects = []
     source = bpy.data.objects.get(str(scene.get(SOURCE_NAME_KEY, "")))
-    if source is not None and source not in objects:
+    if source is not None:
         objects.append(source)
     for required in required_objects:
         if required is not None and required not in objects:
@@ -101,6 +99,15 @@ def keep_model_visible(scene, required_objects=()):
         if obj is None:
             continue
         try:
+            # Recoverable checkpoints and superseded sources are deliberately
+            # retained, but never belong to the visible current vehicle.
+            if bool(obj.get("smrn_archive_only", False)) or bool(
+                obj.get("smrn_superseded_source_only", False)
+            ):
+                obj.hide_viewport = True
+                obj.hide_render = True
+                obj.hide_set(True)
+                continue
             obj.hide_viewport = False
             obj.hide_render = False
             obj.hide_set(False)
