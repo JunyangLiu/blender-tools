@@ -33,6 +33,7 @@ ARCHIVE_COLLECTION_NAME = "SMR_01B_原网面恢复检查点"
 REPORT_KEY = "smrn_surface_rebuild_report_json"
 PREVIEW_MATERIAL_NAME = "SMRN_局部网面候选_橙色半透明"
 MIN_FLATTEN_INTERIOR_SUPPORT = 3
+RELIABLE_COMPONENT_DIHEDRAL_SAMPLE = 32
 
 
 def _fit_rotational_from_selected_faces(source, face_indices):
@@ -685,6 +686,66 @@ def _canvas_safe_fraction(
     return 0.0, attempts
 
 
+def _flatten_component_safe_fraction(
+    bm, movable, before_coordinates, proposed_coordinates,
+    before_face_geometry, matched_edges, before_p95, tolerance_degrees=2.0,
+):
+    """Find a safe projection for one disconnected flatten component.
+
+    A weak island must not force a valid large component to share its rollback.
+    The component is tested against its own affected faces and its own matched
+    edge population, then restored when no useful safe fraction exists.
+    """
+    attempts = []
+    for fraction in (1.0, 0.75, 0.5, 0.35, 0.25, 0.125):
+        for vertex in movable:
+            vertex.co = before_coordinates[vertex].lerp(
+                proposed_coordinates[vertex], fraction
+            )
+        bm.normal_update()
+        collapsed = 0
+        reversed_faces = 0
+        minimum_area_ratio = 1.0
+        minimum_normal_dot = 1.0
+        for face, (before_normal, before_area) in before_face_geometry.items():
+            area_ratio = float(face.calc_area()) / max(before_area, 1.0e-20)
+            minimum_area_ratio = min(minimum_area_ratio, area_ratio)
+            if area_ratio <= 0.05:
+                collapsed += 1
+            if before_normal.length_squared and face.normal.length_squared:
+                normal_dot = float(before_normal.dot(face.normal))
+                minimum_normal_dot = min(minimum_normal_dot, normal_dot)
+                if normal_dot <= 0.0:
+                    reversed_faces += 1
+        after_p95 = _percentile(_edge_dihedrals(matched_edges), 0.95)
+        passed = (
+            collapsed == 0
+            and reversed_faces == 0
+            and (
+                not matched_edges
+                or after_p95 <= before_p95 + math.radians(float(tolerance_degrees))
+            )
+        )
+        attempts.append({
+            "fraction": fraction,
+            "collapsed_faces": collapsed,
+            "reversed_faces": reversed_faces,
+            "minimum_area_ratio": minimum_area_ratio,
+            "minimum_normal_dot": minimum_normal_dot,
+            "matched_dihedral_edges": len(matched_edges),
+            "before_dihedral_p95_degrees": math.degrees(before_p95),
+            "after_dihedral_p95_degrees": math.degrees(after_p95),
+            "allowed_dihedral_increase_degrees": float(tolerance_degrees),
+            "passed": passed,
+        })
+        if passed:
+            return fraction, attempts
+    for vertex in movable:
+        vertex.co = before_coordinates[vertex]
+    bm.normal_update()
+    return 0.0, attempts
+
+
 def _canvas_subdivision_cuts(selected_face_count):
     """Choose enough density for waves while keeping the local job bounded."""
     count = max(1, int(selected_face_count))
@@ -1096,8 +1157,6 @@ def _rebuild_working_mesh(
         component_reports = []
         preserved_component_reports = []
         component_geometry = []
-        before_squares = []
-        after_squares = []
         moved_vertices = set()
         for component_index, component_faces in enumerate(components):
             component_vertices = {vertex for face in component_faces for vertex in face.verts}
@@ -1140,9 +1199,11 @@ def _rebuild_working_mesh(
                 float((vertex.co - plane_center).dot(plane_normal))
                 for vertex in component_movable
             ])
+            component_targets = {}
             for vertex in component_movable:
                 signed_distance = (vertex.co - plane_center).dot(plane_normal)
                 vertex.co -= plane_normal * signed_distance
+                component_targets[vertex] = vertex.co.copy()
             moved_vertices.update(component_movable)
             editable_after_distances = np.asarray([
                 float((vertex.co - plane_center).dot(plane_normal))
@@ -1151,8 +1212,6 @@ def _rebuild_working_mesh(
             whole_after_distances = np.asarray([
                 float((vertex.co - plane_center).dot(plane_normal)) for vertex in component_vertices
             ])
-            before_squares.extend(float(value * value) for value in editable_before_distances)
-            after_squares.extend(float(value * value) for value in editable_after_distances)
             component_reports.append({
                 "index": component_index,
                 "faces": len(component_faces),
@@ -1168,7 +1227,8 @@ def _rebuild_working_mesh(
                 "normal_mode": normal_mode,
             })
             component_geometry.append((
-                component_reports[-1], component_movable, component_vertices, plane_center, plane_normal
+                component_reports[-1], component_movable, component_vertices,
+                plane_center, plane_normal, component_targets,
             ))
         if not component_geometry:
             bm.free()
@@ -1176,37 +1236,12 @@ def _rebuild_working_mesh(
             raise ValueError(
                 "绿色区域只有边界或低支撑小碎片；至少需要一个含 3 个内部可移动顶点的连续区域"
             )
-        before_rms = float(math.sqrt(sum(before_squares) / len(before_squares))) if before_squares else 0.0
-        after_rms = float(math.sqrt(sum(after_squares) / len(after_squares))) if after_squares else 0.0
-        planarity = {
-            "method": "local_region_robust_center_pca_per_feature_component",
-            "progress_metric_scope": "supported_components_editable_green_interior_vertices",
-            "component_count": len(components),
-            "fitted_component_count": len(component_reports),
-            "preserved_component_count": len(preserved_component_reports),
-            "preserved_components": preserved_component_reports,
-            "preserved_faces": sum(item["faces"] for item in preserved_component_reports),
-            "preserved_movable_vertices": sum(
-                item["movable_vertices"] for item in preserved_component_reports
-            ),
-            "preservation_policy": "keep_low_support_components_unchanged_v1",
-            "before_rms": before_rms,
-            "after_rms": after_rms,
-            "components": component_reports,
-        }
-        # Preserve a planar green core while the green outer boundary remains
-        # fixed.  Only these green interior vertices may receive a target.
-        core_movable = list(moved_vertices)
-        core_before = dict(before_coordinates)
-        full_targets = {vertex: vertex.co.copy() for vertex in core_movable}
-        full_maximum = max(
-            ((full_targets[vertex] - core_before[vertex]).length for vertex in core_movable),
-            default=0.0,
-        )
-        for vertex in core_movable:
-            vertex.co = core_before[vertex]
+        # Restore the common baseline, then validate each disconnected patch
+        # independently.  One weak strip may be preserved, but it can no
+        # longer force a sound dominant patch to share a global rollback.
+        for vertex in moved_vertices:
+            vertex.co = before_coordinates[vertex]
         bm.normal_update()
-        movable = core_movable
         qa_faces = set(region_faces)
         minimum_qa_area = max(local_scale * local_scale * 1.0e-10, 1.0e-18)
         ignored_preexisting_tiny_faces = sum(
@@ -1217,90 +1252,173 @@ def _rebuild_working_mesh(
             for face in qa_faces
             if float(face.calc_area()) > minimum_qa_area
         }
-        # This is a rejection gate, not a clamp.  A plane that would move a
-        # point several local triangles is almost certainly the wrong patch.
-        max_allowed = local_scale * 2.5
-        flatten_projection_fraction = min(
-            1.0,
-            max_allowed / full_maximum if full_maximum > 1.0e-20 else 1.0,
-        )
-        # Backtrack to the strongest geometrically safe projection.  This is
-        # a deterministic orientation/area constraint, not a tuned brush
-        # strength: the first fraction with no flipped or collapsed face wins.
-        safe_fraction = 0.0
-        for _attempt in range(12):
-            for vertex in movable:
-                vertex.co = before_coordinates[vertex].lerp(
-                    full_targets[vertex], flatten_projection_fraction
-                )
-            bm.normal_update()
-            collapsed = 0
-            reversed_faces = 0
-            collapsed_core_faces = 0
-            reversed_core_faces = 0
-            minimum_area_ratio = 1.0
-            minimum_normal_dot = 1.0
-            for face, (before_normal, before_area) in before_face_geometry.items():
-                area_ratio = float(face.calc_area()) / before_area
-                minimum_area_ratio = min(minimum_area_ratio, area_ratio)
-                if area_ratio <= 0.05:
-                    collapsed += 1
-                    if face in region_faces:
-                        collapsed_core_faces += 1
-                if before_normal.length_squared and face.normal.length_squared:
-                    normal_dot = float(before_normal.dot(face.normal))
-                    minimum_normal_dot = min(minimum_normal_dot, normal_dot)
-                    if normal_dot <= 0.0:
-                        reversed_faces += 1
-                        if face in region_faces:
-                            reversed_core_faces += 1
-            flatten_safety_attempts.append({
-                "fraction": flatten_projection_fraction,
-                "collapsed_faces": collapsed,
-                "reversed_faces": reversed_faces,
-                "collapsed_core_faces": collapsed_core_faces,
-                "reversed_core_faces": reversed_core_faces,
-                "minimum_area_ratio": minimum_area_ratio,
-                "minimum_normal_dot": minimum_normal_dot,
-            })
-            invalid = collapsed > 0 or reversed_faces > 0
-            if not invalid:
-                safe_fraction = flatten_projection_fraction
-                break
-            flatten_projection_fraction *= 0.5
-        flatten_projection_fraction = safe_fraction
-        if not safe_fraction:
-            for vertex in movable:
-                vertex.co = before_coordinates[vertex]
-        final_after_squares = []
+        accepted_geometry = []
+        accepted_reports = []
+        accepted_vertices = set()
         for (
             component_report,
             component_movable,
             component_vertices,
             plane_center,
             plane_normal,
+            component_targets,
         ) in component_geometry:
+            affected_faces = {
+                face for vertex in component_movable for face in vertex.link_faces
+            }
+            component_face_geometry = {
+                face: before_face_geometry[face]
+                for face in affected_faces
+                if face in before_face_geometry
+            }
+            component_edges = {
+                edge for edge in matched_dihedral_edges
+                if any(vertex in component_movable for vertex in edge.verts)
+            }
+            component_before_p95 = _percentile(
+                _edge_dihedrals(component_edges), 0.95
+            )
+            # A dense component has a stable percentile and needs limited
+            # freedom at its locked transition boundary.  Tiny islands have
+            # only one or two comparable edges, so keep the strict limit and
+            # preserve them instead of extrapolating a plane from weak data.
+            component_dihedral_tolerance = (
+                4.0
+                if len(component_edges) >= RELIABLE_COMPONENT_DIHEDRAL_SAMPLE
+                else 2.0
+            )
+            fraction, attempts = _flatten_component_safe_fraction(
+                bm,
+                component_movable,
+                before_coordinates,
+                component_targets,
+                component_face_geometry,
+                component_edges,
+                component_before_p95,
+                tolerance_degrees=component_dihedral_tolerance,
+            )
             final_distances = np.asarray([
-                float((vertex.co - plane_center).dot(plane_normal)) for vertex in component_movable
+                float((vertex.co - plane_center).dot(plane_normal))
+                for vertex in component_movable
             ])
+            final_rms = float(np.sqrt(np.mean(np.square(final_distances))))
+            before_component_rms = float(component_report["before_rms"])
+            progress_passed = (
+                fraction >= 0.5
+                and (
+                    before_component_rms <= 1.0e-9
+                    or final_rms <= before_component_rms * 0.25 + 1.0e-12
+                )
+            )
+            flatten_safety_attempts.append({
+                "component_index": component_report["index"],
+                "accepted": progress_passed,
+                "attempts": attempts,
+            })
+            if not progress_passed:
+                for vertex in component_movable:
+                    vertex.co = before_coordinates[vertex]
+                bm.normal_update()
+                preserved_component_reports.append({
+                    "index": component_report["index"],
+                    "faces": component_report["faces"],
+                    "vertices": component_report["vertices"],
+                    "movable_vertices": component_report["movable_vertices"],
+                    "reason": (
+                        "component_safety_rejected"
+                        if fraction <= 0.0 else "component_projection_not_useful"
+                    ),
+                    "safe_projection_fraction": fraction,
+                    "before_rms": before_component_rms,
+                    "proposed_after_rms": final_rms,
+                    "full_projection_max_displacement": max(
+                        (
+                            (component_targets[vertex] - before_coordinates[vertex]).length
+                            for vertex in component_movable
+                        ),
+                        default=0.0,
+                    ),
+                    "safety_attempts": attempts,
+                })
+                continue
             whole_final_distances = np.asarray([
-                float((vertex.co - plane_center).dot(plane_normal)) for vertex in component_vertices
+                float((vertex.co - plane_center).dot(plane_normal))
+                for vertex in component_vertices
             ])
-            final_after_squares.extend(float(value * value) for value in final_distances)
-            component_report["after_rms"] = float(np.sqrt(np.mean(np.square(final_distances))))
+            component_report["after_rms"] = final_rms
             component_report["whole_region_after_rms"] = float(
                 np.sqrt(np.mean(np.square(whole_final_distances)))
             )
-        planarity["after_rms"] = (
-            float(math.sqrt(sum(final_after_squares) / len(final_after_squares)))
-            if final_after_squares else planarity["before_rms"]
+            component_report["projection_fraction"] = fraction
+            component_report["full_projection_max_displacement"] = max(
+                (
+                    (component_targets[vertex] - before_coordinates[vertex]).length
+                    for vertex in component_movable
+                ),
+                default=0.0,
+            )
+            component_report["safety_attempts"] = attempts
+            component_report["progress_passed"] = True
+            accepted_reports.append(component_report)
+            accepted_geometry.append((
+                component_report, component_movable, component_vertices,
+                plane_center, plane_normal, component_targets,
+            ))
+            accepted_vertices.update(component_movable)
+        if not accepted_geometry:
+            bm.free()
+            _remove_object(working)
+            raise ValueError(
+                "绿色区域均为低支撑或不安全小区域；请扩大一个连续主区域后再平整"
+            )
+        component_reports = accepted_reports
+        component_geometry = accepted_geometry
+        movable = list(accepted_vertices)
+        moved_vertices = accepted_vertices
+        max_allowed = local_scale * 2.5
+        flatten_projection_fraction = min(
+            (float(item["projection_fraction"]) for item in component_reports),
+            default=0.0,
         )
-        planarity["projection_fraction"] = flatten_projection_fraction
-        planarity["full_projection_max_displacement"] = full_maximum
-        flatten_progress_passed = (
-            flatten_projection_fraction >= 0.5
-            and planarity["after_rms"] < planarity["before_rms"] * 0.25
+        full_maximum = max(
+            (float(item["full_projection_max_displacement"]) for item in component_reports),
+            default=0.0,
         )
+        weighted_vertices = sum(item["movable_vertices"] for item in component_reports)
+        before_rms = math.sqrt(
+            sum(
+                item["before_rms"] ** 2 * item["movable_vertices"]
+                for item in component_reports
+            ) / weighted_vertices
+        )
+        after_rms = math.sqrt(
+            sum(
+                item["after_rms"] ** 2 * item["movable_vertices"]
+                for item in component_reports
+            ) / weighted_vertices
+        )
+        planarity = {
+            "method": "component_independent_safe_projection_v2",
+            "progress_metric_scope": "accepted_components_editable_green_interior_vertices",
+            "component_count": len(components),
+            "fitted_component_count": len(component_reports),
+            "preserved_component_count": len(preserved_component_reports),
+            "preserved_components": preserved_component_reports,
+            "preserved_faces": sum(item["faces"] for item in preserved_component_reports),
+            "preserved_movable_vertices": sum(
+                item["movable_vertices"] for item in preserved_component_reports
+            ),
+            "preservation_policy": "component_independent_safety_preservation_v2",
+            "before_rms": before_rms,
+            "after_rms": after_rms,
+            "components": component_reports,
+            "projection_fraction": flatten_projection_fraction,
+            "full_projection_max_displacement": full_maximum,
+            "component_safety_passed": all(
+                bool(item.get("progress_passed")) for item in component_reports
+            ),
+        }
+        flatten_progress_passed = bool(planarity["component_safety_passed"])
     elif mode == "canvas" and movable:
         bounded_strength = max(0.0, min(1.0, float(strength)))
         frame = _canvas_frame(region_vertices, region_faces, local_scale)
@@ -1564,6 +1682,12 @@ def _rebuild_working_mesh(
             (max(moved) if moved else 0.0) <= max_allowed + 1.0e-12
         )
     if planarity is not None:
+        # Flatten QA is intentionally component-scoped.  Mixing the edge
+        # populations of disconnected strips recreates the old failure mode
+        # where one weak island vetoes a valid main patch.
+        quality_gates["matched_dihedral_within_limit"] = bool(
+            planarity.get("component_safety_passed")
+        )
         quality_gates["planarity_improved"] = (
             planarity["after_rms"] <= planarity["before_rms"] + 1.0e-9
         )
@@ -1800,6 +1924,9 @@ def _matching_existing_candidate(scene, source, source_snapshot_value, request_s
         return None
     reused_report = dict(report)
     reused_report["reused_existing"] = True
+    scene["smrn_surface_last_report_json"] = json.dumps(
+        reused_report, ensure_ascii=False, separators=(",", ":")
+    )
     # Normalize previews created by older add-on versions as soon as they are
     # reused; this is display-only and leaves both meshes untouched.
     preview.show_in_front = False
