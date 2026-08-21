@@ -500,12 +500,14 @@ def _auto_thickness(fit, axial_min, axial_max):
     middle = 0.5 * (axial_min + axial_max)
     radius = fit.radius_at_axial(middle)
     axial_span = max(axial_max - axial_min, 1.0e-5)
-    # Automatic mode is a surface-restoration preview, not a structural
-    # thickening operation. Keep the visible fitted envelope exact and use
-    # only a scale-derived thin backing shell. Explicit advanced thickness
-    # remains available when a printable wall is intentionally requested.
+    # Preserve the calibrated visible envelope and add a useful structural
+    # backing only on the material/centre side.  The old preview shell used
+    # one percent of the feature scale and was effectively a membrane on
+    # vehicle-sized rings.  Bound the backing from both the local axial span
+    # and radius so it scales with this marked part without swallowing the
+    # opening or borrowing a fixed dimension from another model.
     feature_scale = min(max(radius, 1.0e-5), axial_span)
-    return max(1.0e-5, min(radius * 0.005, feature_scale * 0.01))
+    return max(1.0e-5, min(radius * 0.04, feature_scale * 0.18))
 
 
 def _ring_point(fit, axial, angle, radius):
@@ -787,7 +789,8 @@ def _build_candidate(scene, fit, source, targets, excludes, context_report,
         fit, dense, axial_min, axial_max,
         extra_clearance=float(scene.smrn_rotational_clearance),
     )
-    thickness = float(scene.smrn_rotational_thickness)
+    requested_thickness = float(scene.smrn_rotational_thickness)
+    thickness = requested_thickness
     if thickness <= 0.0:
         thickness = _auto_thickness(fit, axial_min, axial_max)
     coverage = _coverage_report(
@@ -817,6 +820,11 @@ def _build_candidate(scene, fit, source, targets, excludes, context_report,
                    "clearance_max": float(np.max(profile_clearance)),
                    "axial_profile_rings": len(axial_knots),
                    "thickness": thickness,
+                   "thickness_mode": ("auto_inward_structural_backing"
+                                      if requested_thickness <= 0.0 else "explicit"),
+                   "visible_surface_preserved": True,
+                   "backing_direction": ("toward_axis" if fit.surface_side == "outer"
+                                         else "away_from_axis_into_material"),
                    "segments": segments},
         "coverage_qa": {
             **coverage,

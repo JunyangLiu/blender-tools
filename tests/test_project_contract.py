@@ -70,9 +70,11 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("source_unchanged", (ROOT / "scripts" / "live_build_gate_test.py").read_text(encoding="utf-8"))
         self.assertNotIn("bpy.ops.object.delete", adapter)
         auto_thickness = adapter.split("def _auto_thickness", 1)[1].split("def _ring_point", 1)[0]
-        self.assertIn("feature_scale * 0.01", auto_thickness)
-        self.assertIn("radius * 0.005", auto_thickness)
+        self.assertIn("feature_scale * 0.18", auto_thickness)
+        self.assertIn("radius * 0.04", auto_thickness)
         self.assertNotIn("radius * 0.08", auto_thickness)
+        self.assertIn('"visible_surface_preserved": True', adapter)
+        self.assertIn('"backing_direction": ("toward_axis"', adapter)
 
     def test_disconnected_rotational_marks_require_local_geometric_proof(self):
         adapter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "rotational_blender.py").read_text(encoding="utf-8")
