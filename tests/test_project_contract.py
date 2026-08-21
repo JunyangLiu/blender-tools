@@ -25,9 +25,14 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("self._painting = True", operators)
         self.assertIn("dragging=True", operators)
         self.assertIn("def brush_scene_hits", raycast)
+        self.assertIn("def brush_object_hits", raycast)
+        self.assertIn("def object_hit_at", raycast)
         self.assertIn("_brush_disc_offsets(radius_px)", raycast)
         self.assertIn('hit["hit_object_name"] != anchor_object', raycast)
         self.assertIn("self._marked_faces", operators)
+        self.assertIn("self._fingerprints", operators)
+        self.assertIn("self._stroke_object_name", operators)
+        self.assertIn("brush_object_hits", operators)
         self.assertNotIn("magnetic_radius = min(magnetic_radius, 4)", operators)
 
     def test_legacy_helpers_are_excluded_from_raycast(self):

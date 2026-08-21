@@ -15,7 +15,7 @@ from .constants import (
     TARGET_ROLE,
 )
 from .overlay import create_surface_overlay, remove_overlay
-from .raycast import brush_scene_hits, magnetic_scene_hit
+from .raycast import brush_object_hits, magnetic_scene_hit
 from .records import MarkRecord
 from .anchors import enrich_hit_anchor, source_snapshot
 from .storage import (
@@ -215,11 +215,11 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         )
 
     def _store_hit(self, context, hit, *, dragging=False):
+        self._stroke_object_name = hit["hit_object_name"]
         face_key = (hit["hit_object_name"], int(hit["face_index"]))
         if face_key in self._marked_faces:
             return False
-        summary = document_summary(context.scene)
-        number = next_id(context.scene)
+        number = self._next_mark_id
         role = TARGET_ROLE if self.mark_value == 1 else EXCLUDE_ROLE
         color = TARGET_COLOR if role == TARGET_ROLE else EXCLUDE_COLOR
         name = f"{MARK_PREFIX}{number:04d}_{role.upper()}"
@@ -233,15 +233,19 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         source = bpy.data.objects.get(hit["source_object_name"])
         hit_object = bpy.data.objects.get(hit["hit_object_name"])
         if source is not None:
-            snapshot = summary.get("source") or source_snapshot(source)
-            if not summary.get("source"):
+            snapshot = self._source_snapshot or source_snapshot(source)
+            if self._source_snapshot is None:
                 set_active_source(context.scene, snapshot)
+                self._source_snapshot = snapshot
         if hit_object is not None:
-            fingerprint = source_snapshot(hit_object).get("fingerprint", "")
+            fingerprint = self._fingerprints.get(hit_object.name)
+            if fingerprint is None:
+                fingerprint = source_snapshot(hit_object).get("fingerprint", "")
+                self._fingerprints[hit_object.name] = fingerprint
             enrich_hit_anchor(hit, hit_object, fingerprint)
         record = MarkRecord(
             id=number,
-            task_id=summary["task_id"],
+            task_id=self._task_id,
             role=role,
             overlay_object_name=name,
             hit_object_name=hit["hit_object_name"],
@@ -266,10 +270,12 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
                 _set_status(context.scene, "该位置已有标记；可按住左键继续刷过相邻网面。")
             return False
         self._marked_faces.add(face_key)
-        _set_status(
-            context.scene,
-            f"已标记 {hit['hit_object_name']} 面 {hit['face_index']}；磁吸偏移 {hit['screen_offset_px']:.1f}px。",
-        )
+        self._next_mark_id += 1
+        if not dragging:
+            _set_status(
+                context.scene,
+                f"已标记 {hit['hit_object_name']} 面 {hit['face_index']}；磁吸偏移 {hit['screen_offset_px']:.1f}px。",
+            )
         return True
 
     def _paint_at(self, context, mouse_x, mouse_y, *, dragging=False):
@@ -282,8 +288,13 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
             # Dragging is a visible-surface brush disc, not a sequence of
             # single magnetic picks. The cap protects dense vehicle scenes.
             brush_radius = max(0, min(radius, 24))
-            hits = brush_scene_hits(
-                context, self._window_region, self._region_3d, (x, y), brush_radius
+            hits = brush_object_hits(
+                context,
+                self._window_region,
+                self._region_3d,
+                (x, y),
+                brush_radius,
+                self._stroke_object_name,
             )
         else:
             hit = magnetic_scene_hit(
@@ -335,8 +346,13 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         self._region_3d = context.space_data.region_3d
         self._painting = False
         self._last_paint_window = None
+        self._stroke_object_name = ""
         role = TARGET_ROLE if self.mark_value == 1 else EXCLUDE_ROLE
         summary = document_summary(context.scene)
+        self._task_id = summary["task_id"]
+        self._source_snapshot = summary.get("source")
+        self._next_mark_id = next_id(context.scene)
+        self._fingerprints = {}
         self._marked_faces = {
             (record.hit_object_name, int(record.face_index))
             for record in load_all_marks(context.scene, summary["task_id"])
@@ -364,6 +380,7 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
                 self._finish(context)
                 return {"FINISHED"}
             self._painting = True
+            self._stroke_object_name = ""
             self._last_paint_window = (event.mouse_x, event.mouse_y)
             self._paint_at(context, event.mouse_x, event.mouse_y)
             return {"RUNNING_MODAL"}
