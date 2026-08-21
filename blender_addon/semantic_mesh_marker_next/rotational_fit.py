@@ -524,6 +524,143 @@ def fit_rotational_surface(points: Iterable[Iterable[float]], normals: Iterable[
     )
 
 
+def fit_rotational_boundary_rings(
+    first_ring: Iterable[Iterable[float]],
+    second_ring: Iterable[Iterable[float]],
+    surface_points: Iterable[Iterable[float]],
+    surface_normals: Iterable[Iterable[float]],
+) -> RotationalFit:
+    """Fit a frustum strip from its two source-derived circumferential boundaries.
+
+    Unlike the generic normal-only fitter, this path has a topological proof of
+    the axial direction: both ordered boundary chains lie in planes normal to
+    the rotational axis.  It is therefore stable for partial cone arcs.
+    """
+    ring_a = _as_rows(first_ring, "first_ring")
+    ring_b = _as_rows(second_ring, "second_ring")
+    points = _as_rows(surface_points, "surface_points")
+    normals = _as_rows(surface_normals, "surface_normals")
+    if len(ring_a) < 4 or len(ring_b) < 4 or len(points) < 8 or len(normals) < 4:
+        return _failed("上下圆周边界证据不足", len(points))
+
+    tangents = np.vstack((np.diff(ring_a, axis=0), np.diff(ring_b, axis=0)))
+    tangent_lengths = np.linalg.norm(tangents, axis=1)
+    tangents = tangents[tangent_lengths > EPSILON]
+    if len(tangents) < 6:
+        return _failed("圆周边界连续边不足", len(points))
+    tangent_covariance = tangents.T @ tangents
+    tangent_values, tangent_vectors = np.linalg.eigh(tangent_covariance)
+    axis = _canonical_axis(tangent_vectors[:, int(np.argmin(tangent_values))])
+    if axis is None:
+        return _failed("无法从两条圆周边界确定旋转轴", len(points))
+    plane_condition = float(tangent_values[1] / max(tangent_values[0], EPSILON))
+    if plane_condition < 12.0:
+        return _failed("圆周边界不足以唯一确定旋转轴", len(points))
+
+    basis_x, basis_y = _basis(axis)
+    reference = np.mean(np.vstack((ring_a, ring_b)), axis=0)
+
+    def circle(rows):
+        relative = rows - reference
+        x = relative @ basis_x
+        y = relative @ basis_y
+        design = np.column_stack((2.0 * x, 2.0 * y, np.ones(len(rows))))
+        values = x * x + y * y
+        solution, _residuals, rank, singular = np.linalg.lstsq(design, values, rcond=None)
+        if rank < 3 or singular[-1] <= EPSILON:
+            return None
+        cx, cy, constant = (float(value) for value in solution)
+        radius_squared = constant + cx * cx + cy * cy
+        if radius_squared <= EPSILON:
+            return None
+        axial = float(np.mean(relative @ axis))
+        center = reference + cx * basis_x + cy * basis_y + axial * axis
+        radius = math.sqrt(radius_squared)
+        residual = np.abs(np.hypot(x - cx, y - cy) - radius)
+        return center, radius, axial, residual, float(singular[0] / singular[-1])
+
+    circle_a, circle_b = circle(ring_a), circle(ring_b)
+    if circle_a is None or circle_b is None:
+        return _failed("局部圆周边界无法稳定拟圆", len(points))
+    center_a, radius_a, axial_a, residual_a, condition_a = circle_a
+    center_b, radius_b, axial_b, residual_b, condition_b = circle_b
+    axial_delta = axial_b - axial_a
+    if abs(axial_delta) <= EPSILON:
+        return _failed("两条圆周边界没有可测轴向间距", len(points))
+    if axial_delta < 0.0:
+        axis = -axis
+        basis_y = -basis_y
+        axial_a, axial_b = -axial_a, -axial_b
+        axial_delta = -axial_delta
+
+    lateral_center = 0.5 * (
+        center_a - axis * float((center_a - reference) @ axis)
+        + center_b - axis * float((center_b - reference) @ axis)
+    )
+    axial_middle = 0.5 * (axial_a + axial_b)
+    origin = lateral_center + axis * axial_middle
+    signed_slope = (radius_b - radius_a) / axial_delta
+    radius_at_origin = 0.5 * (radius_a + radius_b)
+
+    relative = points - origin
+    axial = relative @ axis
+    radial_vectors = relative - axial[:, None] * axis[None, :]
+    radii = np.linalg.norm(radial_vectors, axis=1)
+    predicted = radius_at_origin + signed_slope * axial
+    residuals = np.abs(radii - predicted)
+    relative_p90 = float(np.quantile(residuals, 0.90) / max(radius_at_origin, EPSILON))
+
+    normalized_normals = normals / np.maximum(np.linalg.norm(normals, axis=1)[:, None], EPSILON)
+    radial_unit = radial_vectors / np.maximum(radii[:, None], EPSILON)
+    expected = radial_unit - signed_slope * axis[None, :]
+    expected /= np.maximum(np.linalg.norm(expected, axis=1)[:, None], EPSILON)
+    orientation = 1.0 if float(np.mean(np.sum(expected * normalized_normals, axis=1))) >= 0.0 else -1.0
+    dots = np.clip(np.sum((orientation * expected) * normalized_normals, axis=1), -1.0, 1.0)
+    normal_errors = np.degrees(np.arccos(dots))
+
+    x = relative @ basis_x
+    y = relative @ basis_y
+    angles = np.sort(np.mod(np.arctan2(y, x), 2.0 * math.pi))
+    gaps = np.diff(np.r_[angles, angles[0] + 2.0 * math.pi])
+    gap_index = int(np.argmax(gaps))
+    angular_start = float(angles[(gap_index + 1) % len(angles)])
+    angular_span = float(2.0 * math.pi - gaps[gap_index])
+    coverage_mode = "full_rotation" if angular_span >= 0.96 * 2.0 * math.pi else "partial_arc"
+    if coverage_mode == "full_rotation":
+        angular_span = 2.0 * math.pi
+
+    ring_p90 = float(np.quantile(np.r_[residual_a, residual_b], 0.90))
+    normal_p90 = float(np.quantile(normal_errors, 0.90))
+    reasons = []
+    if relative_p90 > 0.08 or ring_p90 / max(radius_at_origin, EPSILON) > 0.05:
+        reasons.append("两条源圆周边界的拟圆残差过大")
+    if normal_p90 > 22.0:
+        reasons.append("源面法线与边界确定的旋转面不一致")
+    ready = not reasons
+    condition = max(condition_a, condition_b, 1.0 / max(plane_condition, EPSILON))
+    confidence = max(0.0, min(1.0, 1.0 - 2.0 * relative_p90 - normal_p90 / 90.0))
+    return RotationalFit(
+        status="candidate_ready" if ready else "needs_more_evidence",
+        reason="；".join(reasons) if reasons else "两条源圆周边界共同确定了旋转轴和尺寸",
+        profile_kind="cone" if abs(signed_slope) * axial_delta > 2.5 * ring_p90 else "cylinder",
+        surface_side="outer" if orientation > 0.0 else "inner",
+        axis=tuple(float(value) for value in axis),
+        axis_origin=tuple(float(value) for value in origin),
+        basis_x=tuple(float(value) for value in basis_x),
+        basis_y=tuple(float(value) for value in basis_y),
+        signed_radius_at_origin=float(orientation * radius_at_origin),
+        signed_slope=float(orientation * signed_slope),
+        axial_min=float(np.min(axial)), axial_max=float(np.max(axial)),
+        angular_start=angular_start, angular_span=angular_span,
+        angular_largest_gap=float(gaps[gap_index]), coverage_mode=coverage_mode,
+        point_residual_p50=float(np.quantile(residuals, 0.50)),
+        point_residual_p90=float(np.quantile(residuals, 0.90)),
+        relative_residual_p90=relative_p90,
+        normal_error_p90_degrees=normal_p90,
+        condition_number=condition, confidence=confidence, sample_count=len(points),
+    )
+
+
 def _failed(reason: str, count: int) -> RotationalFit:
     return RotationalFit(
         status="needs_more_evidence", reason=reason, profile_kind="unknown",

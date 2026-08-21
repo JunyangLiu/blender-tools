@@ -121,6 +121,38 @@ class RotationalFitTests(unittest.TestCase):
         self.assertEqual(fit.status, "needs_more_evidence")
         self.assertNotEqual(fit.reason, "")
 
+    def test_partial_cone_strip_uses_two_boundary_rings_for_axis(self):
+        expected_axis, x, y = basis((0.13, -0.42, 0.898))
+        origin = np.array((17.0, 8.0, -4.0))
+        slope = 0.74
+        angles = np.radians(np.linspace(-62.0, 68.0, 10))
+
+        def ring(axial):
+            radius = 5.6 + slope * axial
+            return np.asarray([
+                origin + axial * expected_axis + radius * (math.cos(angle) * x + math.sin(angle) * y)
+                for angle in angles
+            ])
+
+        points, normals = [], []
+        for axial in np.linspace(-1.4, 1.4, 3):
+            radius = 5.6 + slope * axial
+            for angle in np.radians(np.linspace(-58.0, 64.0, 6)):
+                radial = math.cos(angle) * x + math.sin(angle) * y
+                points.append(origin + axial * expected_axis + radius * radial)
+                normal = radial - slope * expected_axis
+                normals.append(normal / np.linalg.norm(normal))
+
+        fit = ROTATIONAL.fit_rotational_boundary_rings(
+            ring(-1.4), ring(1.4), points, normals
+        )
+        self.assertEqual(fit.status, "candidate_ready", fit.reason)
+        self.assertEqual(fit.profile_kind, "cone")
+        self.assertGreater(abs(np.dot(fit.axis, expected_axis)), 0.999)
+        self.assertAlmostEqual(abs(fit.signed_radius_at_origin), 5.6, delta=0.02)
+        self.assertAlmostEqual(abs(fit.signed_slope), slope, delta=0.02)
+        self.assertEqual(fit.coverage_mode, "partial_arc")
+
 
 if __name__ == "__main__":
     unittest.main()

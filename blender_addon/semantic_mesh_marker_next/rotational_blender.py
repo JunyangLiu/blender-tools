@@ -14,7 +14,11 @@ import numpy as np
 
 from .anchors import source_snapshot
 from .constants import EXCLUDE_ROLE, SOURCE_NAME_KEY, TARGET_ROLE
-from .rotational_fit import RotationalFit, fit_rotational_surface
+from .rotational_fit import (
+    RotationalFit,
+    fit_rotational_boundary_rings,
+    fit_rotational_surface,
+)
 from .scene_state import ensure_scene_roots, keep_model_visible
 from .storage import load_all_marks
 
@@ -64,13 +68,9 @@ def analyze_scene(scene):
         )
         return fit, None, targets, excludes, {"source": None}
     source, snapshot = _source_for_targets(scene, targets)
-    points, normals = [], []
-    for record in targets:
-        point, normal = _current_anchor(record, source)
-        points.append(tuple(point))
-        normals.append(tuple(normal))
-    fit = fit_rotational_surface(points, normals)
-    return fit, source, targets, excludes, {"source": snapshot}
+    face_indices = _target_face_indices(source, targets)
+    fit, topology = _fit_marked_face_strip(source, face_indices)
+    return fit, source, targets, excludes, {"source": snapshot, "axis_evidence": topology}
 
 
 def _face_components(source, face_indices):
@@ -114,15 +114,10 @@ def analyze_selected_faces(source, face_indices):
     components = _face_components(source, indices)
     if len(components) != 1:
         raise ValueError("选中面必须属于一个连续曲面；请分别处理不同零件")
-    points = []
-    normals = []
-    for face_index in sorted(indices):
-        polygon = source.data.polygons[face_index]
-        points.append(tuple(source.matrix_world @ polygon.center))
-        normals.append(tuple(_world_normal(source, polygon.normal)))
-    fit = fit_rotational_surface(points, normals)
+    fit, axis_evidence = _fit_marked_face_strip(source, indices)
     return fit, {
         "source": source_snapshot(source),
+        "axis_evidence": axis_evidence,
         "selection_qa": {
             "selection_method": "exact_edit_mode_faces",
             "selected_faces": len(indices),
@@ -131,6 +126,117 @@ def analyze_selected_faces(source, face_indices):
             "passed": len(components) == 1,
         },
     }
+
+
+def _ordered_boundary_component(edges):
+    adjacency = defaultdict(set)
+    for first, second in edges:
+        adjacency[first].add(second)
+        adjacency[second].add(first)
+    if any(len(linked) > 2 for linked in adjacency.values()):
+        raise ValueError("标记边界存在分叉，无法作为单一圆柱或圆锥处理")
+    endpoints = sorted(vertex for vertex, linked in adjacency.items() if len(linked) == 1)
+    if len(endpoints) not in (0, 2):
+        raise ValueError("标记边界不是连续圆周链")
+    start = endpoints[0] if endpoints else min(adjacency)
+    ordered = [start]
+    previous = None
+    current = start
+    while True:
+        choices = sorted(adjacency[current] - ({previous} if previous is not None else set()))
+        if not choices:
+            break
+        following = choices[0]
+        if following == start:
+            break
+        if following in ordered:
+            raise ValueError("标记边界包含自交回路")
+        ordered.append(following)
+        previous, current = current, following
+    if len(ordered) != len(adjacency):
+        raise ValueError("标记边界链不连续")
+    return ordered
+
+
+def _boundary_ring_vertex_chains(source, face_indices):
+    """Extract two circumferential chains from only the marked face strip."""
+    edge_counts = defaultdict(int)
+    for face_index in face_indices:
+        for edge in source.data.polygons[face_index].edge_keys:
+            edge_counts[tuple(sorted(edge))] += 1
+    boundary = {edge for edge, count in edge_counts.items() if count == 1}
+    if len(boundary) < 8:
+        raise ValueError("至少需要两条各含 4 个点的圆周边界")
+
+    def components(edges):
+        adjacency = defaultdict(set)
+        for first, second in edges:
+            adjacency[first].add(second)
+            adjacency[second].add(first)
+        remaining = set(adjacency)
+        result = []
+        while remaining:
+            seed = remaining.pop()
+            vertices = {seed}
+            queue = deque((seed,))
+            while queue:
+                current = queue.popleft()
+                for other in adjacency[current] & remaining:
+                    remaining.remove(other)
+                    vertices.add(other)
+                    queue.append(other)
+            result.append({edge for edge in edges if edge[0] in vertices and edge[1] in vertices})
+        return result
+
+    groups = components(boundary)
+    separator_edges = set()
+    if len(groups) == 1:
+        lengths = []
+        for edge in boundary:
+            first = source.matrix_world @ source.data.vertices[edge[0]].co
+            second = source.matrix_world @ source.data.vertices[edge[1]].co
+            lengths.append(((second - first).length, edge))
+        lengths.sort(reverse=True)
+        typical = float(np.median([value for value, _edge in lengths]))
+        if len(lengths) < 4 or lengths[1][0] < max(typical * 1.45, lengths[2][0] * 1.35):
+            raise ValueError("无法从标记带区分上下圆周边与两端轴向边；已拒绝猜测轴线")
+        separator_edges = {lengths[0][1], lengths[1][1]}
+        groups = components(boundary - separator_edges)
+    if len(groups) != 2:
+        raise ValueError("标记区域必须形成上下两条连续圆周边界")
+    ordered = [_ordered_boundary_component(group) for group in groups]
+    if min(len(chain) for chain in ordered) < 4:
+        raise ValueError("每条圆周边界至少需要 4 个源顶点")
+    return ordered, separator_edges, len(boundary)
+
+
+def _fit_marked_face_strip(source, face_indices):
+    indices = {int(index) for index in face_indices}
+    if len(indices) < 4:
+        raise ValueError("至少需要 4 个实际源面，重复刷点不会增加轴线证据")
+    components = _face_components(source, indices)
+    if len(components) != 1:
+        raise ValueError("绿色标记必须属于一个连续的圆柱或圆锥侧面")
+    chains, separators, boundary_count = _boundary_ring_vertex_chains(source, indices)
+    rings = [
+        [tuple(source.matrix_world @ source.data.vertices[index].co) for index in chain]
+        for chain in chains
+    ]
+    points, normals = [], []
+    for face_index in sorted(indices):
+        polygon = source.data.polygons[face_index]
+        points.append(tuple(source.matrix_world @ polygon.center))
+        normals.append(tuple(_world_normal(source, polygon.normal)))
+    fit = fit_rotational_boundary_rings(rings[0], rings[1], points, normals)
+    evidence = {
+        "method": "two_source_boundary_rings",
+        "unique_mark_faces": len(indices),
+        "ring_vertex_counts": [len(chain) for chain in chains],
+        "boundary_edges": boundary_count,
+        "axial_separator_edges": len(separators),
+        "whole_vehicle_search": False,
+    }
+    return fit, evidence
 
 
 def _fit_frame(fit):
@@ -632,13 +738,20 @@ def _build_candidate(scene, fit, source, targets, excludes, context_report,
 
 
 def build_scene_candidate(scene):
-    """Compatibility path: expand green marks across the matching surface."""
+    """Build from the exact green-marked strip without scanning the vehicle."""
     fit, source, targets, excludes, context_report = analyze_scene(scene)
     if fit.status != "candidate_ready" or source is None:
         return _build_candidate(
             scene, fit, source, targets, excludes, context_report, set(), {}, "semantic_marks"
         )
-    surface_faces, expansion = _semantic_rotational_faces(fit, source, targets)
+    surface_faces = _target_face_indices(source, targets)
+    expansion = {
+        "selection_method": "exact_green_mark_faces",
+        "seed_faces": len(surface_faces),
+        "surface_faces": len(surface_faces),
+        "expanded_faces": 0,
+        "whole_vehicle_search": False,
+    }
     return _build_candidate(
         scene, fit, source, targets, excludes, context_report,
         surface_faces, expansion, "semantic_marks",
