@@ -1714,7 +1714,12 @@ def _rebuild_working_mesh(
         )
     topology_passed = all(quality_gates.values())
 
-    if mode in {"canvas", "canvas_physics", "rotational"}:
+    # The preview is smooth shaded.  Keep the confirmed working mesh on the
+    # same shading contract, otherwise very elongated triangles in a flattened
+    # low-poly panel become visible as hairline bands only after confirmation.
+    # This changes shading on the exact rebuilt region only; geometry outside
+    # the green scope remains untouched.
+    if mode in {"canvas", "canvas_physics", "rotational", "flatten"}:
         for face in region_faces:
             face.smooth = True
 
@@ -1765,6 +1770,8 @@ def _rebuild_working_mesh(
         "locked_boundary_or_feature_vertices": len(locked_vertices),
         "strict_marked_scope": True,
         "unmarked_vertices_moved": 0,
+        "confirmed_shading_matches_preview": True,
+        "smooth_shaded_region_faces": len(region_faces),
         "transition_faces_checked": len(qa_faces - set(region_faces)),
         "transition_ring_count": len(transition_rings),
         "transition_vertices": sum(len(ring) for ring in transition_rings),
