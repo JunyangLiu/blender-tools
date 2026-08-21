@@ -98,7 +98,10 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn('text="生成独立圆圈候选"', panel)
         self.assertIn('"确认独立圆圈（保留标记）"', panel)
         self.assertIn('def _envelope_profile', adapter)
-        self.assertIn('"clearance_mode": "local_axial_envelope"', adapter)
+        self.assertIn('def _analytic_envelope_profile', adapter)
+        self.assertIn('"clearance_mode": "analytic_affine_outer_envelope"', adapter)
+        self.assertIn('polygon.use_smooth = polygon.index in smooth_face_set', adapter)
+        self.assertIn('obj.show_wire = False', adapter)
         self.assertGreater(
             panel.index('text="生成独立圆圈候选"'),
             panel.index("if scene.smrn_show_advanced:"),

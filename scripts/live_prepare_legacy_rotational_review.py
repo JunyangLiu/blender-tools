@@ -15,7 +15,8 @@ source.hide_viewport = False
 candidate.hide_set(False)
 candidate.hide_viewport = False
 candidate.show_in_front = False
-candidate.show_wire = True
+candidate.show_wire = False
+candidate.show_all_edges = False
 for obj in bpy.context.selected_objects:
     obj.select_set(False)
 candidate.select_set(True)
@@ -27,5 +28,6 @@ print("SMRN_LEGACY_REVIEW=" + json.dumps({
     "candidate": candidate.name,
     "candidate_visible": candidate.visible_get(),
     "candidate_in_front": candidate.show_in_front,
+    "candidate_wire": candidate.show_wire,
     "advanced_open": scene.smrn_show_advanced,
 }, ensure_ascii=False, sort_keys=True))

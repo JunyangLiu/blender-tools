@@ -455,6 +455,25 @@ def _envelope_profile(fit, points, axial_min, axial_max, extra_clearance=0.0,
     return knots, values
 
 
+def _analytic_envelope_profile(fit, points, axial_min, axial_max, extra_clearance=0.0):
+    """Return the tightest fitted affine correction that covers every sample.
+
+    A cylinder/cone must remain analytic along its axis.  Following individual
+    low-poly triangles with many clearance rings creates visible annular
+    ripples, so only an intercept and slope correction are allowed here.
+    """
+    axial, radius, _angle = _coordinates(points, fit)
+    predicted = np.abs(fit.signed_radius_at_origin + fit.signed_slope * axial)
+    residual = radius - predicted if fit.surface_side == "outer" else predicted - radius
+    centered = axial - float(np.mean(axial))
+    denominator = float(centered @ centered)
+    slope = 0.0 if denominator <= 1.0e-12 else float(centered @ residual) / denominator
+    intercept = float(np.max(residual - slope * axial)) + max(0.0, float(extra_clearance))
+    knots = np.asarray((axial_min, axial_max), dtype=float)
+    values = intercept + slope * knots
+    return knots, values
+
+
 def _profile_clearance(axial, knots, values):
     return np.interp(axial, np.asarray(knots, dtype=float), np.asarray(values, dtype=float))
 
@@ -488,23 +507,26 @@ def _candidate_geometry(fit, axial_knots, profile_clearance, angle_start, angle_
         ring_pairs.append(pair)
 
     faces = []
+    smooth_faces = []
     pair_count = len(angles) if full else len(angles) - 1
-    def connect(first, second, reverse=False):
+    def connect(first, second, reverse=False, smooth=False):
         for index in range(pair_count):
             following = (index + 1) % len(angles)
             face = (first[index], first[following], second[following], second[index])
             faces.append(tuple(reversed(face)) if reverse else face)
+            if smooth:
+                smooth_faces.append(len(faces) - 1)
     # Visible and backing skins for every axial interval, then axial caps.
     for first, second in zip(ring_pairs, ring_pairs[1:]):
-        connect(first[0], second[0], reverse=(fit.surface_side == "inner"))
-        connect(first[1], second[1], reverse=(fit.surface_side != "inner"))
+        connect(first[0], second[0], reverse=(fit.surface_side == "inner"), smooth=True)
+        connect(first[1], second[1], reverse=(fit.surface_side != "inner"), smooth=True)
     connect(ring_pairs[0][0], ring_pairs[0][1], reverse=True)
     connect(ring_pairs[-1][0], ring_pairs[-1][1], reverse=False)
     if not full:
         for first, second in zip(ring_pairs, ring_pairs[1:]):
             faces.append((first[0][0], second[0][0], second[1][0], first[1][0]))
             faces.append((first[0][-1], first[1][-1], second[1][-1], second[0][-1]))
-    return vertices, faces, segments
+    return vertices, faces, segments, smooth_faces
 
 
 def _topology_report(vertices, faces):
@@ -658,11 +680,9 @@ def _build_candidate(scene, fit, source, targets, excludes, context_report,
         fit, source, targets, surface_faces
     )
     dense = _dense_triangle_samples(source, targets, face_indices=surface_faces)
-    requested_axial_knots = max(8, min(24, int(math.ceil(math.sqrt(max(len(dense), 1))))))
-    axial_knots, profile_clearance = _envelope_profile(
+    axial_knots, profile_clearance = _analytic_envelope_profile(
         fit, dense, axial_min, axial_max,
         extra_clearance=float(scene.smrn_rotational_clearance),
-        requested_knots=requested_axial_knots,
     )
     thickness = float(scene.smrn_rotational_thickness)
     if thickness <= 0.0:
@@ -675,7 +695,7 @@ def _build_candidate(scene, fit, source, targets, excludes, context_report,
         fit, source, excludes, axial_min, axial_max, angle_start, angle_span,
         axial_knots, profile_clearance, thickness
     )
-    vertices, faces, segments = _candidate_geometry(
+    vertices, faces, segments, smooth_faces = _candidate_geometry(
         fit, axial_knots, profile_clearance, angle_start, angle_span,
         thickness, int(scene.smrn_rotational_segments),
     )
@@ -688,7 +708,7 @@ def _build_candidate(scene, fit, source, targets, excludes, context_report,
                    "angular_span_degrees": math.degrees(angle_span),
                    "coverage_mode": ("full_rotation" if angle_span >= 2.0 * math.pi - 1.0e-7
                                      else "partial_arc"),
-                   "clearance_mode": "local_axial_envelope",
+                   "clearance_mode": "analytic_affine_outer_envelope",
                    "legacy_global_clearance": fitted_clearance,
                    "clearance_min": float(np.min(profile_clearance)),
                    "clearance_max": float(np.max(profile_clearance)),
@@ -714,12 +734,15 @@ def _build_candidate(scene, fit, source, targets, excludes, context_report,
     mesh = bpy.data.meshes.new(f"{CANDIDATE_PREFIX}MESH")
     mesh.from_pydata(vertices, [], faces)
     mesh.update(calc_edges=True)
+    smooth_face_set = set(smooth_faces)
+    for polygon in mesh.polygons:
+        polygon.use_smooth = polygon.index in smooth_face_set
     obj = bpy.data.objects.new(f"{CANDIDATE_PREFIX}{fit.profile_kind.upper()}", mesh)
     candidates.objects.link(obj)
     obj.display_type = "SOLID"
     obj.color = (0.04, 0.55, 1.0, 0.72)
-    obj.show_wire = True
-    obj.show_all_edges = True
+    obj.show_wire = False
+    obj.show_all_edges = False
     obj["smrn_candidate_only"] = True
     obj["smrn_source_name"] = source.name
     obj["smrn_input_mode"] = input_mode
