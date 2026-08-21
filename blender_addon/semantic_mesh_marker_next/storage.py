@@ -157,13 +157,34 @@ def set_active_source(storage: Any, snapshot: dict[str, Any]) -> None:
 
 
 def append_mark(storage: Any, record: MarkRecord) -> bool:
+    return bool(append_marks(storage, [record]))
+
+
+def append_marks(storage: Any, incoming: Iterable[MarkRecord]) -> list[MarkRecord]:
+    """Append a brush batch with one document/index write per changed bucket.
+
+    Brush events can cover dozens of narrow faces. Persisting every face as a
+    separate transaction made viewport feedback progressively slower as the
+    annotation set grew. This keeps the same duplicate semantics while making
+    the whole event one storage transaction.
+    """
+    candidates = list(incoming)
+    if not candidates:
+        return []
     document = ensure_document(storage)
-    task = _task(document, record.task_id)
-    stable_key = record.anchor.stable_key(record.hit_object_name)
-    index_key, composite = _index_key(record.task_id, stable_key)
-    bucket = _read_index(storage, index_key)
-    if composite in bucket:
-        return False
+    bucket_cache: dict[str, dict[str, int]] = {}
+    accepted: list[MarkRecord] = []
+    for record in candidates:
+        stable_key = record.anchor.stable_key(record.hit_object_name)
+        index_key, composite = _index_key(record.task_id, stable_key)
+        bucket = bucket_cache.setdefault(index_key, _read_index(storage, index_key))
+        if composite in bucket:
+            continue
+        bucket[composite] = record.id
+        accepted.append(record)
+    if not accepted:
+        return []
+
     chunks = document.setdefault("chunks", [])
     if chunks:
         key = chunks[-1]
@@ -171,21 +192,28 @@ def append_mark(storage: Any, record: MarkRecord) -> bool:
     else:
         key, records = _chunk_key(0), []
         chunks.append(key)
-    if len(records) >= int(document.get("chunk_size", CHUNK_SIZE)):
-        key, records = _chunk_key(len(chunks)), []
-        chunks.append(key)
-    records.append(record)
+    chunk_size = int(document.get("chunk_size", CHUNK_SIZE))
+    for record in accepted:
+        if len(records) >= chunk_size:
+            _write_chunk(storage, key, records)
+            key, records = _chunk_key(len(chunks)), []
+            chunks.append(key)
+        records.append(record)
+        task = _task(document, record.task_id)
+        task["mark_count"] = int(task.get("mark_count", 0)) + 1
+        counts = task.setdefault("role_counts", {})
+        counts[record.role] = int(counts.get(record.role, 0)) + 1
     _write_chunk(storage, key, records)
-    task["mark_count"] = int(task.get("mark_count", 0)) + 1
-    counts = task.setdefault("role_counts", {})
-    counts[record.role] = int(counts.get(record.role, 0)) + 1
-    bucket[composite] = record.id
-    storage[index_key] = _json(bucket)
-    if index_key not in document.setdefault("index_buckets", []):
-        document["index_buckets"].append(index_key)
-    document["next_mark_id"] = max(int(document.get("next_mark_id", 1)), record.id + 1)
+    for index_key, bucket in bucket_cache.items():
+        storage[index_key] = _json(bucket)
+        if index_key not in document.setdefault("index_buckets", []):
+            document["index_buckets"].append(index_key)
+    document["next_mark_id"] = max(
+        int(document.get("next_mark_id", 1)),
+        max(record.id for record in accepted) + 1,
+    )
     _write_document(storage, document)
-    return True
+    return accepted
 
 
 def pop_last_mark(storage: Any, task_id: str | None = None) -> MarkRecord | None:

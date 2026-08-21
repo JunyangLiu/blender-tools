@@ -1,30 +1,34 @@
 import json
 import math
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import bpy
 import bmesh
 
 from .constants import (
-    EXCLUDE_COLOR,
     EXCLUDE_ROLE,
-    MARK_PREFIX,
     MODAL_TOKEN_KEY,
-    TARGET_COLOR,
     TARGET_ROLE,
 )
-from .overlay import create_surface_overlay, remove_overlay
-from .raycast import brush_object_hits, magnetic_scene_hit
+from .overlay import (
+    rebuild_task_surface_overlays,
+    remove_overlay,
+    shared_surface_overlay_name,
+    surface_overlay_metrics,
+)
+from .raycast import brush_object_hits, brush_object_stroke_hits, magnetic_scene_hit
 from .records import MarkRecord
 from .anchors import enrich_hit_anchor, source_snapshot
 from .storage import (
-    append_mark,
+    append_marks,
     clear_task_marks,
     document_summary,
     load_all_marks,
     next_id,
     pop_last_mark,
+    rewrite_all_marks,
     set_active_source,
 )
 from .rotational_blender import (
@@ -214,25 +218,23 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
             and self._ui_region.y <= mouse_y < self._ui_region.y + self._ui_region.height
         )
 
-    def _store_hit(self, context, hit, *, dragging=False):
+    def _record_for_hit(self, context, hit, number):
         # A visible topology-identical working candidate may proxy the source.
         # Continue the stroke on the visible proxy while all records and face
         # indices remain attached to the untouched semantic source.
         self._stroke_object_name = hit.get("raycast_object_name", hit["hit_object_name"])
         face_key = (hit["hit_object_name"], int(hit["face_index"]))
         if face_key in self._marked_faces:
-            return False
-        number = self._next_mark_id
+            return None
         role = TARGET_ROLE if self.mark_value == 1 else EXCLUDE_ROLE
-        color = TARGET_COLOR if role == TARGET_ROLE else EXCLUDE_COLOR
-        name = f"{MARK_PREFIX}{number:04d}_{role.upper()}"
+        name = shared_surface_overlay_name(self._task_id, role)
         try:
-            _overlay, surface_offset, stored_normal = create_surface_overlay(
-                context, name, hit, color, context.scene.smrn_marker_size
+            surface_offset, stored_normal = surface_overlay_metrics(
+                hit, context.scene.smrn_marker_size
             )
         except RuntimeError as error:
             self.report({"ERROR"}, str(error))
-            return False
+            return None
         source = bpy.data.objects.get(hit["source_object_name"])
         hit_object = bpy.data.objects.get(hit["hit_object_name"])
         if source is not None:
@@ -246,7 +248,7 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
                 fingerprint = source_snapshot(hit_object).get("fingerprint", "")
                 self._fingerprints[hit_object.name] = fingerprint
             enrich_hit_anchor(hit, hit_object, fingerprint)
-        record = MarkRecord(
+        return MarkRecord(
             id=number,
             task_id=self._task_id,
             role=role,
@@ -266,20 +268,38 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
             semantic_radius=float(context.scene.smrn_marker_size),
             created_at=datetime.now(timezone.utc).isoformat(),
         )
-        if not append_mark(context.scene, record):
-            remove_overlay(name)
-            self._marked_faces.add(face_key)
-            if not dragging:
-                _set_status(context.scene, "该位置已有标记；可按住左键继续刷过相邻网面。")
-            return False
-        self._marked_faces.add(face_key)
-        self._next_mark_id += 1
+
+    def _store_hits(self, context, hits, *, dragging=False):
+        pending = []
+        seen = set()
+        for hit in hits:
+            face_key = (hit["hit_object_name"], int(hit["face_index"]))
+            if face_key in self._marked_faces or face_key in seen:
+                continue
+            record = self._record_for_hit(
+                context, hit, self._next_mark_id + len(pending)
+            )
+            if record is not None:
+                pending.append(record)
+                seen.add(face_key)
+        accepted = append_marks(context.scene, pending)
+        if not accepted:
+            return 0
+        for record in accepted:
+            self._marked_faces.add((record.hit_object_name, int(record.face_index)))
+        self._next_mark_id = max(record.id for record in accepted) + 1
+        rebuild_task_surface_overlays(
+            context,
+            load_all_marks(context.scene, self._task_id),
+            context.scene.smrn_marker_size,
+        )
         if not dragging:
+            record = accepted[0]
             _set_status(
                 context.scene,
-                f"已标记 {hit['hit_object_name']} 面 {hit['face_index']}；磁吸偏移 {hit['screen_offset_px']:.1f}px。",
+                f"已标记 {record.hit_object_name} 面 {record.face_index}；本次覆盖 {len(accepted)} 个面。",
             )
-        return True
+        return len(accepted)
 
     def _paint_at(self, context, mouse_x, mouse_y, *, dragging=False):
         x = mouse_x - self._window_region.x
@@ -308,30 +328,40 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
             if not dragging:
                 _set_status(context.scene, "未找到可见表面；请靠近零件点击或增大刷选覆盖半径。")
             return False
-        painted_count = sum(
-            1 for hit in hits if self._store_hit(context, hit, dragging=dragging)
-        )
+        painted_count = self._store_hits(context, hits, dragging=dragging)
         if dragging and painted_count > 1:
             _set_status(context.scene, f"本次刷选覆盖 {painted_count} 个可见网面；已自动跳过重复面。")
         return painted_count > 0
 
     def _stroke_spacing(self, context):
-        radius = max(2.0, min(float(context.scene.smrn_magnetic_radius_px), 24.0))
-        return max(4.0, min(7.0, radius * 0.5))
+        return 2.0
 
     def _paint_segment(self, context, start, end):
-        distance = math.hypot(end[0] - start[0], end[1] - start[1])
-        spacing = self._stroke_spacing(context)
-        steps = max(1, int(math.ceil(distance / spacing)))
-        painted = False
-        for step in range(1, steps + 1):
-            factor = step / steps
-            mouse_x = start[0] + (end[0] - start[0]) * factor
-            mouse_y = start[1] + (end[1] - start[1]) * factor
-            if self._over_sidebar(mouse_x, mouse_y):
-                continue
-            painted = self._paint_at(context, mouse_x, mouse_y, dragging=True) or painted
-        return painted
+        radius = max(0, min(int(context.scene.smrn_magnetic_radius_px), 24))
+        local_start = (
+            start[0] - self._window_region.x,
+            start[1] - self._window_region.y,
+        )
+        local_end = (
+            end[0] - self._window_region.x,
+            end[1] - self._window_region.y,
+        )
+        segment_hits = brush_object_stroke_hits(
+            context,
+            self._window_region,
+            self._region_3d,
+            local_start,
+            local_end,
+            radius,
+            self._stroke_object_name,
+        )
+        painted_count = self._store_hits(context, segment_hits, dragging=True)
+        if painted_count:
+            _set_status(
+                context.scene,
+                f"本次刷选覆盖 {painted_count} 个可见网面；已批量更新。",
+            )
+        return painted_count > 0
 
     def invoke(self, context, event):
         if context.area is None or context.area.type != "VIEW_3D":
@@ -356,9 +386,33 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         self._source_snapshot = summary.get("source")
         self._next_mark_id = next_id(context.scene)
         self._fingerprints = {}
+        task_records = load_all_marks(context.scene, summary["task_id"])
+        consolidated = [
+            replace(
+                record,
+                overlay_object_name=shared_surface_overlay_name(record.task_id, record.role),
+            )
+            for record in task_records
+        ]
+        if consolidated != task_records:
+            for record in task_records:
+                remove_overlay(record.overlay_object_name)
+            replacements = {
+                (record.task_id, record.id): record for record in consolidated
+            }
+            rewrite_all_marks(
+                context.scene,
+                [
+                    replacements.get((record.task_id, record.id), record)
+                    for record in load_all_marks(context.scene)
+                ],
+            )
+        rebuild_task_surface_overlays(
+            context, consolidated, context.scene.smrn_marker_size
+        )
         self._marked_faces = {
             (record.hit_object_name, int(record.face_index))
-            for record in load_all_marks(context.scene, summary["task_id"])
+            for record in consolidated
             if record.role == role
         }
         self._token = uuid.uuid4().hex
@@ -419,6 +473,11 @@ class SMRN_OT_undo_mark(bpy.types.Operator):
             self.report({"WARNING"}, "没有可撤销的标记")
             return {"CANCELLED"}
         remove_overlay(record.overlay_object_name)
+        rebuild_task_surface_overlays(
+            context,
+            load_all_marks(context.scene, record.task_id),
+            context.scene.smrn_marker_size,
+        )
         remaining = document_summary(context.scene)["mark_count"]
         _set_status(context.scene, f"已撤销标记 {record.id}；剩余 {remaining} 个。")
         return {"FINISHED"}

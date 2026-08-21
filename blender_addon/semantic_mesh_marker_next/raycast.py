@@ -97,9 +97,10 @@ def _brush_disc_offsets(radius_px, spacing_px=None):
     if not radius:
         return [(0, 0)]
     if spacing_px is None:
-        # One-pixel probes keep very thin visible triangles selectable at the
-        # normal brush size. Larger brushes relax to two pixels to bound cost.
-        spacing = 1 if radius <= 14 else 2
+        # The stroke path is sampled every 2 px, so a 3 px disc lattice keeps
+        # sub-pixel-thin strips covered without repeating the same 441 rays at
+        # every nearby mouse position. Default radius 12 now uses 49 probes.
+        spacing = 3 if radius <= 18 else 4
     else:
         spacing = max(1, int(spacing_px))
     values = range(-radius, radius + 1, spacing)
@@ -240,6 +241,16 @@ def brush_object_hits(context, region, region_3d, coordinate, radius_px, object_
     helpers. It also guarantees that a broad brush cannot jump to a neighboring
     object while retaining front-most visibility within the locked source.
     """
+    coordinates = [
+        (coordinate[0] + dx, coordinate[1] + dy, float(math.hypot(dx, dy)))
+        for dx, dy in _brush_disc_offsets(radius_px)
+    ]
+    return _object_hits_at_coordinates(
+        context, region, region_3d, coordinates, object_name
+    )
+
+
+def _object_hits_at_coordinates(context, region, region_3d, coordinates, object_name):
     obj = bpy.data.objects.get(object_name)
     if obj is None or obj.type != "MESH":
         return []
@@ -247,22 +258,66 @@ def brush_object_hits(context, region, region_3d, coordinate, radius_px, object_
     inverse = obj.matrix_world.inverted_safe()
     normal_matrix = obj.matrix_world.to_3x3().inverted_safe().transposed()
     unique = {}
-    for dx, dy in _brush_disc_offsets(radius_px):
+    for sample_x, sample_y, screen_offset in coordinates:
         hit = object_hit_at(
             context,
             obj,
             region,
             region_3d,
-            (coordinate[0] + dx, coordinate[1] + dy),
+            (sample_x, sample_y),
             depsgraph=depsgraph,
             inverse=inverse,
             normal_matrix=normal_matrix,
         )
         if hit is None:
             continue
-        hit["screen_offset_px"] = float(math.hypot(dx, dy))
+        hit["screen_offset_px"] = float(screen_offset)
         key = int(hit["face_index"])
         previous = unique.get(key)
         if previous is None or hit["screen_offset_px"] < previous["screen_offset_px"]:
             unique[key] = hit
     return sorted(unique.values(), key=lambda item: (item["screen_offset_px"], item["face_index"]))
+
+
+def brush_object_stroke_hits(
+    context, region, region_3d, start, end, radius_px, object_name, spacing_px=3
+):
+    """Ray-cast one swept capsule instead of many overlapping brush discs.
+
+    Every screen-space point between two mouse events is covered even when the
+    UI coalesces events during a fast drag. A shared lattice removes the large
+    overlap that previously delayed the green feedback.
+    """
+    radius = max(0.0, float(radius_px))
+    dx = float(end[0] - start[0])
+    dy = float(end[1] - start[1])
+    distance = math.hypot(dx, dy)
+    if distance < 1.0e-6:
+        return brush_object_hits(
+            context, region, region_3d, start, radius_px, object_name
+        )
+    tangent = (dx / distance, dy / distance)
+    perpendicular = (-tangent[1], tangent[0])
+    spacing = max(1.0, float(spacing_px))
+    along_steps = max(1, int(math.ceil((distance + radius * 2.0) / spacing)))
+    cross_steps = max(1, int(math.ceil((radius * 2.0) / spacing)))
+    coordinates = []
+    seen = set()
+    for along_index in range(along_steps + 1):
+        along = -radius + (distance + radius * 2.0) * along_index / along_steps
+        outside = max(0.0, -along, along - distance)
+        half_width = math.sqrt(max(0.0, radius * radius - outside * outside))
+        for cross_index in range(cross_steps + 1):
+            cross = -radius + radius * 2.0 * cross_index / cross_steps
+            if abs(cross) > half_width + 1.0e-6:
+                continue
+            sample_x = start[0] + tangent[0] * along + perpendicular[0] * cross
+            sample_y = start[1] + tangent[1] * along + perpendicular[1] * cross
+            key = (round(sample_x), round(sample_y))
+            if key in seen:
+                continue
+            seen.add(key)
+            coordinates.append((sample_x, sample_y, abs(cross)))
+    return _object_hits_at_coordinates(
+        context, region, region_3d, coordinates, object_name
+    )

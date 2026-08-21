@@ -33,6 +33,10 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("self._fingerprints", operators)
         self.assertIn("self._stroke_object_name", operators)
         self.assertIn("brush_object_hits", operators)
+        self.assertIn("brush_object_stroke_hits", operators)
+        self.assertIn("append_marks", operators)
+        self.assertIn("rebuild_task_surface_overlays", operators)
+        self.assertIn("smrn_batched_overlay", (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "overlay.py").read_text(encoding="utf-8"))
         self.assertNotIn("magnetic_radius = min(magnetic_radius, 4)", operators)
 
     def test_marker_overlay_follows_visible_proxy_geometry(self):

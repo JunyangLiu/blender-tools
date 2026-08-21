@@ -74,6 +74,19 @@ class StorageTests(unittest.TestCase):
         self.assertEqual([item.id for item in removed], [1, 2])
         self.assertEqual(storage.document_summary(scene)["mark_count"], 0)
 
+    def test_brush_batch_is_one_document_transaction_and_keeps_duplicates_out(self):
+        scene = {}
+        accepted = storage.append_marks(scene, [
+            mark(1),
+            mark(2),
+            mark(3, (1.0, 0.0, 0.0), face_index=1),
+        ])
+        self.assertEqual([item.id for item in accepted], [1, 2])
+        summary = storage.document_summary(scene)
+        self.assertEqual(summary["mark_count"], 2)
+        # One initial document creation plus one batch commit.
+        self.assertEqual(summary["revision"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

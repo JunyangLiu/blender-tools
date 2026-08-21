@@ -5,6 +5,7 @@ import json
 import bpy
 
 from semantic_mesh_marker_next import raycast
+from semantic_mesh_marker_next.storage import document_summary, load_all_marks
 
 
 area = next(item for item in bpy.context.screen.areas if item.type == "VIEW_3D")
@@ -12,6 +13,11 @@ region = next(item for item in area.regions if item.type == "WINDOW")
 region_3d = area.spaces.active.region_3d
 scene = bpy.context.scene
 working = bpy.data.objects.get(str(scene.get("smrn_surface_working_name", "")))
+summary = document_summary(scene)
+marked_faces = {
+    (record.hit_object_name, int(record.face_index))
+    for record in load_all_marks(scene, summary["task_id"])
+}
 
 # Coordinates are bounded to the two visible gaps in the current viewport.
 # They are expressed in Blender window units, not image pixels.
@@ -50,6 +56,9 @@ for label, window_coordinate in points.items():
             "raycast": direct.get("raycast_object_name"),
             "face": direct["face_index"],
         } if direct else None),
+        "already_marked": bool(
+            direct and (direct["hit_object_name"], int(direct["face_index"])) in marked_faces
+        ),
     }
 
 print("SMRN_BRUSH_GAP_PROBE=" + json.dumps({
