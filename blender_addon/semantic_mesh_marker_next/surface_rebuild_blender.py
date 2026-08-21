@@ -156,6 +156,17 @@ def _face_center(face):
     return face.calc_center_median()
 
 
+def _face_shape_quality(face):
+    """Return a scale-free area/edge score; near zero means a normal-unstable sliver."""
+    maximum_edge_squared = max(
+        ((edge.verts[1].co - edge.verts[0].co).length_squared for edge in face.edges),
+        default=0.0,
+    )
+    if maximum_edge_squared <= 1.0e-20:
+        return 0.0
+    return float(2.0 * face.calc_area() / maximum_edge_squared)
+
+
 def _seed_face_indices(records, face_count):
     return sorted({int(record.face_index) for record in records if 0 <= int(record.face_index) < face_count})
 
@@ -1086,6 +1097,7 @@ def _rebuild_working_mesh(
     before_coordinates = {vertex: vertex.co.copy() for vertex in movable}
     qa_faces = set(region_faces)
     before_face_geometry = {}
+    before_face_shape_quality = {}
     ignored_preexisting_tiny_faces = 0
     transition_rings = []
     planarity = None
@@ -1175,6 +1187,9 @@ def _rebuild_working_mesh(
             face: (face.normal.copy(), float(face.calc_area()))
             for face in transition_faces
             if float(face.calc_area()) > minimum_qa_area
+        }
+        before_face_shape_quality = {
+            face: _face_shape_quality(face) for face in before_face_geometry
         }
         projected_targets = {}
         for vertex in region_vertices:
@@ -1769,6 +1784,7 @@ def _rebuild_working_mesh(
     flipped_faces = 0
     degenerate_faces = 0
     flipped_face_details = []
+    accepted_unstable_sliver_flips = []
     degenerate_face_details = []
     for face, (before_normal, before_area) in before_face_geometry.items():
         after_area = float(face.calc_area())
@@ -1780,15 +1796,48 @@ def _rebuild_working_mesh(
                 "before_area": before_area,
                 "after_area": after_area,
             })
-        if before_normal.length_squared and face.normal.length_squared and before_normal.dot(face.normal) <= 0.0:
-            flipped_faces += 1
-            flipped_face_details.append({
+        normal_dot = (
+            float(before_normal.dot(face.normal))
+            if before_normal.length_squared and face.normal.length_squared else 1.0
+        )
+        if normal_dot <= 0.0:
+            neighbor_dots = [
+                float(face.normal.dot(neighbor.normal))
+                for edge in face.edges
+                for neighbor in edge.link_faces
+                if neighbor is not face and neighbor.normal.length_squared
+            ]
+            positive_neighbors = sum(1 for dot in neighbor_dots if dot > 0.0)
+            strict_neighbor_majority = bool(
+                neighbor_dots and positive_neighbors > len(neighbor_dots) * 0.5
+            )
+            # Very thin source triangles have numerically unstable normals: a
+            # tiny movement of two shared boundary vertices can cross their
+            # almost-collinear third vertex even though the triangle expands
+            # and agrees with the surrounding surface.  Accept only that
+            # tightly-proven case; reliable or isolated flips still fail.
+            accepted_unstable_sliver = bool(
+                mode == "flatten"
+                and face not in region_face_set
+                and before_face_shape_quality.get(face, 1.0) <= 0.002
+                and after_area >= before_area * 0.20
+                and strict_neighbor_majority
+            )
+            detail = {
                 "face_index": int(face.index),
                 "in_green_region": face in region_face_set,
-                "normal_dot": float(before_normal.dot(face.normal)),
+                "normal_dot": normal_dot,
                 "before_area": before_area,
                 "after_area": after_area,
-            })
+                "before_shape_quality": before_face_shape_quality.get(face),
+                "positive_neighbor_normals": positive_neighbors,
+                "neighbor_normal_count": len(neighbor_dots),
+            }
+            if accepted_unstable_sliver:
+                accepted_unstable_sliver_flips.append(detail)
+            else:
+                flipped_faces += 1
+                flipped_face_details.append(detail)
     after_p95 = _percentile(_edge_dihedrals(matched_dihedral_edges), 0.95)
     dihedral_comparable = bool(matched_dihedral_edges)
     after_topology = _topology_signature(bm)
@@ -1921,6 +1970,8 @@ def _rebuild_working_mesh(
         "flatten_safety_attempts": flatten_safety_attempts if mode == "flatten" else None,
         "flipped_faces": flipped_faces,
         "flipped_face_details": flipped_face_details,
+        "accepted_unstable_sliver_flips": len(accepted_unstable_sliver_flips),
+        "accepted_unstable_sliver_flip_details": accepted_unstable_sliver_flips,
         "degenerate_faces": degenerate_faces,
         "degenerate_face_details": degenerate_face_details,
         "ignored_preexisting_tiny_faces": ignored_preexisting_tiny_faces,
