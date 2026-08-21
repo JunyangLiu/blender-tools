@@ -2064,6 +2064,12 @@ def _link_hidden_working(scene, working):
 
 def _show_exact_flatten_working_candidate(source, working, preview):
     """Show the full replacement result without source/candidate z-fighting."""
+    face_indices_match = bool(
+        len(source.data.vertices) == len(working.data.vertices)
+        and len(source.data.polygons) == len(working.data.polygons)
+    )
+    working["smrn_mark_proxy_source"] = source.name
+    working["smrn_mark_proxy_face_indices"] = face_indices_match
     if "smrn_saved_candidate_display_type" not in source:
         source["smrn_saved_candidate_display_type"] = str(source.display_type)
     source.display_type = "BOUNDS"

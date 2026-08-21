@@ -242,6 +242,8 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("def _apply_planar_custom_normals", adapter)
         self.assertIn('"custom_planar_normals_applied"', adapter)
         self.assertIn("def _show_exact_flatten_working_candidate", adapter)
+        self.assertIn('working["smrn_mark_proxy_source"] = source.name', adapter)
+        self.assertIn('working["smrn_mark_proxy_face_indices"] = face_indices_match', adapter)
         self.assertIn("def _restore_source_candidate_display", adapter)
         self.assertIn('source.display_type = "BOUNDS"', adapter)
         self.assertIn("matched_dihedral_edges", adapter)

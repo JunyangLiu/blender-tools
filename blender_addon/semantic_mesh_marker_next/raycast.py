@@ -11,6 +11,34 @@ from .scene_state import (
 )
 
 
+def _mark_proxy_source(obj):
+    """Return the source for a topology-identical visible working candidate.
+
+    Exact flatten previews deliberately show the full working copy while the
+    source is drawn as bounds.  Such a copy is safe to ray-cast because its
+    polygon indices still map one-to-one to the untouched source mesh.
+    """
+    if obj is None or not bool(obj.get("smrn_mark_proxy_face_indices", False)):
+        return None
+    source = bpy.data.objects.get(str(obj.get("smrn_mark_proxy_source", "")))
+    if source is None or source.type != "MESH":
+        return None
+    if (
+        len(obj.data.vertices) != len(source.data.vertices)
+        or len(obj.data.polygons) != len(source.data.polygons)
+    ):
+        return None
+    return source
+
+
+def _mark_hit_identity(obj):
+    source = _mark_proxy_source(obj)
+    if source is None:
+        source = semantic_source_object(obj)
+        return obj, source
+    return source, source
+
+
 def scene_hit_at(context, region, region_3d, coordinate):
     origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, coordinate)
     direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, coordinate).normalized()
@@ -22,7 +50,7 @@ def scene_hit_at(context, region, region_3d, coordinate):
     original = getattr(hit_obj, "original", None)
     if original is None or original.type != "MESH":
         original = bpy.data.objects.get(hit_obj.name, hit_obj)
-    source = semantic_source_object(original)
+    hit_identity, source = _mark_hit_identity(original)
     world_location = Vector(location)
     world_normal = Vector(normal)
     if world_normal.length_squared:
@@ -35,8 +63,9 @@ def scene_hit_at(context, region, region_3d, coordinate):
         "world_normal": world_normal,
         "toward_viewer": toward_viewer,
         "face_index": int(face_index),
-        "hit_object_name": original.name,
+        "hit_object_name": hit_identity.name,
         "source_object_name": source.name,
+        "raycast_object_name": original.name,
         "ray_distance": float((world_location - origin).length),
     }
 
@@ -118,14 +147,15 @@ def object_hit_at(
     toward_viewer = origin - world_location
     if toward_viewer.length_squared:
         toward_viewer.normalize()
-    source = semantic_source_object(obj)
+    hit_identity, source = _mark_hit_identity(obj)
     return {
         "world_location": world_location,
         "world_normal": world_normal,
         "toward_viewer": toward_viewer,
         "face_index": int(face_index),
-        "hit_object_name": obj.name,
+        "hit_object_name": hit_identity.name,
         "source_object_name": source.name,
+        "raycast_object_name": obj.name,
         "ray_distance": float((world_location - origin).length),
     }
 
@@ -135,7 +165,10 @@ def _passthrough_objects(context):
         obj
         for obj in context.view_layer.objects
         if obj.type == "MESH"
-        and (is_helper_object(obj) or is_unaccepted_candidate_object(obj))
+        and (
+            is_helper_object(obj)
+            or (is_unaccepted_candidate_object(obj) and _mark_proxy_source(obj) is None)
+        )
         and obj.visible_get(view_layer=context.view_layer)
     ]
 

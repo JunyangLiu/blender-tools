@@ -215,7 +215,10 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         )
 
     def _store_hit(self, context, hit, *, dragging=False):
-        self._stroke_object_name = hit["hit_object_name"]
+        # A visible topology-identical working candidate may proxy the source.
+        # Continue the stroke on the visible proxy while all records and face
+        # indices remain attached to the untouched semantic source.
+        self._stroke_object_name = hit.get("raycast_object_name", hit["hit_object_name"])
         face_key = (hit["hit_object_name"], int(hit["face_index"]))
         if face_key in self._marked_faces:
             return False
