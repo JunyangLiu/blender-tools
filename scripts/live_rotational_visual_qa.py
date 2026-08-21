@@ -88,3 +88,4 @@ print("SMRN_VISUAL_QA=" + json.dumps({
     "source_bounds": [list(source_min), list(source_max)],
     "candidate_bounds": [list(candidate_min), list(candidate_max)],
 }, ensure_ascii=False, separators=(",", ":")))
+candidate.show_in_front = False

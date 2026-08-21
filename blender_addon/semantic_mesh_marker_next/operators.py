@@ -457,8 +457,8 @@ class SMRN_OT_analyze_rotational(bpy.types.Operator):
 
 class SMRN_OT_build_rotational_candidate(bpy.types.Operator):
     bl_idname = "smrn.build_rotational_candidate"
-    bl_label = "生成圆润候选"
-    bl_description = "默认直接使用绿色刷选；没有绿色标记时才使用编辑模式原生选面。只生成独立候选，源网格保持不变"
+    bl_label = "生成独立圆圈候选"
+    bl_description = "使用绿色刷选拟合独立封闭圆圈/圆弧候选；不替换当前原网面结果，也不扫描整车"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):

@@ -94,11 +94,13 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn('text="物体模式绿色刷选；重建原网面，不生成罩体"', panel)
         self.assertIn('text="重建绿色圆润原网面"', panel)
         self.assertIn('rebuild_rotational.mode = "rotational"', panel)
-        self.assertIn('text="旧版独立罩体（实验，不替换原网面）"', panel)
-        self.assertIn('text="生成旧版独立罩体"', panel)
-        self.assertIn('"确认旧罩体（保留标记）"', panel)
+        self.assertIn('text="独立圆圈候选（不替换原网面）"', panel)
+        self.assertIn('text="生成独立圆圈候选"', panel)
+        self.assertIn('"确认独立圆圈（保留标记）"', panel)
+        self.assertIn('def _envelope_profile', adapter)
+        self.assertIn('"clearance_mode": "local_axial_envelope"', adapter)
         self.assertGreater(
-            panel.index('text="生成旧版独立罩体"'),
+            panel.index('text="生成独立圆圈候选"'),
             panel.index("if scene.smrn_show_advanced:"),
         )
 

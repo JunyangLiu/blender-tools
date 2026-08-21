@@ -189,9 +189,9 @@ class SMRN_PT_marking(bpy.types.Panel):
 
             rotational_settings = advanced.column(align=True)
             rotational_settings.label(text="圆润拟合")
-            rotational_settings.label(text="旧版独立罩体（实验，不替换原网面）", icon="ERROR")
+            rotational_settings.label(text="独立圆圈候选（不替换原网面）", icon="MESH_CIRCLE")
             rotational_settings.operator(
-                "smrn.build_rotational_candidate", text="生成旧版独立罩体", icon="MESH_CYLINDER"
+                "smrn.build_rotational_candidate", text="生成独立圆圈候选", icon="MESH_CYLINDER"
             )
             if _candidate_exists(
                 scene, "smrn_rotational_candidate_name", "SMRN_ROTATIONAL_CANDIDATE_"
@@ -202,16 +202,16 @@ class SMRN_PT_marking(bpy.types.Panel):
                 confirm = rotational_settings.operator(
                     "smrn.confirm_candidate",
                     text=(
-                        "确认旧罩体（保留标记）"
+                        "确认独立圆圈（保留标记）"
                         if selected_input
-                        else "确认旧罩体并清除标记"
+                        else "确认独立圆圈并清除标记"
                     ),
                     icon="CHECKMARK",
                 )
                 confirm.candidate_kind = "rotational"
                 rotational_settings.operator(
                     "smrn.remove_rotational_candidate",
-                    text="移除旧版独立罩体",
+                    text="移除独立圆圈候选",
                     icon="TRASH",
                 )
             rotational_settings.prop(scene, "smrn_rotational_segments", text="圆周细分")

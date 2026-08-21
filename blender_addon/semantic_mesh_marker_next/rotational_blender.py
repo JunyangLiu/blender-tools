@@ -304,8 +304,57 @@ def _ring_point(fit, axial, angle, radius):
     return origin + axis * axial + radius * (math.cos(angle) * basis_x + math.sin(angle) * basis_y)
 
 
-def _candidate_geometry(fit, axial_min, axial_max, angle_start, angle_span,
-                        thickness, clearance, requested_segments):
+def _envelope_profile(fit, points, axial_min, axial_max, extra_clearance=0.0,
+                      requested_knots=12):
+    """Build a smooth local radial envelope instead of one global clearance.
+
+    Every dense source sample is covered, but a local protrusion only raises
+    neighboring axial rings.  The one-sided smoothing step fills narrow dents
+    without sanding down peaks that are required for source coverage.
+    """
+    axial, radius, _angle = _coordinates(points, fit)
+    predicted = np.abs(fit.signed_radius_at_origin + fit.signed_slope * axial)
+    residual = radius - predicted if fit.surface_side == "outer" else predicted - radius
+    span = max(float(axial_max - axial_min), 1.0e-8)
+    knot_count = max(4, min(int(requested_knots), max(4, len(points))))
+    knots = np.linspace(axial_min, axial_max, knot_count)
+    step = span / max(knot_count - 1, 1)
+    values = np.empty(knot_count, dtype=float)
+    for index, knot in enumerate(knots):
+        distance = np.abs(axial - knot)
+        local = residual[distance <= step * 1.05]
+        values[index] = float(np.max(local)) if len(local) else float(residual[np.argmin(distance)])
+
+    # Raise valleys only. Required peaks never move inward.
+    for _iteration in range(3):
+        neighbor = values.copy()
+        neighbor[1:-1] = 0.25 * values[:-2] + 0.5 * values[1:-1] + 0.25 * values[2:]
+        values = np.maximum(values, neighbor)
+
+    # Piecewise-linear candidate must cover every dense triangle sample.
+    for _iteration in range(4):
+        interpolated = np.interp(axial, knots, values)
+        deficit = residual - interpolated
+        if float(np.max(deficit)) <= 1.0e-8:
+            break
+        for sample_axial, amount in zip(axial, deficit):
+            if amount <= 0.0:
+                continue
+            right = int(np.searchsorted(knots, sample_axial, side="right"))
+            right = min(max(right, 1), knot_count - 1)
+            left = right - 1
+            values[left] += float(amount) + 1.0e-8
+            values[right] += float(amount) + 1.0e-8
+    values += max(0.0, float(extra_clearance))
+    return knots, values
+
+
+def _profile_clearance(axial, knots, values):
+    return np.interp(axial, np.asarray(knots, dtype=float), np.asarray(values, dtype=float))
+
+
+def _candidate_geometry(fit, axial_knots, profile_clearance, angle_start, angle_span,
+                        thickness, requested_segments):
     full = angle_span >= 2.0 * math.pi - 1.0e-7
     segments = max(12, int(round(requested_segments * angle_span / (2.0 * math.pi))))
     if full:
@@ -313,20 +362,24 @@ def _candidate_geometry(fit, axial_min, axial_max, angle_start, angle_span,
         angles = [angle_start + angle_span * index / segments for index in range(segments)]
     else:
         angles = [angle_start + angle_span * index / segments for index in range(segments + 1)]
-    rings = []
+    ring_pairs = []
     vertices = []
-    for axial in (axial_min, axial_max):
+    for axial, clearance in zip(axial_knots, profile_clearance):
         base_radius = fit.radius_at_axial(axial)
         if fit.surface_side == "outer":
-            radii = (base_radius + clearance, max(1.0e-5, base_radius - thickness))
+            visible_radius = base_radius + clearance
+            radii = (visible_radius, max(1.0e-5, visible_radius - thickness))
         else:
-            radii = (max(1.0e-5, base_radius - clearance), base_radius + thickness)
+            visible_radius = max(1.0e-5, base_radius - clearance)
+            radii = (visible_radius, visible_radius + thickness)
+        pair = []
         for radius in radii:
             ring = []
             for angle in angles:
                 ring.append(len(vertices))
                 vertices.append(tuple(float(value) for value in _ring_point(fit, axial, angle, radius)))
-            rings.append(ring)
+            pair.append(ring)
+        ring_pairs.append(pair)
 
     faces = []
     pair_count = len(angles) if full else len(angles) - 1
@@ -335,14 +388,16 @@ def _candidate_geometry(fit, axial_min, axial_max, angle_start, angle_span,
             following = (index + 1) % len(angles)
             face = (first[index], first[following], second[following], second[index])
             faces.append(tuple(reversed(face)) if reverse else face)
-    # outer/visible, inner/backing, then both axial caps
-    connect(rings[0], rings[2], reverse=(fit.surface_side == "inner"))
-    connect(rings[1], rings[3], reverse=(fit.surface_side != "inner"))
-    connect(rings[0], rings[1], reverse=True)
-    connect(rings[2], rings[3], reverse=False)
+    # Visible and backing skins for every axial interval, then axial caps.
+    for first, second in zip(ring_pairs, ring_pairs[1:]):
+        connect(first[0], second[0], reverse=(fit.surface_side == "inner"))
+        connect(first[1], second[1], reverse=(fit.surface_side != "inner"))
+    connect(ring_pairs[0][0], ring_pairs[0][1], reverse=True)
+    connect(ring_pairs[-1][0], ring_pairs[-1][1], reverse=False)
     if not full:
-        faces.append((rings[0][0], rings[2][0], rings[3][0], rings[1][0]))
-        faces.append((rings[0][-1], rings[1][-1], rings[3][-1], rings[2][-1]))
+        for first, second in zip(ring_pairs, ring_pairs[1:]):
+            faces.append((first[0][0], second[0][0], second[1][0], first[1][0]))
+            faces.append((first[0][-1], first[1][-1], second[1][-1], second[0][-1]))
     return vertices, faces, segments
 
 
@@ -379,19 +434,26 @@ def _dense_triangle_samples(source, targets, order=5, face_indices=None):
     return result
 
 
-def _coverage_report(fit, points, axial_min, axial_max, angle_start, angle_span, clearance):
+def _coverage_report(fit, points, axial_min, axial_max, angle_start, angle_span,
+                     axial_knots, profile_clearance):
     axial, radius, angle = _coordinates(points, fit)
     angular = _angle_offset(angle, angle_start)
-    in_angle = np.ones(len(points), dtype=bool) if fit.coverage_mode == "full_rotation" else angular <= angle_span + 1e-7
+    full = angle_span >= 2.0 * math.pi - 1.0e-7
+    in_angle = np.ones(len(points), dtype=bool) if full else angular <= angle_span + 1e-7
     in_axial = (axial >= axial_min - 1e-7) & (axial <= axial_max + 1e-7)
     predicted = np.abs(fit.signed_radius_at_origin + fit.signed_slope * axial)
+    clearance = _profile_clearance(axial, axial_knots, profile_clearance)
     if fit.surface_side == "outer":
         overshoot = radius - (predicted + clearance)
     else:
         overshoot = (predicted - clearance) - radius
+    gap = -overshoot
     covered = in_angle & in_axial & (overshoot <= 1e-6)
     return {"samples": len(points), "uncovered": int(np.sum(~covered)),
             "maximum_overshoot": float(max(0.0, np.max(overshoot))) if len(points) else 0.0,
+            "median_visible_gap": float(max(0.0, np.median(gap))) if len(points) else 0.0,
+            "p90_visible_gap": float(max(0.0, np.quantile(gap, 0.90))) if len(points) else 0.0,
+            "maximum_visible_gap": float(max(0.0, np.max(gap))) if len(points) else 0.0,
             "passed": bool(np.all(covered))}
 
 
@@ -405,20 +467,22 @@ def _required_clearance(fit, points):
 
 
 def _exclude_report(fit, source, excludes, axial_min, axial_max, angle_start, angle_span,
-                    clearance, thickness):
+                    axial_knots, profile_clearance, thickness):
     relevant = [item for item in excludes if item.source_object_name == source.name]
     if not relevant:
         return {"samples": 0, "conflicts": 0, "passed": True}
     points = [tuple(_current_anchor(item, source)[0]) for item in relevant]
     axial, radius, angle = _coordinates(points, fit)
     angular = _angle_offset(angle, angle_start)
-    in_angle = np.ones(len(points), dtype=bool) if fit.coverage_mode == "full_rotation" else angular <= angle_span + 1e-7
+    full = angle_span >= 2.0 * math.pi - 1.0e-7
+    in_angle = np.ones(len(points), dtype=bool) if full else angular <= angle_span + 1e-7
     in_axial = (axial >= axial_min) & (axial <= axial_max)
     predicted = np.abs(fit.signed_radius_at_origin + fit.signed_slope * axial)
+    clearance = _profile_clearance(axial, axial_knots, profile_clearance)
     if fit.surface_side == "outer":
-        radial_hit = (radius >= predicted - thickness) & (radius <= predicted + clearance)
+        radial_hit = (radius >= predicted + clearance - thickness) & (radius <= predicted + clearance)
     else:
-        radial_hit = (radius >= predicted - clearance) & (radius <= predicted + thickness)
+        radial_hit = (radius >= predicted - clearance) & (radius <= predicted - clearance + thickness)
     conflicts = int(np.sum(in_angle & in_axial & radial_hit))
     return {"samples": len(points), "conflicts": conflicts, "passed": conflicts == 0}
 
@@ -488,21 +552,26 @@ def _build_candidate(scene, fit, source, targets, excludes, context_report,
         fit, source, targets, surface_faces
     )
     dense = _dense_triangle_samples(source, targets, face_indices=surface_faces)
-    clearance = max(fitted_clearance, _required_clearance(fit, dense))
-    clearance += max(0.0, float(scene.smrn_rotational_clearance))
+    requested_axial_knots = max(8, min(24, int(math.ceil(math.sqrt(max(len(dense), 1))))))
+    axial_knots, profile_clearance = _envelope_profile(
+        fit, dense, axial_min, axial_max,
+        extra_clearance=float(scene.smrn_rotational_clearance),
+        requested_knots=requested_axial_knots,
+    )
     thickness = float(scene.smrn_rotational_thickness)
     if thickness <= 0.0:
         thickness = _auto_thickness(fit, axial_min, axial_max)
     coverage = _coverage_report(
-        fit, dense, axial_min, axial_max, angle_start, angle_span, clearance
+        fit, dense, axial_min, axial_max, angle_start, angle_span,
+        axial_knots, profile_clearance,
     )
     excludes_report = _exclude_report(
         fit, source, excludes, axial_min, axial_max, angle_start, angle_span,
-        clearance, thickness
+        axial_knots, profile_clearance, thickness
     )
     vertices, faces, segments = _candidate_geometry(
-        fit, axial_min, axial_max, angle_start, angle_span,
-        thickness, clearance, int(scene.smrn_rotational_segments),
+        fit, axial_knots, profile_clearance, angle_start, angle_span,
+        thickness, int(scene.smrn_rotational_segments),
     )
     topology = _topology_report(vertices, faces)
     report.update({
@@ -513,7 +582,12 @@ def _build_candidate(scene, fit, source, targets, excludes, context_report,
                    "angular_span_degrees": math.degrees(angle_span),
                    "coverage_mode": ("full_rotation" if angle_span >= 2.0 * math.pi - 1.0e-7
                                      else "partial_arc"),
-                   "clearance": clearance, "thickness": thickness,
+                   "clearance_mode": "local_axial_envelope",
+                   "legacy_global_clearance": fitted_clearance,
+                   "clearance_min": float(np.min(profile_clearance)),
+                   "clearance_max": float(np.max(profile_clearance)),
+                   "axial_profile_rings": len(axial_knots),
+                   "thickness": thickness,
                    "segments": segments},
         "coverage_qa": {
             **coverage,
