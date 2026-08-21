@@ -46,7 +46,7 @@ class ProjectContractTests(unittest.TestCase):
     def test_panel_defaults_to_one_click_workflow(self):
         panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
         addon = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn('text="一键圆润选中表面"', panel)
+        self.assertIn('text="一键圆润绿色选区"', panel)
         self.assertIn('text="一键生成扶手候选"', panel)
         self.assertIn("if scene.smrn_show_advanced:", panel)
         self.assertIn('bpy.types.Scene.smrn_show_advanced = bpy.props.BoolProperty(', addon)
@@ -86,8 +86,13 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("def _selected_rotational_faces", operators)
         self.assertIn("bmesh.from_edit_mesh", operators)
         self.assertIn("build_selected_scene_candidate", operators)
+        self.assertIn('has_green_marks = int(mark_counts.get(TARGET_ROLE, 0)) > 0', operators)
+        self.assertIn('if has_green_marks:', operators)
+        self.assertLess(operators.index('if has_green_marks:'), operators.index('selected = _selected_rotational_faces(context)', operators.index('if has_green_marks:')))
+        self.assertIn('bpy.ops.object.mode_set(mode="OBJECT")', operators)
         self.assertIn("现有语义标记保持不变", operators)
-        self.assertIn('text="一键圆润选中表面"', panel)
+        self.assertIn('text="物体模式绿色刷选；无需进入编辑模式"', panel)
+        self.assertIn('text="一键圆润绿色选区"', panel)
         self.assertIn('"确认选面圆润（保留标记）"', panel)
 
     def test_visibility_guard_only_reveals_authoritative_objects(self):

@@ -58,10 +58,10 @@ class SMRN_PT_marking(bpy.types.Panel):
 
         rotational = layout.box()
         rotational.label(text="2. 圆柱 / 圆锥圆润", icon="MOD_SCREW")
-        rotational.label(text="编辑模式选中侧面；未选面时使用绿色标记")
+        rotational.label(text="物体模式绿色刷选；无需进入编辑模式")
         rotational.operator(
             "smrn.build_rotational_candidate",
-            text="一键圆润选中表面",
+            text="一键圆润绿色选区",
             icon="MESH_CYLINDER",
         )
         if _candidate_exists(scene, "smrn_rotational_candidate_name", "SMRN_ROTATIONAL_CANDIDATE_"):

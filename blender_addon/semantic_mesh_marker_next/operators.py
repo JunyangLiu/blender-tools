@@ -458,16 +458,24 @@ class SMRN_OT_analyze_rotational(bpy.types.Operator):
 class SMRN_OT_build_rotational_candidate(bpy.types.Operator):
     bl_idname = "smrn.build_rotational_candidate"
     bl_label = "生成圆润候选"
-    bl_description = "编辑模式优先使用选中侧面；否则使用绿色标记。只生成独立候选，源网格保持不变"
+    bl_description = "默认直接使用绿色刷选；没有绿色标记时才使用编辑模式原生选面。只生成独立候选，源网格保持不变"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         selected = None
         try:
-            selected = _selected_rotational_faces(context)
-            if selected is None:
+            mark_counts = document_summary(context.scene).get("role_counts", {})
+            has_green_marks = int(mark_counts.get(TARGET_ROLE, 0)) > 0
+            if has_green_marks:
+                # Semantic brush marks are the normal, lightweight workflow.  Do not let
+                # stale native edit selections shadow an already valid green selection.
+                if context.mode == "EDIT_MESH":
+                    bpy.ops.object.mode_set(mode="OBJECT")
                 candidate, report = build_scene_candidate(context.scene)
             else:
+                selected = _selected_rotational_faces(context)
+                if selected is None:
+                    raise ValueError("请先用绿色刷子标记要圆润的侧面；无需进入编辑模式")
                 source, face_indices = selected
                 bpy.ops.object.mode_set(mode="OBJECT")
                 candidate, report = build_selected_scene_candidate(
