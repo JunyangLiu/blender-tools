@@ -16,15 +16,23 @@ def create_surface_overlay(context, name, hit, color, marker_size):
     hit_obj = bpy.data.objects.get(hit["hit_object_name"])
     if hit_obj is None or hit_obj.type != "MESH":
         raise RuntimeError("命中的网格对象已不存在")
-    if hit["face_index"] >= len(hit_obj.data.polygons):
+    # Keep semantic records attached to the untouched source, but draw the
+    # overlay from the mesh that was actually ray-cast. A topology-identical
+    # working candidate can have different vertex positions after flattening.
+    raycast_obj = bpy.data.objects.get(hit.get("raycast_object_name", ""))
+    geometry_obj = raycast_obj if raycast_obj is not None and raycast_obj.type == "MESH" else hit_obj
+    if hit["face_index"] >= len(geometry_obj.data.polygons):
         raise RuntimeError("命中面编号已失效；请先应用会改变拓扑的修改器")
-    polygon = hit_obj.data.polygons[hit["face_index"]]
-    world_vertices = [hit_obj.matrix_world @ hit_obj.data.vertices[index].co for index in polygon.vertices]
+    polygon = geometry_obj.data.polygons[hit["face_index"]]
+    world_vertices = [
+        geometry_obj.matrix_world @ geometry_obj.data.vertices[index].co
+        for index in polygon.vertices
+    ]
     if len(world_vertices) < 3:
         raise RuntimeError("命中面无法建立覆盖标记")
     normal = Vector(hit["world_normal"])
     if normal.length_squared < 1.0e-12:
-        normal = hit_obj.matrix_world.to_3x3().inverted().transposed() @ polygon.normal
+        normal = geometry_obj.matrix_world.to_3x3().inverted().transposed() @ polygon.normal
     normal.normalize()
     toward_viewer = Vector(hit.get("toward_viewer", normal))
     if toward_viewer.length_squared and normal.dot(toward_viewer.normalized()) < 0.0:
@@ -67,6 +75,7 @@ def create_surface_overlay(context, name, hit, color, marker_size):
     overlay["smrn_role"] = "marker_do_not_export"
     overlay["smrn_hit_object_name"] = hit["hit_object_name"]
     overlay["smrn_source_object_name"] = hit["source_object_name"]
+    overlay["smrn_raycast_object_name"] = geometry_obj.name
     overlay["smrn_face_index"] = hit["face_index"]
     overlay["smrn_world_location"] = list(hit["world_location"])
     overlay["smrn_world_normal"] = list(normal)
@@ -81,4 +90,3 @@ def remove_overlay(name):
     bpy.data.objects.remove(obj, do_unlink=True)
     if mesh is not None and mesh.users == 0:
         bpy.data.meshes.remove(mesh)
-

@@ -35,6 +35,13 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("brush_object_hits", operators)
         self.assertNotIn("magnetic_radius = min(magnetic_radius, 4)", operators)
 
+    def test_marker_overlay_follows_visible_proxy_geometry(self):
+        overlay = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "overlay.py").read_text(encoding="utf-8")
+        self.assertIn('hit.get("raycast_object_name", "")', overlay)
+        self.assertIn("geometry_obj.data.polygons", overlay)
+        self.assertIn('overlay["smrn_raycast_object_name"] = geometry_obj.name', overlay)
+        self.assertNotIn("world_vertices = [hit_obj.matrix_world @ hit_obj.data.vertices", overlay)
+
     def test_legacy_helpers_are_excluded_from_raycast(self):
         scene_state = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "scene_state.py").read_text(encoding="utf-8")
         self.assertIn('obj.get("smr_annotation_only", False)', scene_state)
