@@ -762,9 +762,16 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
             self.report({"INFO"}, context.scene.smrn_surface_summary)
             _set_status(context.scene, context.scene.smrn_surface_summary)
             return {"FINISHED"}
+        preserved = ""
+        if report["mode"] == "flatten":
+            planarity = topology.get("planarity_qa") or {}
+            preserved_count = int(planarity.get("preserved_component_count", 0))
+            preserved_faces = int(planarity.get("preserved_faces", 0))
+            if preserved_count:
+                preserved = f" · 保留 {preserved_count} 个低支撑小区域（{preserved_faces} 面）"
         context.scene.smrn_surface_summary = (
             f"{action}候选 · {region['selected_faces']} 面 → "
-            f"{topology['region_faces_after']} 面 · {protection}{reference}"
+            f"{topology['region_faces_after']} 面 · {protection}{reference}{preserved}"
         )
         _set_status(context.scene, context.scene.smrn_surface_summary)
         return {"FINISHED"}

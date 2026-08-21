@@ -32,6 +32,7 @@ WORKING_PREFIX = "SMRN_SURFACE_WORKING_FULL_"
 ARCHIVE_COLLECTION_NAME = "SMR_01B_原网面恢复检查点"
 REPORT_KEY = "smrn_surface_rebuild_report_json"
 PREVIEW_MATERIAL_NAME = "SMRN_局部网面候选_橙色半透明"
+MIN_FLATTEN_INTERIOR_SUPPORT = 3
 
 
 def _fit_rotational_from_selected_faces(source, face_indices):
@@ -1093,6 +1094,7 @@ def _rebuild_working_mesh(
     elif mode == "flatten" and movable:
         components = _region_face_components(region_faces, locked_region_edges)
         component_reports = []
+        preserved_component_reports = []
         component_geometry = []
         before_squares = []
         after_squares = []
@@ -1101,6 +1103,28 @@ def _rebuild_working_mesh(
             component_vertices = {vertex for face in component_faces for vertex in face.verts}
             component_movable = (component_vertices - locked_vertices) - moved_vertices
             if not component_movable or len(component_vertices) < 3:
+                preserved_component_reports.append({
+                    "index": component_index,
+                    "faces": len(component_faces),
+                    "vertices": len(component_vertices),
+                    "movable_vertices": len(component_movable),
+                    "reason": "no_editable_interior_support",
+                })
+                continue
+            # A disconnected sliver with only one or two editable interior
+            # vertices cannot describe a stable surface patch.  Projecting it
+            # to a reference plane creates a spike or reverses its surrounding
+            # fan, and historically forced the valid main component to share
+            # the same global safety rollback.  Preserve such a sliver exactly
+            # and evaluate the supported components independently of it.
+            if len(component_movable) < MIN_FLATTEN_INTERIOR_SUPPORT:
+                preserved_component_reports.append({
+                    "index": component_index,
+                    "faces": len(component_faces),
+                    "vertices": len(component_vertices),
+                    "movable_vertices": len(component_movable),
+                    "reason": "insufficient_interior_support",
+                })
                 continue
             orientation = Vector((0.0, 0.0, 0.0))
             for face in component_faces:
@@ -1146,20 +1170,33 @@ def _rebuild_working_mesh(
             component_geometry.append((
                 component_reports[-1], component_movable, component_vertices, plane_center, plane_normal
             ))
+        if not component_geometry:
+            bm.free()
+            _remove_object(working)
+            raise ValueError(
+                "绿色区域只有边界或低支撑小碎片；至少需要一个含 3 个内部可移动顶点的连续区域"
+            )
         before_rms = float(math.sqrt(sum(before_squares) / len(before_squares))) if before_squares else 0.0
         after_rms = float(math.sqrt(sum(after_squares) / len(after_squares))) if after_squares else 0.0
         planarity = {
             "method": "local_region_robust_center_pca_per_feature_component",
-            "progress_metric_scope": "editable_green_interior_vertices",
+            "progress_metric_scope": "supported_components_editable_green_interior_vertices",
             "component_count": len(components),
             "fitted_component_count": len(component_reports),
+            "preserved_component_count": len(preserved_component_reports),
+            "preserved_components": preserved_component_reports,
+            "preserved_faces": sum(item["faces"] for item in preserved_component_reports),
+            "preserved_movable_vertices": sum(
+                item["movable_vertices"] for item in preserved_component_reports
+            ),
+            "preservation_policy": "keep_low_support_components_unchanged_v1",
             "before_rms": before_rms,
             "after_rms": after_rms,
             "components": component_reports,
         }
         # Preserve a planar green core while the green outer boundary remains
         # fixed.  Only these green interior vertices may receive a target.
-        core_movable = list(movable)
+        core_movable = list(moved_vertices)
         core_before = dict(before_coordinates)
         full_targets = {vertex: vertex.co.copy() for vertex in core_movable}
         full_maximum = max(
