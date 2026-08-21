@@ -661,6 +661,7 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
         items=(
             ("smooth", "细化平滑", ""),
             ("flatten", "一键平整", ""),
+            ("rotational", "重建圆润原网面", ""),
             ("canvas", "帆布波浪重建", ""),
             ("canvas_physics", "多折面帆布重建（物理）", ""),
         ),
@@ -690,14 +691,14 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
         action = {
             "flatten": "平整",
             "smooth": "细化平滑",
+            "rotational": "圆柱/圆锥原网面重建",
             "canvas": "帆布波浪重建",
             "canvas_physics": "多折面帆布重建（物理）",
         }.get(report["mode"], "局部重建")
-        protection = (
-            "外边界与红色面已锁定"
-            if report["mode"] == "flatten"
-            else "边界、红色面与大折线已锁定"
-        )
+        protection = {
+            "flatten": "外边界与红色面已锁定",
+            "rotational": "绿色外边界、红色面与未标记面已锁定",
+        }.get(report["mode"], "边界、红色面与大折线已锁定")
         reference = ""
         if report["mode"] == "flatten":
             labels = {"LOW": "最低点", "MEDIAN": "居中", "HIGH": "最高点", "RED_REFERENCE": "红面高度"}

@@ -24,6 +24,7 @@ from .anchors import source_snapshot
 from .constants import EXCLUDE_ROLE, SOURCE_NAME_KEY, TARGET_ROLE
 from .scene_state import ensure_scene_roots, keep_model_visible
 from .storage import load_all_marks, set_active_source
+from .rotational_fit import fit_rotational_surface
 
 
 CANDIDATE_PREFIX = "SMRN_SURFACE_CANDIDATE_"
@@ -31,6 +32,54 @@ WORKING_PREFIX = "SMRN_SURFACE_WORKING_FULL_"
 ARCHIVE_COLLECTION_NAME = "SMR_01B_原网面恢复检查点"
 REPORT_KEY = "smrn_surface_rebuild_report_json"
 PREVIEW_MATERIAL_NAME = "SMRN_局部网面候选_橙色半透明"
+
+
+def _fit_rotational_from_selected_faces(source, face_indices):
+    """Fit only exact green faces in source-local coordinates."""
+    normal_sums = defaultdict(lambda: Vector((0.0, 0.0, 0.0)))
+    selected_faces = []
+    for face_index in face_indices:
+        if 0 <= int(face_index) < len(source.data.polygons):
+            polygon = source.data.polygons[int(face_index)]
+            selected_faces.append(polygon)
+            for vertex_index in polygon.vertices:
+                normal_sums[int(vertex_index)] += polygon.normal
+    if len(selected_faces) < 4 or len(normal_sums) < 6:
+        raise ValueError("圆润重建至少需要 4 个连续绿色侧面；不要只标端盖、台阶或零件")
+
+    points = []
+    normals = []
+    for vertex_index, normal in normal_sums.items():
+        if not normal.length_squared:
+            continue
+        normal.normalize()
+        points.append(tuple(source.data.vertices[vertex_index].co))
+        normals.append(tuple(normal))
+    fit = fit_rotational_surface(points, normals)
+    if fit.status != "candidate_ready":
+        raise ValueError(f"绿色侧面无法稳定拟合为圆柱/圆锥：{fit.reason}")
+    return fit
+
+
+def _rotational_target(coordinate, fit):
+    axis = Vector(fit.axis)
+    origin = Vector(fit.axis_origin)
+    relative = coordinate - origin
+    axial = float(relative.dot(axis))
+    radial = relative - axis * axial
+    if radial.length_squared <= 1.0e-20:
+        raise ValueError("圆润区域包含落在拟合轴线上的点；请只标圆柱/圆锥侧面")
+    radial.normalize()
+    return origin + axis * axial + radial * fit.radius_at_axial(axial)
+
+
+def _rotational_residual(coordinate, fit):
+    axis = Vector(fit.axis)
+    origin = Vector(fit.axis_origin)
+    relative = coordinate - origin
+    axial = float(relative.dot(axis))
+    radial = relative - axis * axial
+    return abs(float(radial.length) - float(fit.radius_at_axial(axial)))
 
 
 def _remove_object(obj):
@@ -797,6 +846,7 @@ def _canvas_outer_envelope_shift(
 def _rebuild_working_mesh(
     source, selected_indices, excluded_indices, level, strength, hard_angle, mode="smooth",
     height_mode="MEDIAN", normal_hint=None, normal_mode="AUTO", height_reference_points=None,
+    rotational_fit=None,
 ):
     working = source.copy()
     working.data = source.data.copy()
@@ -867,7 +917,7 @@ def _rebuild_working_mesh(
     # patch has no editable interior, fail closed and ask for a wider mark.
     protected_feature_edges = (
         canvas_macro_folds if mode in {"canvas", "canvas_physics"}
-        else (hard_edges if mode != "flatten" else set())
+        else (set() if mode in {"flatten", "rotational"} else hard_edges)
     )
     excluded_edges = {edge for face in excluded for edge in face.edges}
     locked_edges = boundary_edges | protected_feature_edges | excluded_edges
@@ -953,6 +1003,10 @@ def _rebuild_working_mesh(
         bm.free()
         _remove_object(working)
         raise ValueError("帆布区域没有可重建的内部网面；请沿帆布长度和宽度多刷一圈")
+    if mode == "rotational" and not movable:
+        bm.free()
+        _remove_object(working)
+        raise ValueError("绿色圆润区域没有可重建的内部网面；请把连续侧面多刷一圈")
     # Compare the exact same post-subdivision edges before and after fitting.
     # Comparing original coarse edges against new triangulation edges mixes
     # different populations and can falsely reject an otherwise safe result.
@@ -981,7 +1035,62 @@ def _rebuild_working_mesh(
     canvas_wave = None
     canvas_base_fairing = None
     canvas_outer_envelope = None
-    if mode == "flatten" and movable:
+    rotational_projection = None
+    if mode == "rotational" and movable:
+        if rotational_fit is None:
+            bm.free()
+            _remove_object(working)
+            raise ValueError("缺少当前绿色面的圆柱/圆锥拟合结果")
+        qa_faces = {face for vertex in movable for face in vertex.link_faces} | set(region_faces)
+        before_face_geometry = {
+            face: (face.normal.copy(), max(float(face.calc_area()), 1.0e-20))
+            for face in qa_faces
+        }
+        proposed_coordinates = {
+            vertex: _rotational_target(vertex.co, rotational_fit) for vertex in movable
+        }
+        full_displacements = [
+            (proposed_coordinates[vertex] - before_coordinates[vertex]).length
+            for vertex in movable
+        ]
+        max_allowed = local_scale * 0.55
+        full_maximum = max(full_displacements, default=0.0)
+        if full_maximum > max_allowed + 1.0e-12:
+            bm.free()
+            _remove_object(working)
+            raise ValueError("拟合圆面偏离绿色原网面过大；请确认没有混入端盖、台阶或其他零件")
+        residual_before = [
+            _rotational_residual(before_coordinates[vertex], rotational_fit) for vertex in movable
+        ]
+        projection_fraction, safety_attempts = _canvas_safe_fraction(
+            bm, movable, before_coordinates, proposed_coordinates, before_face_geometry,
+            matched_dihedral_edges, before_p95, tolerance_degrees=4.0,
+        )
+        residual_after = [_rotational_residual(vertex.co, rotational_fit) for vertex in movable]
+        before_p90_residual = _percentile(residual_before, 0.90)
+        after_p90_residual = _percentile(residual_after, 0.90)
+        progress_passed = (
+            projection_fraction >= 0.75
+            and (
+                before_p90_residual <= max(local_scale * 1.0e-6, 1.0e-10)
+                or after_p90_residual <= before_p90_residual * 0.30
+            )
+        )
+        rotational_projection = {
+            "method": "exact_green_local_subdivision_radial_reprojection_v1",
+            "fit": rotational_fit.to_dict(),
+            "projected_vertices": len(movable),
+            "locked_boundary_vertices": len(locked_vertices),
+            "projection_fraction": projection_fraction,
+            "full_projection_max_displacement": full_maximum,
+            "before_radial_residual_p90": before_p90_residual,
+            "after_radial_residual_p90": after_p90_residual,
+            "safety_attempts": safety_attempts,
+            "source_objects_scanned": 1,
+            "whole_vehicle_search": False,
+            "passed": progress_passed,
+        }
+    elif mode == "flatten" and movable:
         components = _region_face_components(region_faces, locked_region_edges)
         component_reports = []
         component_geometry = []
@@ -1397,7 +1506,8 @@ def _rebuild_working_mesh(
         "matched_dihedral_within_limit": (
             not dihedral_comparable
             or after_p95 <= before_p95 + math.radians(
-                8.0 if mode in {"canvas", "canvas_physics"} else 2.0
+                8.0 if mode in {"canvas", "canvas_physics"}
+                else (4.0 if mode == "rotational" else 2.0)
             )
         ),
         "planarity_improved": True,
@@ -1406,6 +1516,16 @@ def _rebuild_working_mesh(
         "no_flipped_faces": flipped_faces == 0,
         "no_degenerate_faces": degenerate_faces == 0,
     }
+    if rotational_projection is not None:
+        quality_gates["rotational_fit_ready"] = (
+            rotational_projection["fit"]["status"] == "candidate_ready"
+        )
+        quality_gates["rotational_projection_complete"] = bool(
+            rotational_projection["passed"]
+        )
+        quality_gates["displacement_within_limit"] = (
+            (max(moved) if moved else 0.0) <= max_allowed + 1.0e-12
+        )
     if planarity is not None:
         quality_gates["planarity_improved"] = (
             planarity["after_rms"] <= planarity["before_rms"] + 1.0e-9
@@ -1433,7 +1553,7 @@ def _rebuild_working_mesh(
         )
     topology_passed = all(quality_gates.values())
 
-    if mode in {"canvas", "canvas_physics"}:
+    if mode in {"canvas", "canvas_physics", "rotational"}:
         for face in region_faces:
             face.smooth = True
 
@@ -1471,6 +1591,7 @@ def _rebuild_working_mesh(
         "canvas_wave_qa": canvas_wave,
         "canvas_base_fairing_qa": canvas_base_fairing,
         "canvas_outer_envelope_qa": canvas_outer_envelope,
+        "rotational_projection_qa": rotational_projection,
         "local_edge_scale": local_scale,
         "max_allowed_displacement": max_allowed,
         "max_actual_displacement": max(moved) if moved else 0.0,
@@ -1589,6 +1710,8 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
     }
     if mode == "smooth":
         settings["smooth_strength"] = round(float(scene.smrn_surface_smooth_strength), 6)
+    elif mode == "rotational":
+        settings["rebuild_method"] = "exact_green_local_subdivision_radial_reprojection_v1"
     elif mode in {"canvas", "canvas_physics"}:
         settings["canvas_wave_strength"] = round(float(scene.smrn_canvas_wave_strength), 6)
     else:
@@ -1597,7 +1720,7 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
             "normal_mode": str(getattr(scene, "smrn_surface_normal_mode", "AUTO")),
         })
     payload = {
-        "schema": 12,
+        "schema": 13,
         "canvas_pipeline": (
             "fair_base_then_source_aligned_wave_outer_envelope_v3"
             if mode == "canvas"
@@ -1649,7 +1772,7 @@ def _matching_existing_candidate(scene, source, source_snapshot_value, request_s
 
 
 def build_scene_candidate(scene, mode="smooth"):
-    if mode not in {"smooth", "flatten", "canvas", "canvas_physics"}:
+    if mode not in {"smooth", "flatten", "rotational", "canvas", "canvas_physics"}:
         raise ValueError("不支持的局部网面重构模式")
     source, targets, excludes, before_snapshot = _source_and_records(scene)
     if mode in {"canvas", "canvas_physics"} and len(targets) < 3:
@@ -1678,6 +1801,10 @@ def build_scene_candidate(scene, mode="smooth"):
     probe.free()
     if not selected_indices:
         raise ValueError("没有可重构的局部网面；请检查绿色与红色标记是否冲突")
+    rotational_fit = (
+        _fit_rotational_from_selected_faces(source, sorted(selected_indices))
+        if mode == "rotational" else None
+    )
     if mode in {"canvas", "canvas_physics"} and len(selected_indices) < 6:
         raise ValueError("帆布绿色区域过小；请沿帆布长度和宽度多刷一些表面")
 
@@ -1700,6 +1827,7 @@ def build_scene_candidate(scene, mode="smooth"):
             normal_hint,
             normal_mode,
             height_reference_points,
+            rotational_fit,
         )
         if not topology["passed"]:
             failures = []
@@ -1747,6 +1875,8 @@ def build_scene_candidate(scene, mode="smooth"):
                 failures.append("平面误差没有改善")
             if gates.get("flatten_progress_sufficient") is False:
                 failures.append("安全回退后平整进度不足")
+            if gates.get("rotational_projection_complete") is False:
+                failures.append("圆柱/圆锥径向重投影未达到安全完成度")
             detail = "、".join(failures) or "未识别的局部质量门失败"
             raise ValueError(f"平整质量检查未通过（{detail}），已拒绝生成；源网格未修改")
         checkpoint = _checkpoint(scene, source)
@@ -1771,7 +1901,11 @@ def build_scene_candidate(scene, mode="smooth"):
                 "passed": True,
                 "method": (
                     "strict_green_surface_with_dense_outer_envelope"
-                    if mode in {"canvas", "canvas_physics"} else "exact_brushed_faces_only"
+                    if mode in {"canvas", "canvas_physics"}
+                    else (
+                        "exact_green_faces_local_radial_reprojection"
+                        if mode == "rotational" else "exact_brushed_faces_only"
+                    )
                 ),
                 "source_objects_scanned": 1,
                 "whole_vehicle_search": False,

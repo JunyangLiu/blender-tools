@@ -48,6 +48,10 @@ class SMRN_PT_marking(bpy.types.Panel):
         row.operator("smrn.clear_marks", text="清空", icon="X")
         helpers = bpy.data.collections.get(HELPER_COLLECTION_NAME)
         counts = marks_summary(scene)["role_counts"]
+        has_any_surface_candidate = _candidate_exists(
+            scene, "smrn_surface_candidate_name", "SMRN_SURFACE_CANDIDATE_"
+        )
+        surface_candidate_mode = str(scene.get("smrn_surface_candidate_mode", ""))
         row = marks_box.row(align=True)
         row.label(text=f"绿色 {counts[TARGET_ROLE]}  ·  红色 {counts[EXCLUDE_ROLE]}")
         row.operator(
@@ -58,24 +62,22 @@ class SMRN_PT_marking(bpy.types.Panel):
 
         rotational = layout.box()
         rotational.label(text="2. 圆柱 / 圆锥圆润", icon="MOD_SCREW")
-        rotational.label(text="物体模式绿色刷选；无需进入编辑模式")
-        rotational.operator(
-            "smrn.build_rotational_candidate",
-            text="一键圆润绿色选区",
+        rotational.label(text="物体模式绿色刷选；重建原网面，不生成罩体")
+        rebuild_rotational = rotational.operator(
+            "smrn.build_surface_candidate",
+            text="重建绿色圆润原网面",
             icon="MESH_CYLINDER",
         )
-        if _candidate_exists(scene, "smrn_rotational_candidate_name", "SMRN_ROTATIONAL_CANDIDATE_"):
-            selected_input = _candidate_input_mode(
-                scene, "smrn_rotational_candidate_name"
-            ) == "selected_faces"
-            confirm = rotational.operator(
-                "smrn.confirm_candidate",
-                text=("确认选面圆润（保留标记）" if selected_input else "确认并清除标记"),
+        rebuild_rotational.mode = "rotational"
+        if has_any_surface_candidate and surface_candidate_mode == "rotational":
+            rotational.operator(
+                "smrn.confirm_surface_replacement",
+                text="确认圆润并替换标记网面",
                 icon="CHECKMARK",
             )
-            confirm.candidate_kind = "rotational"
-            rotational.operator("smrn.remove_rotational_candidate", text="移除当前圆润候选", icon="TRASH")
-
+            rotational.operator(
+                "smrn.remove_surface_candidate", text="移除当前圆润预览", icon="TRASH"
+            )
         handle = layout.box()
         handle.label(text="3. 扶手 / 把手还原", icon="CURVE_BEZCURVE")
         handle.label(text="绿色标管体；红色安装面仅用于纠偏")
@@ -122,10 +124,8 @@ class SMRN_PT_marking(bpy.types.Panel):
             icon="PHYSICS",
         )
         physics.mode = "canvas_physics"
-        has_surface_candidate = _candidate_exists(
-            scene, "smrn_surface_candidate_name", "SMRN_SURFACE_CANDIDATE_"
-        )
-        mode = str(scene.get("smrn_surface_candidate_mode", ""))
+        has_surface_candidate = has_any_surface_candidate and surface_candidate_mode != "rotational"
+        mode = surface_candidate_mode
         if has_surface_candidate:
             if mode == "smooth":
                 surface.prop(scene, "smrn_surface_smooth_strength", text="平滑程度", slider=True)
@@ -162,7 +162,7 @@ class SMRN_PT_marking(bpy.types.Panel):
                 text=confirm_text,
                 icon="CHECKMARK",
             )
-        else:
+        elif not has_any_surface_candidate:
             confirm_row.enabled = bool(counts[TARGET_ROLE] or counts[EXCLUDE_ROLE])
             confirm_row.operator(
                 "smrn.accept_current_surface",
@@ -189,6 +189,31 @@ class SMRN_PT_marking(bpy.types.Panel):
 
             rotational_settings = advanced.column(align=True)
             rotational_settings.label(text="圆润拟合")
+            rotational_settings.label(text="旧版独立罩体（实验，不替换原网面）", icon="ERROR")
+            rotational_settings.operator(
+                "smrn.build_rotational_candidate", text="生成旧版独立罩体", icon="MESH_CYLINDER"
+            )
+            if _candidate_exists(
+                scene, "smrn_rotational_candidate_name", "SMRN_ROTATIONAL_CANDIDATE_"
+            ):
+                selected_input = _candidate_input_mode(
+                    scene, "smrn_rotational_candidate_name"
+                ) == "selected_faces"
+                confirm = rotational_settings.operator(
+                    "smrn.confirm_candidate",
+                    text=(
+                        "确认旧罩体（保留标记）"
+                        if selected_input
+                        else "确认旧罩体并清除标记"
+                    ),
+                    icon="CHECKMARK",
+                )
+                confirm.candidate_kind = "rotational"
+                rotational_settings.operator(
+                    "smrn.remove_rotational_candidate",
+                    text="移除旧版独立罩体",
+                    icon="TRASH",
+                )
             rotational_settings.prop(scene, "smrn_rotational_segments", text="圆周细分")
             rotational_settings.prop(scene, "smrn_rotational_thickness", text="壳体厚度（0=自动）")
             rotational_settings.prop(scene, "smrn_rotational_clearance", text="额外外扩")

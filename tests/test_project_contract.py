@@ -46,7 +46,7 @@ class ProjectContractTests(unittest.TestCase):
     def test_panel_defaults_to_one_click_workflow(self):
         panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
         addon = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn('text="一键圆润绿色选区"', panel)
+        self.assertIn('text="重建绿色圆润原网面"', panel)
         self.assertIn('text="一键生成扶手候选"', panel)
         self.assertIn("if scene.smrn_show_advanced:", panel)
         self.assertIn('bpy.types.Scene.smrn_show_advanced = bpy.props.BoolProperty(', addon)
@@ -91,9 +91,32 @@ class ProjectContractTests(unittest.TestCase):
         self.assertLess(operators.index('if has_green_marks:'), operators.index('selected = _selected_rotational_faces(context)', operators.index('if has_green_marks:')))
         self.assertIn('bpy.ops.object.mode_set(mode="OBJECT")', operators)
         self.assertIn("现有语义标记保持不变", operators)
-        self.assertIn('text="物体模式绿色刷选；无需进入编辑模式"', panel)
-        self.assertIn('text="一键圆润绿色选区"', panel)
-        self.assertIn('"确认选面圆润（保留标记）"', panel)
+        self.assertIn('text="物体模式绿色刷选；重建原网面，不生成罩体"', panel)
+        self.assertIn('text="重建绿色圆润原网面"', panel)
+        self.assertIn('rebuild_rotational.mode = "rotational"', panel)
+        self.assertIn('text="旧版独立罩体（实验，不替换原网面）"', panel)
+        self.assertIn('text="生成旧版独立罩体"', panel)
+        self.assertIn('"确认旧罩体（保留标记）"', panel)
+        self.assertGreater(
+            panel.index('text="生成旧版独立罩体"'),
+            panel.index("if scene.smrn_show_advanced:"),
+        )
+
+    def test_rotational_surface_rebuild_reprojects_only_green_source_mesh(self):
+        adapter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "surface_rebuild_blender.py").read_text(encoding="utf-8")
+        operators = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "operators.py").read_text(encoding="utf-8")
+        panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
+        self.assertIn("def _fit_rotational_from_selected_faces", adapter)
+        self.assertIn("fit_rotational_surface(points, normals)", adapter)
+        self.assertIn("def _rotational_target", adapter)
+        self.assertIn('"exact_green_local_subdivision_radial_reprojection_v1"', adapter)
+        self.assertIn('"whole_vehicle_search": False', adapter)
+        self.assertIn('set() if mode in {"flatten", "rotational"}', adapter)
+        self.assertIn('"unmarked_vertices_moved": 0', adapter)
+        self.assertIn('"rotational_projection_complete"', adapter)
+        self.assertIn('"rotational", "重建圆润原网面"', operators)
+        self.assertIn('text="确认圆润并替换标记网面"', panel)
+        self.assertNotIn('rebuild_rotational = rotational.operator(\n            "smrn.build_rotational_candidate"', panel)
 
     def test_visibility_guard_only_reveals_authoritative_objects(self):
         scene_state = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "scene_state.py").read_text(encoding="utf-8")
