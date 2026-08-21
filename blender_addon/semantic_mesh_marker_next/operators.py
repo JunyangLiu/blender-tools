@@ -15,10 +15,18 @@ from .constants import (
     TARGET_ROLE,
 )
 from .overlay import create_surface_overlay, remove_overlay
-from .raycast import magnetic_scene_hit
+from .raycast import brush_scene_hits, magnetic_scene_hit
 from .records import MarkRecord
 from .anchors import enrich_hit_anchor, source_snapshot
-from .storage import append_mark, clear_task_marks, document_summary, next_id, pop_last_mark, set_active_source
+from .storage import (
+    append_mark,
+    clear_task_marks,
+    document_summary,
+    load_all_marks,
+    next_id,
+    pop_last_mark,
+    set_active_source,
+)
 from .rotational_blender import (
     analyze_scene,
     build_scene_candidate,
@@ -206,27 +214,9 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
             and self._ui_region.y <= mouse_y < self._ui_region.y + self._ui_region.height
         )
 
-    def _paint_at(self, context, mouse_x, mouse_y, *, dragging=False):
-        x = mouse_x - self._window_region.x
-        y = mouse_y - self._window_region.y
-        if not (0 <= x < self._window_region.width and 0 <= y < self._window_region.height):
-            return False
-        # A full magnetic ring is useful for the first dab on a narrow recess.
-        # During a stroke a smaller ring keeps feedback fluid on dense models;
-        # neighboring samples still cover the stroke continuously.
-        magnetic_radius = int(context.scene.smrn_magnetic_radius_px)
-        if dragging:
-            magnetic_radius = min(magnetic_radius, 4)
-        hit = magnetic_scene_hit(
-            context,
-            self._window_region,
-            self._region_3d,
-            (x, y),
-            magnetic_radius,
-        )
-        if hit is None:
-            if not dragging:
-                _set_status(context.scene, "未找到可见表面；请靠近零件点击或增大磁吸半径。")
+    def _store_hit(self, context, hit, *, dragging=False):
+        face_key = (hit["hit_object_name"], int(hit["face_index"]))
+        if face_key in self._marked_faces:
             return False
         summary = document_summary(context.scene)
         number = next_id(context.scene)
@@ -271,18 +261,53 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         )
         if not append_mark(context.scene, record):
             remove_overlay(name)
+            self._marked_faces.add(face_key)
             if not dragging:
                 _set_status(context.scene, "该位置已有标记；可按住左键继续刷过相邻网面。")
             return False
+        self._marked_faces.add(face_key)
         _set_status(
             context.scene,
             f"已标记 {hit['hit_object_name']} 面 {hit['face_index']}；磁吸偏移 {hit['screen_offset_px']:.1f}px。",
         )
         return True
 
+    def _paint_at(self, context, mouse_x, mouse_y, *, dragging=False):
+        x = mouse_x - self._window_region.x
+        y = mouse_y - self._window_region.y
+        if not (0 <= x < self._window_region.width and 0 <= y < self._window_region.height):
+            return False
+        radius = int(context.scene.smrn_magnetic_radius_px)
+        if dragging:
+            # Dragging is a visible-surface brush disc, not a sequence of
+            # single magnetic picks. The cap protects dense vehicle scenes.
+            brush_radius = max(0, min(radius, 24))
+            hits = brush_scene_hits(
+                context, self._window_region, self._region_3d, (x, y), brush_radius
+            )
+        else:
+            hit = magnetic_scene_hit(
+                context, self._window_region, self._region_3d, (x, y), radius
+            )
+            hits = [hit] if hit is not None else []
+        if not hits:
+            if not dragging:
+                _set_status(context.scene, "未找到可见表面；请靠近零件点击或增大刷选覆盖半径。")
+            return False
+        painted_count = sum(
+            1 for hit in hits if self._store_hit(context, hit, dragging=dragging)
+        )
+        if dragging and painted_count > 1:
+            _set_status(context.scene, f"本次刷选覆盖 {painted_count} 个可见网面；已自动跳过重复面。")
+        return painted_count > 0
+
+    def _stroke_spacing(self, context):
+        radius = max(2.0, min(float(context.scene.smrn_magnetic_radius_px), 24.0))
+        return max(4.0, min(7.0, radius * 0.5))
+
     def _paint_segment(self, context, start, end):
         distance = math.hypot(end[0] - start[0], end[1] - start[1])
-        spacing = max(6.0, min(18.0, float(context.scene.smrn_magnetic_radius_px)))
+        spacing = self._stroke_spacing(context)
         steps = max(1, int(math.ceil(distance / spacing)))
         painted = False
         for step in range(1, steps + 1):
@@ -310,6 +335,13 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         self._region_3d = context.space_data.region_3d
         self._painting = False
         self._last_paint_window = None
+        role = TARGET_ROLE if self.mark_value == 1 else EXCLUDE_ROLE
+        summary = document_summary(context.scene)
+        self._marked_faces = {
+            (record.hit_object_name, int(record.face_index))
+            for record in load_all_marks(context.scene, summary["task_id"])
+            if record.role == role
+        }
         self._token = uuid.uuid4().hex
         context.scene[MODAL_TOKEN_KEY] = self._token
         context.window.cursor_modal_set("PAINT_BRUSH")
@@ -338,7 +370,10 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         if event.type == "MOUSEMOVE" and getattr(self, "_painting", False):
             current = (event.mouse_x, event.mouse_y)
             previous = self._last_paint_window or current
-            if math.hypot(current[0] - previous[0], current[1] - previous[1]) >= 6.0:
+            if (
+                math.hypot(current[0] - previous[0], current[1] - previous[1])
+                >= self._stroke_spacing(context)
+            ):
                 self._paint_segment(context, previous, current)
                 self._last_paint_window = current
             return {"RUNNING_MODAL"}

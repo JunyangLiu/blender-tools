@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Semantic Mesh Marker Next",
     "author": "Local developer",
-    "version": (0, 6, 13),
+    "version": (0, 6, 14),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > 语义标记 Next",
     "description": "Non-destructive target and exclude surface marking",
@@ -34,7 +34,8 @@ def register():
         default=False,
     )
     bpy.types.Scene.smrn_magnetic_radius_px = bpy.props.IntProperty(
-        name="磁吸半径",
+        name="刷选覆盖半径",
+        description="拖刷覆盖范围；单击时也作为靠近细小表面的磁吸范围",
         default=12,
         min=0,
         max=80,

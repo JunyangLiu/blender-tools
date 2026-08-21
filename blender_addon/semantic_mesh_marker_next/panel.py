@@ -185,7 +185,7 @@ class SMRN_PT_marking(bpy.types.Panel):
             marking = advanced.column(align=True)
             marking.label(text="标记工具")
             marking.prop(scene, "smrn_marker_size", text="标记显示大小", slider=True)
-            marking.prop(scene, "smrn_magnetic_radius_px", text="磁吸半径", slider=True)
+            marking.prop(scene, "smrn_magnetic_radius_px", text="刷选覆盖半径", slider=True)
 
             rotational_settings = advanced.column(align=True)
             rotational_settings.label(text="圆润拟合")

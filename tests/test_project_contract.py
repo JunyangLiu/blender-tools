@@ -19,10 +19,16 @@ class ProjectContractTests(unittest.TestCase):
 
     def test_marker_supports_continuous_drag_brushing(self):
         operators = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "operators.py").read_text(encoding="utf-8")
+        raycast = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "raycast.py").read_text(encoding="utf-8")
         self.assertIn('event.type == "MOUSEMOVE"', operators)
         self.assertIn("def _paint_segment", operators)
         self.assertIn("self._painting = True", operators)
         self.assertIn("dragging=True", operators)
+        self.assertIn("def brush_scene_hits", raycast)
+        self.assertIn("_brush_disc_offsets(radius_px)", raycast)
+        self.assertIn('hit["hit_object_name"] != anchor_object', raycast)
+        self.assertIn("self._marked_faces", operators)
+        self.assertNotIn("magnetic_radius = min(magnetic_radius, 4)", operators)
 
     def test_legacy_helpers_are_excluded_from_raycast(self):
         scene_state = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "scene_state.py").read_text(encoding="utf-8")
