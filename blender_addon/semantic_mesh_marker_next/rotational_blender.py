@@ -73,13 +73,44 @@ def analyze_scene(scene):
     return fit, source, targets, excludes, {"source": snapshot, "axis_evidence": topology}
 
 
-def _face_components(source, face_indices):
-    """Return connected components without looking beyond the selected faces."""
+def _selected_weld_frame(source, face_indices):
+    """Build scale-derived virtual vertex keys without modifying the source."""
+    vertex_ids = {
+        int(vertex)
+        for face_index in face_indices
+        for vertex in source.data.polygons[int(face_index)].vertices
+    }
+    world = {
+        vertex: np.asarray(tuple(source.matrix_world @ source.data.vertices[vertex].co), dtype=float)
+        for vertex in vertex_ids
+    }
+    lengths = []
+    for face_index in face_indices:
+        for first, second in source.data.polygons[int(face_index)].edge_keys:
+            lengths.append(float(np.linalg.norm(world[first] - world[second])))
+    typical = float(np.median([value for value in lengths if value > 1.0e-10]))
+    tolerance = max(1.0e-7, typical * 1.0e-5)
+    keys = {
+        vertex: tuple(int(round(value / tolerance)) for value in point)
+        for vertex, point in world.items()
+    }
+    points = defaultdict(list)
+    for vertex, key in keys.items():
+        points[key].append(world[vertex])
+    key_points = {key: np.mean(rows, axis=0) for key, rows in points.items()}
+    return keys, key_points, tolerance, len(vertex_ids) - len(key_points)
+
+
+def _face_components(source, face_indices, vertex_keys=None):
+    """Return selected-face components, virtually welding coincident seams."""
     selected = {int(index) for index in face_indices}
+    if vertex_keys is None:
+        vertex_keys, _points, _tolerance, _collapsed = _selected_weld_frame(source, selected)
     edge_faces = defaultdict(list)
     for face_index in selected:
         for edge in source.data.polygons[face_index].edge_keys:
-            edge_faces[tuple(sorted(edge))].append(face_index)
+            key = tuple(sorted((vertex_keys[edge[0]], vertex_keys[edge[1]])))
+            edge_faces[key].append(face_index)
     neighbors = defaultdict(set)
     for linked in edge_faces.values():
         if len(linked) == 2:
@@ -158,12 +189,13 @@ def _ordered_boundary_component(edges):
     return ordered
 
 
-def _boundary_ring_vertex_chains(source, face_indices):
+def _boundary_ring_vertex_chains(source, face_indices, vertex_keys, key_points):
     """Extract two circumferential chains from only the marked face strip."""
     edge_counts = defaultdict(int)
     for face_index in face_indices:
         for edge in source.data.polygons[face_index].edge_keys:
-            edge_counts[tuple(sorted(edge))] += 1
+            key = tuple(sorted((vertex_keys[edge[0]], vertex_keys[edge[1]])))
+            edge_counts[key] += 1
     boundary = {edge for edge, count in edge_counts.items() if count == 1}
     if len(boundary) < 8:
         raise ValueError("至少需要两条各含 4 个点的圆周边界")
@@ -193,9 +225,8 @@ def _boundary_ring_vertex_chains(source, face_indices):
     if len(groups) == 1:
         lengths = []
         for edge in boundary:
-            first = source.matrix_world @ source.data.vertices[edge[0]].co
-            second = source.matrix_world @ source.data.vertices[edge[1]].co
-            lengths.append(((second - first).length, edge))
+            first, second = key_points[edge[0]], key_points[edge[1]]
+            lengths.append((float(np.linalg.norm(second - first)), edge))
         lengths.sort(reverse=True)
         typical = float(np.median([value for value, _edge in lengths]))
         if len(lengths) < 4 or lengths[1][0] < max(typical * 1.45, lengths[2][0] * 1.35):
@@ -207,21 +238,88 @@ def _boundary_ring_vertex_chains(source, face_indices):
     ordered = [_ordered_boundary_component(group) for group in groups]
     if min(len(chain) for chain in ordered) < 4:
         raise ValueError("每条圆周边界至少需要 4 个源顶点")
-    return ordered, separator_edges, len(boundary)
+    rings = [[tuple(float(value) for value in key_points[key]) for key in chain] for chain in ordered]
+    return rings, separator_edges, len(boundary)
+
+
+def _broad_arc_island_rings(key_points):
+    """Recover two rings from disconnected islands only with broad arc evidence."""
+    points = np.asarray(tuple(key_points.values()), dtype=float)
+    if len(points) < 8:
+        raise ValueError("断续绿色面至少需要 8 个唯一空间顶点")
+    center = np.mean(points, axis=0)
+    centered = points - center
+    values, vectors = np.linalg.eigh(centered.T @ centered / len(points))
+    if values[1] / max(values[0], 1.0e-12) < 12.0:
+        raise ValueError("断续标记没有形成两层稳定圆周，已拒绝猜测轴线")
+    axis = vectors[:, 0]
+    axial = centered @ axis
+
+    cluster_centers = np.asarray((float(np.min(axial)), float(np.max(axial))))
+    labels = np.zeros(len(points), dtype=int)
+    for _iteration in range(16):
+        labels = np.argmin(np.abs(axial[:, None] - cluster_centers[None, :]), axis=1)
+        if len(set(labels.tolist())) != 2:
+            raise ValueError("无法把断续标记分成上下两层圆周")
+        updated = np.asarray([float(np.mean(axial[labels == index])) for index in range(2)])
+        if np.max(np.abs(updated - cluster_centers)) <= 1.0e-10:
+            break
+        cluster_centers = updated
+    separation = abs(float(cluster_centers[1] - cluster_centers[0]))
+    scatter = float(np.quantile(np.abs(axial - cluster_centers[labels]), 0.90))
+    if separation <= 1.0e-8 or scatter > separation * 0.10:
+        raise ValueError("断续标记的上下圆周层不够平直，不能安全合并")
+
+    axis /= max(float(np.linalg.norm(axis)), 1.0e-12)
+    helper = np.asarray((1.0, 0.0, 0.0))
+    if abs(float(helper @ axis)) > 0.85:
+        helper = np.asarray((0.0, 0.0, 1.0))
+    basis_x = np.cross(axis, helper)
+    basis_x /= max(float(np.linalg.norm(basis_x)), 1.0e-12)
+    basis_y = np.cross(axis, basis_x)
+
+    rings = []
+    spans = []
+    for index in range(2):
+        rows = points[labels == index]
+        if len(rows) < 4:
+            raise ValueError("每层断续圆周至少需要 4 个唯一顶点")
+        relative = rows - center
+        angles = np.mod(np.arctan2(relative @ basis_y, relative @ basis_x), 2.0 * math.pi)
+        order = np.argsort(angles)
+        ordered_angles = angles[order]
+        gaps = np.diff(np.r_[ordered_angles, ordered_angles[0] + 2.0 * math.pi])
+        span = float(2.0 * math.pi - np.max(gaps))
+        if span < math.radians(160.0):
+            raise ValueError("断续标记圆周跨度不足 160°，请补充两侧绿色面")
+        rings.append([tuple(float(value) for value in row) for row in rows[order]])
+        spans.append(math.degrees(span))
+    return rings, {
+        "method": "broad_arc_two_plane_island_merge",
+        "pca_values": [float(value) for value in values],
+        "ring_plane_separation": separation,
+        "ring_plane_scatter_p90": scatter,
+        "ring_angular_spans_degrees": spans,
+    }
 
 
 def _fit_marked_face_strip(source, face_indices):
     indices = {int(index) for index in face_indices}
     if len(indices) < 4:
         raise ValueError("至少需要 4 个实际源面，重复刷点不会增加轴线证据")
-    components = _face_components(source, indices)
-    if len(components) != 1:
-        raise ValueError("绿色标记必须属于一个连续的圆柱或圆锥侧面")
-    chains, separators, boundary_count = _boundary_ring_vertex_chains(source, indices)
-    rings = [
-        [tuple(source.matrix_world @ source.data.vertices[index].co) for index in chain]
-        for chain in chains
-    ]
+    vertex_keys, key_points, weld_tolerance, collapsed_vertices = _selected_weld_frame(
+        source, indices
+    )
+    components = _face_components(source, indices, vertex_keys=vertex_keys)
+    if len(components) == 1:
+        rings, separators, boundary_count = _boundary_ring_vertex_chains(
+            source, indices, vertex_keys, key_points
+        )
+        island_evidence = {"method": "two_source_boundary_rings"}
+    else:
+        rings, island_evidence = _broad_arc_island_rings(key_points)
+        separators = set()
+        boundary_count = 0
     points, normals = [], []
     for face_index in sorted(indices):
         polygon = source.data.polygons[face_index]
@@ -229,9 +327,14 @@ def _fit_marked_face_strip(source, face_indices):
         normals.append(tuple(_world_normal(source, polygon.normal)))
     fit = fit_rotational_boundary_rings(rings[0], rings[1], points, normals)
     evidence = {
-        "method": "two_source_boundary_rings",
+        **island_evidence,
         "unique_mark_faces": len(indices),
-        "ring_vertex_counts": [len(chain) for chain in chains],
+        "source_face_islands": len(components),
+        "island_merge_applied": len(components) > 1,
+        "ring_vertex_counts": [len(ring) for ring in rings],
+        "virtual_weld_tolerance": weld_tolerance,
+        "coincident_vertices_collapsed": collapsed_vertices,
+        "source_mesh_modified": False,
         "boundary_edges": boundary_count,
         "axial_separator_edges": len(separators),
         "whole_vehicle_search": False,

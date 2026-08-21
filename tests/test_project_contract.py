@@ -74,6 +74,16 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("radius * 0.005", auto_thickness)
         self.assertNotIn("radius * 0.08", auto_thickness)
 
+    def test_disconnected_rotational_marks_require_local_geometric_proof(self):
+        adapter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "rotational_blender.py").read_text(encoding="utf-8")
+        self.assertIn("def _selected_weld_frame", adapter)
+        self.assertIn("typical * 1.0e-5", adapter)
+        self.assertIn("def _broad_arc_island_rings", adapter)
+        self.assertIn("span < math.radians(160.0)", adapter)
+        self.assertIn('"method": "broad_arc_two_plane_island_merge"', adapter)
+        self.assertIn('"source_mesh_modified": False', adapter)
+        self.assertIn('"whole_vehicle_search": False', adapter)
+
     def test_rotational_selection_rebuild_is_exact_and_local(self):
         adapter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "rotational_blender.py").read_text(encoding="utf-8")
         operators = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "operators.py").read_text(encoding="utf-8")
