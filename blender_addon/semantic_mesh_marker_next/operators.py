@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime, timezone
 
 import bpy
+import bmesh
 
 from .constants import (
     EXCLUDE_COLOR,
@@ -18,7 +19,13 @@ from .raycast import magnetic_scene_hit
 from .records import MarkRecord
 from .anchors import enrich_hit_anchor, source_snapshot
 from .storage import append_mark, clear_task_marks, document_summary, next_id, pop_last_mark, set_active_source
-from .rotational_blender import analyze_scene, build_scene_candidate, remove_last_candidate, store_analysis
+from .rotational_blender import (
+    analyze_scene,
+    build_scene_candidate,
+    build_selected_scene_candidate,
+    remove_last_candidate,
+    store_analysis,
+)
 from .handle_blender import (
     adjust_candidate_thickness,
     analyze_scene as analyze_handle_scene,
@@ -42,6 +49,38 @@ from .scene_state import (
 
 def _set_status(scene, text):
     scene.smrn_status = text
+
+
+def _selected_rotational_faces(context):
+    """Read exact edit-mode selection; return None outside mesh edit mode."""
+    if context.mode != "EDIT_MESH" or context.edit_object is None:
+        return None
+    source = context.edit_object
+    configured = bpy.data.objects.get(str(context.scene.get("smrn_source_name", "")))
+    if configured is not source:
+        raise ValueError("请在当前语义源上进入编辑模式并选择侧面")
+    mesh = bmesh.from_edit_mesh(source.data)
+    mesh.faces.ensure_lookup_table()
+    indices = {face.index for face in mesh.faces if face.select and not face.hide}
+    if len(indices) < 4:
+        raise ValueError("至少选择 4 个连续侧面；不要选择端盖、台阶或其他零件")
+    return source, indices
+
+
+def _restore_edit_selection(context, source, face_indices):
+    """Recover the user's exact face selection after a rejected build."""
+    try:
+        context.view_layer.objects.active = source
+        source.select_set(True)
+        bpy.ops.object.mode_set(mode="EDIT")
+        mesh = bmesh.from_edit_mesh(source.data)
+        mesh.faces.ensure_lookup_table()
+        selected = set(face_indices)
+        for face in mesh.faces:
+            face.select = face.index in selected
+        bmesh.update_edit_mesh(source.data, loop_triangles=False, destructive=False)
+    except (AttributeError, ReferenceError, RuntimeError):
+        pass
 
 
 def _restore_normal_selection(context, source=None):
@@ -419,18 +458,31 @@ class SMRN_OT_analyze_rotational(bpy.types.Operator):
 class SMRN_OT_build_rotational_candidate(bpy.types.Operator):
     bl_idname = "smrn.build_rotational_candidate"
     bl_label = "生成圆润候选"
-    bl_description = "通过拟合与质量门槛后生成独立封闭候选；源网格保持不变"
+    bl_description = "编辑模式优先使用选中侧面；否则使用绿色标记。只生成独立候选，源网格保持不变"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
+        selected = None
         try:
-            candidate, report = build_scene_candidate(context.scene)
+            selected = _selected_rotational_faces(context)
+            if selected is None:
+                candidate, report = build_scene_candidate(context.scene)
+            else:
+                source, face_indices = selected
+                bpy.ops.object.mode_set(mode="OBJECT")
+                candidate, report = build_selected_scene_candidate(
+                    context.scene, source, face_indices
+                )
         except (ValueError, RuntimeError) as error:
+            if selected is not None:
+                _restore_edit_selection(context, selected[0], selected[1])
             self.report({"ERROR"}, str(error))
             _set_status(context.scene, f"候选生成失败：{error}")
             return {"CANCELLED"}
         store_analysis(context.scene, report)
         if candidate is None:
+            if selected is not None:
+                _restore_edit_selection(context, selected[0], selected[1])
             reason = report.get("reason", "质量门槛未通过")
             context.scene.smrn_rotational_summary = f"已拒绝：{reason}"
             _set_status(context.scene, context.scene.smrn_rotational_summary)
@@ -441,6 +493,11 @@ class SMRN_OT_build_rotational_candidate(bpy.types.Operator):
             f"候选 {candidate.name} · {fit['profile_kind']} · "
             f"覆盖 {report['coverage_qa']['samples']} 点 · 拓扑封闭"
         )
+        for obj in tuple(context.selected_objects):
+            obj.select_set(False)
+        candidate.select_set(True)
+        context.view_layer.objects.active = candidate
+        keep_model_visible(context.scene, (candidate, selected[0] if selected else None))
         _set_status(context.scene, context.scene.smrn_rotational_summary)
         return {"FINISHED"}
 
@@ -562,9 +619,14 @@ class SMRN_OT_confirm_candidate(bpy.types.Operator):
             return {"CANCELLED"}
         try:
             accepted = _accept_candidate(context.scene, self.candidate_kind)
-            removed = clear_task_marks(context.scene)
-            for record in removed:
-                remove_overlay(record.overlay_object_name)
+            selected_input = (
+                self.candidate_kind == "rotational"
+                and str(accepted.get("smrn_input_mode", "")) == "selected_faces"
+            )
+            removed = [] if selected_input else clear_task_marks(context.scene)
+            if not selected_input:
+                for record in removed:
+                    remove_overlay(record.overlay_object_name)
             keep_model_visible(context.scene, (accepted,))
             bpy.ops.wm.save_mainfile()
         except (ValueError, RuntimeError) as error:
@@ -573,7 +635,11 @@ class SMRN_OT_confirm_candidate(bpy.types.Operator):
             return {"CANCELLED"}
         context.scene.smrn_handle_summary = "尚未分析本轮扶手标记"
         context.scene.smrn_rotational_summary = "尚未分析本轮标记"
-        _set_status(context.scene, f"已确认 {accepted.name}，清除本轮 {len(removed)} 个标记，可以开始下一次生成")
+        if selected_input:
+            message = f"已确认 {accepted.name}；只消费选中面，现有语义标记保持不变"
+        else:
+            message = f"已确认 {accepted.name}，清除本轮 {len(removed)} 个标记，可以开始下一次生成"
+        _set_status(context.scene, message)
         return {"FINISHED"}
 
 

@@ -9,6 +9,11 @@ def _candidate_exists(scene, key, prefix):
     return bool(name.startswith(prefix) and bpy.data.objects.get(name) is not None)
 
 
+def _candidate_input_mode(scene, key):
+    candidate = bpy.data.objects.get(str(scene.get(key, "")))
+    return str(candidate.get("smrn_input_mode", "")) if candidate is not None else ""
+
+
 class SMRN_PT_marking(bpy.types.Panel):
     bl_label = "语义标记 Next"
     bl_idname = "SMRN_PT_marking"
@@ -53,14 +58,21 @@ class SMRN_PT_marking(bpy.types.Panel):
 
         rotational = layout.box()
         rotational.label(text="2. 圆柱 / 圆锥圆润", icon="MOD_SCREW")
-        rotational.label(text="绿色标记需要圆润的表面")
+        rotational.label(text="编辑模式选中侧面；未选面时使用绿色标记")
         rotational.operator(
             "smrn.build_rotational_candidate",
-            text="一键生成圆润候选",
+            text="一键圆润选中表面",
             icon="MESH_CYLINDER",
         )
         if _candidate_exists(scene, "smrn_rotational_candidate_name", "SMRN_ROTATIONAL_CANDIDATE_"):
-            confirm = rotational.operator("smrn.confirm_candidate", text="确认并清除标记", icon="CHECKMARK")
+            selected_input = _candidate_input_mode(
+                scene, "smrn_rotational_candidate_name"
+            ) == "selected_faces"
+            confirm = rotational.operator(
+                "smrn.confirm_candidate",
+                text=("确认选面圆润（保留标记）" if selected_input else "确认并清除标记"),
+                icon="CHECKMARK",
+            )
             confirm.candidate_kind = "rotational"
             rotational.operator("smrn.remove_rotational_candidate", text="移除当前圆润候选", icon="TRASH")
 

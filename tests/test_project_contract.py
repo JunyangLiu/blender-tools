@@ -46,7 +46,7 @@ class ProjectContractTests(unittest.TestCase):
     def test_panel_defaults_to_one_click_workflow(self):
         panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
         addon = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn('text="一键生成圆润候选"', panel)
+        self.assertIn('text="一键圆润选中表面"', panel)
         self.assertIn('text="一键生成扶手候选"', panel)
         self.assertIn("if scene.smrn_show_advanced:", panel)
         self.assertIn('bpy.types.Scene.smrn_show_advanced = bpy.props.BoolProperty(', addon)
@@ -73,6 +73,22 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("feature_scale * 0.01", auto_thickness)
         self.assertIn("radius * 0.005", auto_thickness)
         self.assertNotIn("radius * 0.08", auto_thickness)
+
+    def test_rotational_selection_rebuild_is_exact_and_local(self):
+        adapter = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "rotational_blender.py").read_text(encoding="utf-8")
+        operators = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "operators.py").read_text(encoding="utf-8")
+        panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
+        self.assertIn("def build_selected_scene_candidate", adapter)
+        self.assertIn('"selection_method": "exact_edit_mode_faces"', adapter)
+        self.assertIn('"expanded_faces": 0', adapter)
+        self.assertIn('"whole_vehicle_search": False', adapter)
+        self.assertIn('"scope": ("exact_selected_faces_only"', adapter)
+        self.assertIn("def _selected_rotational_faces", operators)
+        self.assertIn("bmesh.from_edit_mesh", operators)
+        self.assertIn("build_selected_scene_candidate", operators)
+        self.assertIn("现有语义标记保持不变", operators)
+        self.assertIn('text="一键圆润选中表面"', panel)
+        self.assertIn('"确认选面圆润（保留标记）"', panel)
 
     def test_visibility_guard_only_reveals_authoritative_objects(self):
         scene_state = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "scene_state.py").read_text(encoding="utf-8")

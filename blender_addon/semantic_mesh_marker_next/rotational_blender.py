@@ -73,6 +73,66 @@ def analyze_scene(scene):
     return fit, source, targets, excludes, {"source": snapshot}
 
 
+def _face_components(source, face_indices):
+    """Return connected components without looking beyond the selected faces."""
+    selected = {int(index) for index in face_indices}
+    edge_faces = defaultdict(list)
+    for face_index in selected:
+        for edge in source.data.polygons[face_index].edge_keys:
+            edge_faces[tuple(sorted(edge))].append(face_index)
+    neighbors = defaultdict(set)
+    for linked in edge_faces.values():
+        if len(linked) == 2:
+            first, second = linked
+            neighbors[first].add(second)
+            neighbors[second].add(first)
+    remaining = set(selected)
+    components = []
+    while remaining:
+        seed = remaining.pop()
+        component = {seed}
+        queue = deque((seed,))
+        while queue:
+            current = queue.popleft()
+            for other in neighbors[current] & remaining:
+                remaining.remove(other)
+                component.add(other)
+                queue.append(other)
+        components.append(component)
+    return components
+
+
+def analyze_selected_faces(source, face_indices):
+    """Fit only the explicitly selected side faces of the current source."""
+    if source is None or source.type != "MESH":
+        raise ValueError("请在当前语义源的编辑模式中选中圆柱或圆锥侧面")
+    indices = {int(index) for index in face_indices}
+    if any(index < 0 or index >= len(source.data.polygons) for index in indices):
+        raise ValueError("选中面索引已失效，请重新选择")
+    if len(indices) < 4:
+        raise ValueError("至少选择 4 个连续侧面；不要选择端盖、台阶或其他零件")
+    components = _face_components(source, indices)
+    if len(components) != 1:
+        raise ValueError("选中面必须属于一个连续曲面；请分别处理不同零件")
+    points = []
+    normals = []
+    for face_index in sorted(indices):
+        polygon = source.data.polygons[face_index]
+        points.append(tuple(source.matrix_world @ polygon.center))
+        normals.append(tuple(_world_normal(source, polygon.normal)))
+    fit = fit_rotational_surface(points, normals)
+    return fit, {
+        "source": source_snapshot(source),
+        "selection_qa": {
+            "selection_method": "exact_edit_mode_faces",
+            "selected_faces": len(indices),
+            "connected_components": len(components),
+            "whole_vehicle_search": False,
+            "passed": len(components) == 1,
+        },
+    }
+
+
 def _fit_frame(fit):
     return (
         np.asarray(fit.axis_origin, dtype=float),
@@ -196,7 +256,8 @@ def _marked_face_vertices(source, targets, face_indices=None):
 
 def _expanded_domain(fit, source, targets, face_indices=None):
     points = _marked_face_vertices(source, targets, face_indices)
-    points.extend(tuple(_current_anchor(item, source)[0]) for item in targets)
+    if targets:
+        points.extend(tuple(_current_anchor(item, source)[0]) for item in targets)
     axial, radius, angle = _coordinates(points, fit)
     axial_min, axial_max = float(np.min(axial)), float(np.max(axial))
     ordered = np.sort(np.mod(angle, 2.0 * math.pi))
@@ -416,14 +477,13 @@ def _commit_candidate(scene, obj):
     scene[key] = obj.name
 
 
-def build_scene_candidate(scene):
-    fit, source, targets, excludes, context_report = analyze_scene(scene)
-    report = {"fit": fit.to_dict(), **context_report}
+def _build_candidate(scene, fit, source, targets, excludes, context_report,
+                     surface_faces, expansion, input_mode):
+    report = {"fit": fit.to_dict(), "input_mode": input_mode, **context_report}
     if fit.status != "candidate_ready" or source is None:
         report["status"] = "rejected"
         report["reason"] = fit.reason
         return None, report
-    surface_faces, expansion = _semantic_rotational_faces(fit, source, targets)
     axial_min, axial_max, angle_start, angle_span, fitted_clearance, _points = _expanded_domain(
         fit, source, targets, surface_faces
     )
@@ -455,7 +515,12 @@ def build_scene_candidate(scene):
                                      else "partial_arc"),
                    "clearance": clearance, "thickness": thickness,
                    "segments": segments},
-        "coverage_qa": coverage, "exclude_qa": excludes_report,
+        "coverage_qa": {
+            **coverage,
+            "scope": ("exact_selected_faces_only" if input_mode == "selected_faces"
+                      else "semantic_mark_surface"),
+            "whole_vehicle_search": False,
+        }, "exclude_qa": excludes_report,
         "topology_qa": topology,
     })
     if not (coverage["passed"] and excludes_report["passed"] and topology["passed"]):
@@ -477,10 +542,50 @@ def build_scene_candidate(scene):
     obj.show_all_edges = True
     obj["smrn_candidate_only"] = True
     obj["smrn_source_name"] = source.name
+    obj["smrn_input_mode"] = input_mode
+    report["source_unchanged"] = (
+        source_snapshot(source)["fingerprint"] == context_report["source"]["fingerprint"]
+    )
+    if not report["source_unchanged"]:
+        _remove_candidate_object(obj)
+        report["status"] = "rejected"
+        report["reason"] = "源网格在生成候选期间发生变化"
+        return None, report
     obj["smrn_rotational_report_json"] = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
     _commit_candidate(scene, obj)
     scene["smrn_rotational_last_report_json"] = obj["smrn_rotational_report_json"]
     return obj, report
+
+
+def build_scene_candidate(scene):
+    """Compatibility path: expand green marks across the matching surface."""
+    fit, source, targets, excludes, context_report = analyze_scene(scene)
+    if fit.status != "candidate_ready" or source is None:
+        return _build_candidate(
+            scene, fit, source, targets, excludes, context_report, set(), {}, "semantic_marks"
+        )
+    surface_faces, expansion = _semantic_rotational_faces(fit, source, targets)
+    return _build_candidate(
+        scene, fit, source, targets, excludes, context_report,
+        surface_faces, expansion, "semantic_marks",
+    )
+
+
+def build_selected_scene_candidate(scene, source, face_indices):
+    """Rebuild exactly one selected rotational patch; never scan or grow over the vehicle."""
+    selected = {int(index) for index in face_indices}
+    fit, context_report = analyze_selected_faces(source, selected)
+    expansion = {
+        "selection_method": "exact_edit_mode_faces",
+        "seed_faces": len(selected),
+        "surface_faces": len(selected),
+        "expanded_faces": 0,
+        "whole_vehicle_search": False,
+    }
+    return _build_candidate(
+        scene, fit, source, (), (), context_report,
+        selected, expansion, "selected_faces",
+    )
 
 
 def store_analysis(scene, report):
