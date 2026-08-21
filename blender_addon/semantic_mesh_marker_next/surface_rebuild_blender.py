@@ -997,15 +997,16 @@ def _rebuild_working_mesh(
     cuts = (
         _canvas_subdivision_cuts(len(selected_indices))
         if mode in {"canvas", "canvas_physics"}
-        else (2 ** max(1, min(2, int(level)))) - 1
+        else (0 if mode == "flatten" else (2 ** max(1, min(2, int(level)))) - 1)
     )
-    bmesh.ops.subdivide_edges(
-        bm,
-        edges=list(selected_edges),
-        cuts=cuts,
-        use_grid_fill=True,
-        use_smooth_even=True,
-    )
+    if cuts > 0:
+        bmesh.ops.subdivide_edges(
+            bm,
+            edges=list(selected_edges),
+            cuts=cuts,
+            use_grid_fill=True,
+            use_smooth_even=True,
+        )
     bm.faces.ensure_lookup_table()
     bm.verts.ensure_lookup_table()
     region_faces = [face for face in bm.faces if int(face[region_layer]) == 1]
@@ -1014,19 +1015,10 @@ def _rebuild_working_mesh(
         _remove_object(working)
         raise RuntimeError("细分后未能保留局部区域标签")
 
-    if mode == "flatten":
-        # Work with explicit triangles while solving planarity.  A warped quad
-        # has an ambiguous display normal and was the source of false-looking
-        # folds in the old preview; BEAUTY chooses the shorter, safer diagonal.
-        bmesh.ops.triangulate(
-            bm,
-            faces=region_faces,
-            quad_method="BEAUTY",
-            ngon_method="BEAUTY",
-        )
-        bm.faces.ensure_lookup_table()
-        bm.verts.ensure_lookup_table()
-        region_faces = [face for face in bm.faces if int(face[region_layer]) == 1]
+    # Exact flattening does not need subdivision or triangulation.  Keeping the
+    # source face graph avoids manufacturing another population of long thin
+    # triangles; once every ROI vertex is coplanar, quads have unambiguous
+    # geometry and shade cleanly.
 
     region_vertices = {vertex for face in region_faces for vertex in face.verts}
     region_face_set = set(region_faces)
@@ -1051,6 +1043,14 @@ def _rebuild_working_mesh(
             for first, second in locked_segments
         )
     }
+    if mode == "flatten":
+        # "Flatten" is an exact geometric operation.  The former safe-smooth
+        # implementation locked every boundary/shared vertex, which left a
+        # visibly planar interior surrounded by real height ridges.  Rebuild
+        # the complete green ROI instead; neighbouring faces are only checked
+        # as a transition ring and are never searched or selected globally.
+        locked_vertices = set()
+        locked_region_edges = set()
     canvas_facet_edges = _canvas_facet_edge_samples(
         region_faces,
         canvas_facet_segments,
@@ -1153,6 +1153,132 @@ def _rebuild_working_mesh(
             "passed": progress_passed,
         }
     elif mode == "flatten" and movable:
+        orientation = Vector((0.0, 0.0, 0.0))
+        for face in region_faces:
+            orientation += face.normal
+        plane_center, plane_normal, before_distances = _best_fit_plane(
+            region_vertices,
+            normal_hint=normal_hint,
+            height_mode=height_mode,
+            orientation_hint=orientation if orientation.length_squared else None,
+            height_reference_points=height_reference_points,
+        )
+        qa_faces = {
+            face for vertex in region_vertices for face in vertex.link_faces
+        }
+        transition_faces = qa_faces - set(region_faces)
+        minimum_qa_area = max(local_scale * local_scale * 1.0e-10, 1.0e-18)
+        ignored_preexisting_tiny_faces = sum(
+            1 for face in transition_faces if float(face.calc_area()) <= minimum_qa_area
+        )
+        before_face_geometry = {
+            face: (face.normal.copy(), float(face.calc_area()))
+            for face in transition_faces
+            if float(face.calc_area()) > minimum_qa_area
+        }
+        projected_targets = {}
+        for vertex in region_vertices:
+            signed_distance = float((vertex.co - plane_center).dot(plane_normal))
+            projected_targets[vertex] = vertex.co - plane_normal * signed_distance
+        full_displacements = [
+            (projected_targets[vertex] - before_coordinates[vertex]).length
+            for vertex in movable
+        ]
+        tangential_extent = max(
+            ((vertex.co - plane_center).length for vertex in region_vertices),
+            default=local_scale,
+        )
+        max_allowed = max(local_scale * 4.0, tangential_extent * 0.03)
+        full_maximum = max(full_displacements, default=0.0)
+        if full_maximum > max_allowed + 1.0e-12:
+            bm.free()
+            _remove_object(working)
+            raise ValueError(
+                "绿色平整区域的高度跨度过大，无法判定为同一平面；请缩小到一个连续板面"
+            )
+        for vertex, target in projected_targets.items():
+            vertex.co = target
+        bm.normal_update()
+        # The old ridge sidewalls legitimately collapse toward the plane.  A
+        # before/after area-ratio gate would misclassify that intended removal
+        # of height as damage.  Reorient the now-coplanar green patch and gate
+        # it by absolute numerical area; keep the stricter ratio/flip checks
+        # for the unmarked transition faces only.
+        bmesh.ops.recalc_face_normals(bm, faces=region_faces)
+        bm.normal_update()
+        for face in region_faces:
+            if face.normal.length_squared and face.normal.dot(plane_normal) <= 0.0:
+                face.normal_flip()
+        bm.normal_update()
+        after_distances = np.asarray([
+            float((vertex.co - plane_center).dot(plane_normal))
+            for vertex in region_vertices
+        ])
+        before_rms = float(np.sqrt(np.mean(np.square(before_distances))))
+        after_rms = float(np.sqrt(np.mean(np.square(after_distances))))
+        after_max_abs = max((abs(value) for value in after_distances), default=0.0)
+        coordinate_magnitude = max(
+            (abs(value) for vertex in region_vertices for value in vertex.co),
+            default=1.0,
+        )
+        exact_tolerance = max(
+            1.0e-8,
+            local_scale * 1.0e-6,
+            coordinate_magnitude * 1.0e-7,
+        )
+        absolute_degenerate_region_faces = sum(
+            1 for face in region_faces if float(face.calc_area()) <= minimum_qa_area
+        )
+        reversed_region_faces = sum(
+            1 for face in region_faces
+            if face.normal.length_squared and face.normal.dot(plane_normal) <= 0.0
+        )
+        flatten_projection_fraction = 1.0
+        flatten_progress_passed = (
+            after_rms <= exact_tolerance
+            and after_max_abs <= exact_tolerance
+            and absolute_degenerate_region_faces == 0
+            and reversed_region_faces == 0
+        )
+        flatten_safety_attempts = [{
+            "fraction": 1.0,
+            "scope": "all_green_region_vertices",
+            "transition_faces_checked": len(qa_faces - set(region_faces)),
+        }]
+        planarity = {
+            "method": "strict_single_plane_full_green_projection_v3",
+            "progress_metric_scope": "all_green_region_vertices",
+            "component_count": len(_region_face_components(region_faces, set())),
+            "fitted_component_count": 1,
+            "preserved_component_count": 0,
+            "preserved_components": [],
+            "preserved_faces": 0,
+            "preserved_movable_vertices": 0,
+            "preservation_policy": "none_exact_flatten_requested",
+            "before_rms": before_rms,
+            "after_rms": after_rms,
+            "after_max_abs": after_max_abs,
+            "exact_tolerance": exact_tolerance,
+            "exact_planarity_passed": bool(
+                after_rms <= exact_tolerance and after_max_abs <= exact_tolerance
+            ),
+            "absolute_degenerate_region_faces": absolute_degenerate_region_faces,
+            "reversed_region_faces": reversed_region_faces,
+            "plane_center_local": list(plane_center),
+            "plane_normal_local": list(plane_normal),
+            "height_mode": height_mode,
+            "normal_mode": normal_mode,
+            "projected_vertices": len(region_vertices),
+            "shared_transition_vertices_projected": sum(
+                1 for vertex in region_vertices
+                if any(face not in region_face_set for face in vertex.link_faces)
+            ),
+            "transition_faces_checked": len(transition_faces),
+            "projection_fraction": 1.0,
+            "full_projection_max_displacement": full_maximum,
+            "component_safety_passed": flatten_progress_passed,
+        }
+    elif mode == "__legacy_flatten" and movable:
         components = _region_face_components(region_faces, locked_region_edges)
         component_reports = []
         preserved_component_reports = []
@@ -1642,12 +1768,27 @@ def _rebuild_working_mesh(
     bm.normal_update()
     flipped_faces = 0
     degenerate_faces = 0
+    flipped_face_details = []
+    degenerate_face_details = []
     for face, (before_normal, before_area) in before_face_geometry.items():
         after_area = float(face.calc_area())
         if after_area <= before_area * 0.05:
             degenerate_faces += 1
+            degenerate_face_details.append({
+                "face_index": int(face.index),
+                "in_green_region": face in region_face_set,
+                "before_area": before_area,
+                "after_area": after_area,
+            })
         if before_normal.length_squared and face.normal.length_squared and before_normal.dot(face.normal) <= 0.0:
             flipped_faces += 1
+            flipped_face_details.append({
+                "face_index": int(face.index),
+                "in_green_region": face in region_face_set,
+                "normal_dot": float(before_normal.dot(face.normal)),
+                "before_area": before_area,
+                "after_area": after_area,
+            })
     after_p95 = _percentile(_edge_dihedrals(matched_dihedral_edges), 0.95)
     dihedral_comparable = bool(matched_dihedral_edges)
     after_topology = _topology_signature(bm)
@@ -1682,9 +1823,10 @@ def _rebuild_working_mesh(
             (max(moved) if moved else 0.0) <= max_allowed + 1.0e-12
         )
     if planarity is not None:
-        # Flatten QA is intentionally component-scoped.  Mixing the edge
-        # populations of disconnected strips recreates the old failure mode
-        # where one weak island vetoes a valid main patch.
+        # Exact flatten is evaluated against one common plane for every vertex
+        # belonging to the explicitly green region.  Transition faces are the
+        # only unmarked faces inspected, solely to prove that the local edit did
+        # not invert or collapse their topology.
         quality_gates["matched_dihedral_within_limit"] = bool(
             planarity.get("component_safety_passed")
         )
@@ -1695,6 +1837,12 @@ def _rebuild_working_mesh(
             (max(moved) if moved else 0.0) <= max_allowed
         )
         quality_gates["flatten_progress_sufficient"] = flatten_progress_passed
+        quality_gates["all_vertices_coplanar"] = bool(
+            planarity.get("exact_planarity_passed")
+        )
+        quality_gates["transition_topology_preserved"] = bool(
+            flipped_faces == 0 and degenerate_faces == 0
+        )
     if canvas_wave is not None:
         quality_gates["canvas_source_proximity"] = (
             (max(moved) if moved else 0.0) <= max_allowed + 1.0e-12
@@ -1741,6 +1889,13 @@ def _rebuild_working_mesh(
     bm.to_mesh(working.data)
     working.data.update(calc_edges=True)
     bm.free()
+    if mode == "flatten" and planarity is not None:
+        _apply_planar_custom_normals(
+            working.data,
+            Vector(planarity["plane_normal_local"]),
+            region_attribute_name="smrn_rebuild_region",
+        )
+        planarity["custom_planar_normals_applied"] = True
     report = {
         "selected_faces_before": len(selected_indices),
         "region_faces_after": len(region_faces),
@@ -1765,7 +1920,9 @@ def _rebuild_working_mesh(
         "flatten_progress_passed": flatten_progress_passed if mode == "flatten" else None,
         "flatten_safety_attempts": flatten_safety_attempts if mode == "flatten" else None,
         "flipped_faces": flipped_faces,
+        "flipped_face_details": flipped_face_details,
         "degenerate_faces": degenerate_faces,
+        "degenerate_face_details": degenerate_face_details,
         "ignored_preexisting_tiny_faces": ignored_preexisting_tiny_faces,
         "locked_boundary_or_feature_vertices": len(locked_vertices),
         "strict_marked_scope": True,
@@ -1789,13 +1946,40 @@ def _rebuild_working_mesh(
     return working, preview_vertices, preview_faces, report
 
 
-def _preview_object(scene, source, vertices, faces, smooth_preview=True):
+def _apply_planar_custom_normals(mesh, plane_normal, region_attribute_name=None):
+    normal = Vector(plane_normal).normalized()
+    if not hasattr(mesh, "normals_split_custom_set"):
+        return False
+    mesh.update()
+    loop_normals = [loop.normal.copy() for loop in mesh.loops]
+    region_attribute = (
+        mesh.attributes.get(region_attribute_name) if region_attribute_name else None
+    )
+    for polygon in mesh.polygons:
+        if (
+            region_attribute is not None
+            and int(region_attribute.data[polygon.index].value) != 1
+        ):
+            continue
+        for loop_index in polygon.loop_indices:
+            loop_normals[loop_index] = normal.copy()
+        polygon.use_smooth = True
+    mesh.normals_split_custom_set(loop_normals)
+    mesh.update()
+    return True
+
+
+def _preview_object(
+    scene, source, vertices, faces, smooth_preview=True, planar_normal=None,
+):
     _model, candidates, _helpers = ensure_scene_roots(scene)
     mesh = bpy.data.meshes.new(CANDIDATE_PREFIX + "MESH")
     mesh.from_pydata(vertices, [], faces)
     mesh.update(calc_edges=True)
     for polygon in mesh.polygons:
         polygon.use_smooth = bool(smooth_preview)
+    if planar_normal is not None:
+        _apply_planar_custom_normals(mesh, planar_normal)
     obj = bpy.data.objects.new(CANDIDATE_PREFIX + source.name, mesh)
     candidates.objects.link(obj)
     obj.matrix_world = source.matrix_world.copy()
@@ -1827,6 +2011,33 @@ def _link_hidden_working(scene, working):
     working.hide_set(True)
 
 
+def _show_exact_flatten_working_candidate(source, working, preview):
+    """Show the full replacement result without source/candidate z-fighting."""
+    if "smrn_saved_candidate_display_type" not in source:
+        source["smrn_saved_candidate_display_type"] = str(source.display_type)
+    source.display_type = "BOUNDS"
+    source.hide_viewport = False
+    source.hide_set(False)
+    working.display_type = "SOLID"
+    working.show_in_front = False
+    working.hide_viewport = False
+    working.hide_render = True
+    working.hide_set(False)
+    preview.hide_viewport = True
+    preview.hide_render = True
+    preview.hide_set(True)
+
+
+def _restore_source_candidate_display(source):
+    saved = str(source.get("smrn_saved_candidate_display_type", ""))
+    if saved:
+        try:
+            source.display_type = saved
+        except TypeError:
+            source.display_type = "SOLID"
+        del source["smrn_saved_candidate_display_type"]
+
+
 def remove_last_candidate(scene):
     preview_name = str(scene.get("smrn_surface_candidate_name", ""))
     working_name = str(scene.get("smrn_surface_working_name", ""))
@@ -1836,6 +2047,9 @@ def remove_last_candidate(scene):
         (preview is not None and preview_name.startswith(CANDIDATE_PREFIX))
         or (working is not None and working_name.startswith(WORKING_PREFIX))
     )
+    source = bpy.data.objects.get(str(scene.get("smrn_source_name", "")))
+    if source is not None:
+        _restore_source_candidate_display(source)
     if preview is not None and preview_name.startswith(CANDIDATE_PREFIX):
         _remove_object(preview)
     if working is not None and working_name.startswith(WORKING_PREFIX):
@@ -1939,6 +2153,8 @@ def _matching_existing_candidate(scene, source, source_snapshot_value, request_s
     preview.show_in_front = False
     _set_current_mark_overlays_hidden(scene, True)
     keep_model_visible(scene, (source, preview))
+    if str(report.get("mode", "")) == "flatten":
+        _show_exact_flatten_working_candidate(source, working, preview)
     return preview, reused_report
 
 
@@ -2058,6 +2274,10 @@ def build_scene_candidate(scene, mode="smooth"):
             vertices,
             faces,
             smooth_preview=True,
+            planar_normal=(
+                (topology.get("planarity_qa") or {}).get("plane_normal_local")
+                if mode == "flatten" else None
+            ),
         )
         after_source_snapshot = source_snapshot(source)
         source_unchanged = before_snapshot["fingerprint"] == after_source_snapshot["fingerprint"]
@@ -2111,6 +2331,8 @@ def build_scene_candidate(scene, mode="smooth"):
                 _remove_object(old)
         _set_current_mark_overlays_hidden(scene, True)
         keep_model_visible(scene, (source, preview))
+        if mode == "flatten":
+            _show_exact_flatten_working_candidate(source, working, preview)
         return preview, report
     except Exception:
         if preview is not None:
@@ -2174,6 +2396,7 @@ def confirm_replacement(scene):
 
     new_mesh = working.data
     try:
+        _restore_source_candidate_display(source)
         source.data = new_mesh
         source["smrn_last_surface_rebuild_report_json"] = json.dumps(
             {**report, "status": "accepted", "accepted_at": stamp},
@@ -2192,6 +2415,7 @@ def confirm_replacement(scene):
         return source, archive, report
     except Exception:
         source.data = old_mesh
+        _restore_source_candidate_display(source)
         _remove_object(archive)
         keep_model_visible(scene, (source,))
         raise
