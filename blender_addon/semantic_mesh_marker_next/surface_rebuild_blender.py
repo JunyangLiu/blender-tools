@@ -916,6 +916,144 @@ def _canvas_outer_envelope_shift(
     }
 
 
+def _isolate_flatten_region_boundary(bm, region_faces, region_layer):
+    """Detach the green boundary before exact projection and bridge it locally.
+
+    Exact flattening must move every green vertex to one plane. Moving a
+    boundary vertex in-place also deforms every unmarked face that shares that
+    vertex. Rebuild only boundary-touching green faces with duplicated boundary
+    vertices, preserve all unmarked faces, and connect both rims with sidewalls.
+    """
+    region_faces = list(region_faces)
+    region_set = set(region_faces)
+    selected_edges = {edge for face in region_faces for edge in face.edges}
+    shared_boundary_edges = {
+        edge for edge in selected_edges
+        if any(face not in region_set for face in edge.link_faces)
+    }
+    open_boundary_edges = {
+        edge for edge in selected_edges if len(edge.link_faces) < 2
+    }
+    boundary_vertices = {
+        vertex for face in region_faces for vertex in face.verts
+        if any(linked not in region_set for linked in vertex.link_faces)
+        or any(edge in open_boundary_edges for edge in vertex.link_edges)
+    }
+    if not boundary_vertices:
+        return region_faces, [], {
+            "method": "no_shared_boundary_isolation_needed",
+            "duplicated_boundary_vertices": 0,
+            "rebuilt_boundary_faces": 0,
+            "bridge_faces": 0,
+            "unmarked_vertices_moved": 0,
+        }
+
+    duplicate = {}
+    for vertex in boundary_vertices:
+        copied = bm.verts.new(vertex.co.copy())
+        duplicate[vertex] = copied
+
+    boundary_face_set = {
+        face for face in region_faces
+        if any(vertex in boundary_vertices for vertex in face.verts)
+    }
+    remaining_faces = [face for face in region_faces if face not in boundary_face_set]
+    replacement_faces = []
+    for face in boundary_face_set:
+        replacement_vertices = [
+            duplicate.get(vertex, vertex) for vertex in face.verts
+        ]
+        try:
+            replacement = bm.faces.new(replacement_vertices)
+        except Exception as error:
+            raise RuntimeError(
+                "flatten boundary replacement face creation failed: "
+                + repr({
+                    "source_face": int(face.index),
+                    "vertices": len(replacement_vertices),
+                    "valid": [vertex.is_valid for vertex in replacement_vertices],
+                    "error": str(error),
+                })
+            ) from error
+        replacement.material_index = face.material_index
+        replacement.smooth = face.smooth
+        replacement[region_layer] = 1
+        replacement_faces.append(replacement)
+
+    bridge_specs = []
+    for edge in shared_boundary_edges:
+        selected_face = next(
+            (face for face in edge.link_faces if face in region_set), None
+        )
+        if selected_face is None:
+            continue
+        loop = next(
+            (candidate for candidate in selected_face.loops if candidate.edge is edge),
+            None,
+        )
+        if loop is None:
+            continue
+        first = loop.vert
+        second = loop.link_loop_next.vert
+        if first not in duplicate or second not in duplicate:
+            continue
+        bridge_specs.append((
+            first, second, duplicate[first], duplicate[second],
+            selected_face.material_index,
+        ))
+
+    old_edges = {edge for face in boundary_face_set for edge in face.edges}
+    bridge_faces = []
+    for first, second, copied_first, copied_second, material_index in bridge_specs:
+        if not all(vertex.is_valid for vertex in (first, second, copied_first, copied_second)):
+            continue
+        # The copied edge follows the old green face. Use its reverse in the
+        # bridge so both shared edges have manifold-consistent winding.
+        try:
+            bridge = bm.faces.new((copied_second, copied_first, first, second))
+        except Exception as error:
+            raise RuntimeError(
+                "flatten boundary bridge face creation failed: "
+                + repr({
+                    "valid": [
+                        vertex.is_valid
+                        for vertex in (copied_second, copied_first, first, second)
+                    ],
+                    "error": str(error),
+                })
+            ) from error
+        bridge.material_index = material_index
+        bridge.smooth = False
+        bridge[region_layer] = 0
+        bridge_faces.append(bridge)
+
+    # Keep the old selected faces until the bridges exist. Some malformed
+    # source islands expose a selected boundary vertex only through the face
+    # being replaced; deleting that face first lets BMesh retire the vertex.
+    bmesh.ops.delete(bm, geom=list(boundary_face_set), context="FACES_ONLY")
+
+    # The EDGES delete context may also remove valid endpoint vertices and their
+    # neighbouring geometry. Remove only edges that are still truly face-less,
+    # and do it after the bridge has consumed the original boundary endpoints.
+    orphan_edges = [edge for edge in old_edges if edge.is_valid and not edge.link_faces]
+    for edge in orphan_edges:
+        if edge.is_valid and not edge.link_faces:
+            bm.edges.remove(edge)
+
+    rebuilt_region = remaining_faces + replacement_faces
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.normal_update()
+    return rebuilt_region, bridge_faces, {
+        "method": "detached_green_boundary_with_manifold_sidewalls_v1",
+        "duplicated_boundary_vertices": len(duplicate),
+        "rebuilt_boundary_faces": len(replacement_faces),
+        "bridge_faces": len(bridge_faces),
+        "unmarked_vertices_moved": 0,
+    }
+
+
 def _rebuild_working_mesh(
     source, selected_indices, excluded_indices, level, strength, hard_angle, mode="smooth",
     height_mode="MEDIAN", normal_hint=None, normal_mode="AUTO", height_reference_points=None,
@@ -1025,6 +1163,13 @@ def _rebuild_working_mesh(
         bm.free()
         _remove_object(working)
         raise RuntimeError("细分后未能保留局部区域标签")
+
+    flatten_boundary_isolation = None
+    flatten_bridge_faces = []
+    if mode == "flatten":
+        region_faces, flatten_bridge_faces, flatten_boundary_isolation = (
+            _isolate_flatten_region_boundary(bm, region_faces, region_layer)
+        )
 
     # Exact flattening does not need subdivision or triangulation.  Keeping the
     # source face graph avoids manufacturing another population of long thin
@@ -1292,6 +1437,7 @@ def _rebuild_working_mesh(
             "projection_fraction": 1.0,
             "full_projection_max_displacement": full_maximum,
             "component_safety_passed": flatten_progress_passed,
+            "boundary_isolation": flatten_boundary_isolation,
         }
     elif mode == "__legacy_flatten" and movable:
         components = _region_face_components(region_faces, locked_region_edges)
@@ -1981,6 +2127,8 @@ def _rebuild_working_mesh(
         "confirmed_shading_matches_preview": True,
         "smooth_shaded_region_faces": len(region_faces),
         "transition_faces_checked": len(qa_faces - set(region_faces)),
+        "flatten_boundary_isolation": flatten_boundary_isolation,
+        "flatten_bridge_faces": len(flatten_bridge_faces),
         "transition_ring_count": len(transition_rings),
         "transition_vertices": sum(len(ring) for ring in transition_rings),
         "before_topology": before_topology,
