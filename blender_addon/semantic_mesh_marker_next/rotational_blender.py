@@ -242,9 +242,75 @@ def _boundary_ring_vertex_chains(source, face_indices, vertex_keys, key_points):
     return rings, separator_edges, len(boundary)
 
 
-def _broad_arc_island_rings(key_points):
+def _normal_derived_cylinder_rings(points, normals):
+    """Recover rings when broad side normals uniquely prove a cylinder axis."""
+    normals = np.asarray(normals, dtype=float)
+    if normals.ndim != 2 or normals.shape[1] != 3:
+        return None
+    lengths = np.linalg.norm(normals, axis=1)
+    normals = normals[lengths > 1.0e-12]
+    if len(normals) < 5:
+        return None
+    normals /= np.linalg.norm(normals, axis=1)[:, None]
+    values, vectors = np.linalg.eigh(normals.T @ normals / len(normals))
+    condition = float(values[1] / max(values[0], 1.0e-12))
+    axis = vectors[:, 0]
+    axis /= max(float(np.linalg.norm(axis)), 1.0e-12)
+    pivot = int(np.argmax(np.abs(axis)))
+    if axis[pivot] < 0.0:
+        axis = -axis
+    axial_normal = np.abs(normals @ axis)
+    axial_normal_p90 = float(np.quantile(axial_normal, 0.90))
+    if condition < 25.0 or axial_normal_p90 > math.sin(math.radians(6.0)):
+        return None
+
+    center = np.mean(points, axis=0)
+    axial = (points - center) @ axis
+    axial_min = float(np.min(axial))
+    axial_max = float(np.max(axial))
+    separation = axial_max - axial_min
+    radial = points - center - axial[:, None] * axis[None, :]
+    radial_scale = float(np.quantile(np.linalg.norm(radial, axis=1), 0.75))
+    if separation <= max(1.0e-8, radial_scale * 1.0e-3):
+        return None
+
+    helper = np.asarray((1.0, 0.0, 0.0))
+    if abs(float(helper @ axis)) > 0.85:
+        helper = np.asarray((0.0, 0.0, 1.0))
+    basis_x = np.cross(axis, helper)
+    basis_x /= max(float(np.linalg.norm(basis_x)), 1.0e-12)
+    basis_y = np.cross(axis, basis_x)
+    angles = np.mod(np.arctan2(radial @ basis_y, radial @ basis_x), 2.0 * math.pi)
+    order = np.argsort(angles)
+    ordered_radial = radial[order]
+    ordered_angles = angles[order]
+    gaps = np.diff(np.r_[ordered_angles, ordered_angles[0] + 2.0 * math.pi])
+    span = float(2.0 * math.pi - np.max(gaps))
+    if span < math.radians(160.0):
+        return None
+
+    rings = []
+    for axial_level in (axial_min, axial_max):
+        rows = center + ordered_radial + axial_level * axis
+        rings.append([tuple(float(value) for value in row) for row in rows])
+    return rings, {
+        "method": "normal_null_axis_projected_source_envelope_rings",
+        "normal_covariance_values": [float(value) for value in values],
+        "normal_axis_condition": condition,
+        "normal_axial_p90_degrees": math.degrees(math.asin(min(1.0, axial_normal_p90))),
+        "ring_plane_separation": separation,
+        "ring_plane_scatter_p90": 0.0,
+        "ring_angular_spans_degrees": [math.degrees(span), math.degrees(span)],
+        "source_vertices_projected_only_for_fit": True,
+    }
+
+
+def _broad_arc_island_rings(key_points, source_normals=None):
     """Recover two rings from disconnected islands only with broad arc evidence."""
     points = np.asarray(tuple(key_points.values()), dtype=float)
+    normal_result = _normal_derived_cylinder_rings(points, source_normals or ())
+    if normal_result is not None:
+        return normal_result
     if len(points) < 8:
         raise ValueError("断续绿色面至少需要 8 个唯一空间顶点")
     center = np.mean(points, axis=0)
@@ -311,20 +377,44 @@ def _fit_marked_face_strip(source, face_indices):
         source, indices
     )
     components = _face_components(source, indices, vertex_keys=vertex_keys)
+    face_normals = {
+        face_index: np.asarray(
+            tuple(_world_normal(source, source.data.polygons[face_index].normal)),
+            dtype=float,
+        )
+        for face_index in indices
+    }
     if len(components) == 1:
         rings, separators, boundary_count = _boundary_ring_vertex_chains(
             source, indices, vertex_keys, key_points
         )
         island_evidence = {"method": "two_source_boundary_rings"}
     else:
-        rings, island_evidence = _broad_arc_island_rings(key_points)
+        rings, island_evidence = _broad_arc_island_rings(
+            key_points, [face_normals[index] for index in sorted(indices)]
+        )
         separators = set()
         boundary_count = 0
     points, normals = [], []
-    for face_index in sorted(indices):
-        polygon = source.data.polygons[face_index]
-        points.append(tuple(source.matrix_world @ polygon.center))
-        normals.append(tuple(_world_normal(source, polygon.normal)))
+    if island_evidence.get("method") == "normal_null_axis_projected_source_envelope_rings":
+        key_normal_rows = defaultdict(list)
+        for face_index in sorted(indices):
+            polygon = source.data.polygons[face_index]
+            for vertex in polygon.vertices:
+                key_normal_rows[vertex_keys[vertex]].append(face_normals[face_index])
+        for key, point in key_points.items():
+            normal = np.mean(key_normal_rows[key], axis=0)
+            normal /= max(float(np.linalg.norm(normal)), 1.0e-12)
+            points.append(tuple(float(value) for value in point))
+            normals.append(tuple(float(value) for value in normal))
+        island_evidence["fit_samples"] = (
+            "unique_source_vertices_with_averaged_source_normals"
+        )
+    else:
+        for face_index in sorted(indices):
+            polygon = source.data.polygons[face_index]
+            points.append(tuple(source.matrix_world @ polygon.center))
+            normals.append(tuple(face_normals[face_index]))
     fit = fit_rotational_boundary_rings(rings[0], rings[1], points, normals)
     evidence = {
         **island_evidence,
