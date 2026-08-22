@@ -189,10 +189,15 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("support_angle_after_degrees", fitter)
         self.assertNotIn("np.eye", fitter)
         self.assertIn("terminal_bridge", adapter)
-        self.assertIn('"topology_bridge_samples": discarded_topology_bridge_samples', adapter)
+        self.assertIn('"path_bridge_samples": discarded_path_bridge_samples', adapter)
+        self.assertIn(
+            "discarded_topology_bridge_samples - discarded_path_bridge_samples",
+            adapter,
+        )
         self.assertIn("fit.half_span + endpoint_margin", adapter)
         self.assertIn("minimum_enclosing_circle", adapter)
         self.assertIn("_semantic_handle_faces", adapter)
+        self.assertIn("np.sum(middle) < 1", fitter)
         self.assertIn('"global_geometry_scan": False', adapter)
         self.assertIn('bool(old_obj.get("smrn_accepted", False))', adapter)
         self.assertIn("def _evidence_request", adapter)

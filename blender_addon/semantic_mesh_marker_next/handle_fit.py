@@ -261,7 +261,14 @@ def _fit_path(local: np.ndarray, radius_hint: float):
     centered_u = u - center_u
     terminals = np.abs(centered_u) >= half_span * 0.62
     middle = np.abs(centered_u) <= half_span * 0.58
-    if np.sum(terminals) < 2 or np.sum(middle) < 2:
+    # A low-poly flat top can be one long source face while both legs and
+    # corners are split into dozens of small faces.  In that valid case the
+    # semantic marks contain only one central path sample.  Requiring two
+    # central faces rejects good marking purely because of tessellation.
+    # One central sample is sufficient to propose the top envelope; the
+    # downstream path residual, plane, span/rise, and corridor gates still
+    # have to validate the complete handle before it can become a candidate.
+    if np.sum(terminals) < 2 or np.sum(middle) < 1:
         return None
     # Terminal samples contain both the feet and the rising corner/leg.  A
     # central quantile therefore pulls the installation baseline upward when

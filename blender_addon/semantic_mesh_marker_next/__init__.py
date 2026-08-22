@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Semantic Mesh Marker Next",
     "author": "Local developer",
-    "version": (0, 6, 25),
+    "version": (0, 6, 26),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > 语义标记 Next",
     "description": "Non-destructive target and exclude surface marking",

@@ -38,7 +38,10 @@ def _evidence_request(fit, targets, supports):
             f"再补至少 {missing_green} 个绿色管体标记，分布到两腿、两处弯角和顶部"
         )
     else:
-        green = "绿色标记数量已经足够；请撤销明显偏离同一扶手管体的标记后重试，无需继续增加数量"
+        green = (
+            "绿色标记数量已经足够；当前拒绝来自路径一致性检查："
+            f"{fit.reason}。无需继续增加标记"
+        )
     red = None
     if len(supports) < 2:
         red = "若两端安装角度或落点不明确，请在左右安装平面各补 1 个红色标记"
@@ -843,11 +846,21 @@ def build_scene_candidate(scene):
 
     path_segments = max(64, int(scene.smrn_handle_path_segments))
     base_path = path_points_world(fit, path_segments, (0.0, 0.0))
-    marked_values = np.asarray(marked_dense, dtype=float)
-    _nearest, _tangents, marked_distances = polyline_nearest(marked_values, base_path)
-    # This source-scaled corridor only bounds topology growth. No accepted
-    # semantic sample can later disappear from the coverage denominator.
-    corridor = max(float(np.max(marked_distances)) * 1.35, fit.radius_hint * 1.75)
+    # Bound semantic growth from the actual brush-hit anchors, not from every
+    # vertex of the hit polygons.  A valid low-poly handle face can contain a
+    # long triangulation tail welded into the vehicle shell; using that tail's
+    # maximum distance made one good green mark inflate the corridor, section,
+    # and inferred endpoint depth by an order of magnitude.
+    anchor_values = np.asarray(
+        [tuple(_current_anchor(item)[0]) for item in targets], dtype=float
+    )
+    _anchor_nearest, _anchor_tangents, anchor_distances = polyline_nearest(
+        anchor_values, base_path
+    )
+    corridor = max(
+        float(np.quantile(anchor_distances, 0.95)) + fit.radius_hint * 1.25,
+        fit.radius_hint * 2.75,
+    )
     semantic_faces, semantic_diagnostics = _semantic_handle_faces(
         targets, base_path, fit.plane_normal, corridor
     )
@@ -868,20 +881,56 @@ def build_scene_candidate(scene):
 
     raw_semantic_samples = int(len(dense))
 
-    nearest, tangents, _distances = polyline_nearest(dense, base_path)
+    nearest, tangents, base_distances = polyline_nearest(dense, base_path)
     plane_normal = np.asarray(fit.plane_normal, dtype=float)
-    in_plane = np.cross(tangents, plane_normal)
-    in_plane /= np.maximum(np.linalg.norm(in_plane, axis=1)[:, None], 1.0e-12)
-    offsets = dense - nearest
     local_dense = _local(dense, fit)
     # Faces on the mounting feet extend axially below the fitted baseline.
     # They determine endpoint burial, not tube diameter.  Including those
     # axial extensions in a cross-section circle is the exact failure that
     # produced an enormously thick handle when the user added more marks.
-    terminal_extension = (
-        (local_dense[:, 1] < -fit.radius_hint * 1.25)
-        & (np.abs(local_dense[:, 0]) > fit.half_span * 0.70)
+    below_baseline = local_dense[:, 1] < -fit.radius_hint * 1.25
+    start_terminal_distance = np.sqrt(
+        np.square(local_dense[:, 0] + fit.half_span)
+        + np.square(local_dense[:, 2])
     )
+    end_terminal_distance = np.sqrt(
+        np.square(local_dense[:, 0] - fit.half_span)
+        + np.square(local_dense[:, 2])
+    )
+    terminal_extension = below_baseline & (
+        (start_terminal_distance <= corridor)
+        | (end_terminal_distance <= corridor)
+    )
+    # Retain the complete local tube corridor and bounded axial mounting
+    # extensions.  Samples outside both are triangulation bridges, not a
+    # request to cover the surrounding hull.  They remain counted and
+    # reported, but cannot determine tube diameter or candidate containment.
+    path_supported = (base_distances <= corridor) | terminal_extension
+    if np.any(~path_supported):
+        dense = dense[path_supported]
+        sample_areas = sample_areas[path_supported]
+        sample_owners = [
+            owner for owner, retained in zip(sample_owners, path_supported) if retained
+        ]
+        nearest = nearest[path_supported]
+        tangents = tangents[path_supported]
+        base_distances = base_distances[path_supported]
+        local_dense = local_dense[path_supported]
+        terminal_extension = terminal_extension[path_supported]
+    discarded_path_bridge_samples = raw_semantic_samples - int(len(dense))
+    if len(dense) < 24:
+        report.update({
+            "status": "rejected",
+            "reason": "排除与车体相连的长三角桥接后，局部管体证据不足",
+            "semantic_expansion": semantic_diagnostics,
+        })
+        return None, report
+    # Rebuild the cross-section frame after dropping triangulation bridges.
+    # Keeping the pre-filter arrays here would pair retained samples with stale
+    # offsets and can either fail by shape mismatch or corrupt the radius fit.
+    in_plane = np.cross(tangents, plane_normal)
+    in_plane /= np.maximum(np.linalg.norm(in_plane, axis=1)[:, None], 1.0e-12)
+    offsets = dense - nearest
     section_mask = ~terminal_extension
     if int(np.sum(section_mask)) < 24:
         report.update({
@@ -996,8 +1045,12 @@ def build_scene_candidate(scene):
         "semantic_faces": int(sum(len(values) for values in semantic_faces.values())),
         "marked_samples": int(len(marked_dense)),
         "discarded_semantic_samples": discarded_topology_bridge_samples,
-        "topology_bridge_samples": discarded_topology_bridge_samples,
+        "path_bridge_samples": discarded_path_bridge_samples,
+        "topology_bridge_samples": (
+            discarded_topology_bridge_samples - discarded_path_bridge_samples
+        ),
         "raw_semantic_samples": raw_semantic_samples,
+        "anchor_corridor": float(corridor),
         "endpoint_span_margin": float(endpoint_margin),
         "terminal_extension_samples": int(np.sum(terminal_extension)),
         "section_samples": int(np.sum(section_mask)),

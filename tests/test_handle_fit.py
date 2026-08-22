@@ -98,6 +98,18 @@ class HandleFitTests(unittest.TestCase):
         self.assertAlmostEqual(fit.support_angle_after_degrees, 0.0, places=8)
         self.assertGreater(fit.rise, 2.0)
 
+    def test_one_long_middle_face_can_define_low_poly_flat_top(self):
+        points, normals, _supports, _support_normals, radius = surface_marks(
+            "flat_top"
+        )[:5]
+        # One long top polygon contributes one central brush anchor while the
+        # two legs and corners contribute several small-face anchors.
+        indices = [0, 1, 2, 4, 6, 7, 8]
+        fit = fit_handle(points[indices], normals[indices], radius_hint=radius)
+        self.assertEqual(fit.status, "candidate_ready", fit.reason)
+        self.assertEqual(fit.path_kind, "flat_top")
+        self.assertEqual(fit.sample_count, 7)
+
     def test_semiellipse_is_recovered_in_arbitrary_orientation(self):
         values = surface_marks("semi_ellipse")
         points, normals, supports, support_normals, radius, span, _rise, _origin = values
