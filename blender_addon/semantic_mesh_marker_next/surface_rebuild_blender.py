@@ -999,14 +999,16 @@ def _taubin_fair_canvas(
 def _canvas_outer_envelope_shift(
     movable, region_vertices, source_coordinates, outward_normal, local_scale,
 ):
-    """Lift the fair cloth by the exact minimum needed to cover source peaks.
+    """Lift each cloth sample only by the amount needed to cover its source.
 
     The locally subdivided candidate and the saved source coordinates share
-    the same parameterization.  A single calculated translation therefore
-    preserves the already-faired shape while making every movable source
-    sample lie behind the candidate.  Locked boundary vertices stay exactly
-    on the untouched source, so the replacement still joins the unmarked
-    mesh without a guessed transition band.
+    the same parameterization.  The old implementation translated every
+    movable vertex by the *largest* missing clearance.  A single deep fold
+    could therefore drag the entire interior away from its locked boundary
+    and flip otherwise valid transition faces.  Correct each sample
+    independently instead: vertices already outside are not moved, while an
+    inward sample receives only its own missing clearance.  Locked boundary
+    vertices stay exactly on the untouched source.
     """
     direction = outward_normal.copy()
     if not direction.length_squared:
@@ -1019,15 +1021,19 @@ def _canvas_outer_envelope_shift(
         vertex: float((vertex.co - source_coordinates[vertex]).dot(direction))
         for vertex in movable_set
     }
-    required_shift = max(
-        (clearance - offset for offset in before_offsets.values()),
-        default=0.0,
-    )
-    applied_shift = min(max(0.0, required_shift), maximum_shift)
-    if applied_shift:
-        translation = direction * applied_shift
-        for vertex in movable_set:
-            vertex.co += translation
+    required_by_vertex = {
+        vertex: max(0.0, clearance - offset)
+        for vertex, offset in before_offsets.items()
+    }
+    applied_by_vertex = {
+        vertex: min(required, maximum_shift)
+        for vertex, required in required_by_vertex.items()
+    }
+    required_shift = max(required_by_vertex.values(), default=0.0)
+    applied_shift = max(applied_by_vertex.values(), default=0.0)
+    for vertex, distance in applied_by_vertex.items():
+        if distance:
+            vertex.co += direction * distance
     after_offsets = {
         vertex: float((vertex.co - source_coordinates[vertex]).dot(direction))
         for vertex in movable_set
@@ -1046,7 +1052,7 @@ def _canvas_outer_envelope_shift(
         and min(all_offsets_after, default=0.0) >= -tolerance
     )
     return {
-        "method": "exact_minimum_frame_normal_outer_shift_v1",
+        "method": "per_vertex_minimum_frame_normal_outer_correction_v2",
         "parameterization": "same_locally_subdivided_marked_surface",
         "source_vertices_sampled": len(region_vertices),
         "movable_vertices_sampled": len(movable_set),
@@ -1055,6 +1061,10 @@ def _canvas_outer_envelope_shift(
         "minimum_signed_offset_after": min(after_offsets.values(), default=0.0),
         "required_outer_shift": required_shift,
         "applied_outer_shift": applied_shift,
+        "mean_applied_outer_shift": (
+            sum(applied_by_vertex.values()) / len(applied_by_vertex)
+            if applied_by_vertex else 0.0
+        ),
         "maximum_allowed_outer_shift": maximum_shift,
         "uncovered_vertices_before": uncovered_before,
         "uncovered_vertices_after": uncovered_after,
@@ -1062,6 +1072,63 @@ def _canvas_outer_envelope_shift(
         "whole_vehicle_search": False,
         "passed": passed,
     }
+
+
+def _canvas_outer_envelope_after_safety(
+    report, movable, region_vertices, source_coordinates, outward_normal,
+    safety_fraction,
+):
+    """Re-evaluate outer coverage after the final topology-safe rollback.
+
+    A safety rollback interpolates toward the source-aligned candidate.  It
+    may reduce the requested positive clearance, but it must never put the
+    rebuilt surface behind the source.  Coincident samples at a locked or
+    safety-limited transition are valid dense coverage and avoid a thin gap.
+    """
+    direction = outward_normal.copy()
+    if not direction.length_squared:
+        updated = dict(report)
+        updated.update({"passed": False, "invalid_outer_direction": True})
+        return updated
+    direction.normalize()
+    movable_set = set(movable)
+    clearance = float(report.get("outer_clearance", 0.0))
+    tolerance = max(clearance * 0.1, 1.0e-7)
+    movable_offsets = [
+        float((vertex.co - source_coordinates[vertex]).dot(direction))
+        for vertex in movable_set
+    ]
+    all_offsets = [
+        float((vertex.co - source_coordinates[vertex]).dot(direction))
+        for vertex in region_vertices
+    ]
+    uncovered_after = sum(offset < -tolerance for offset in movable_offsets)
+    minimum_movable = min(movable_offsets, default=0.0)
+    minimum_all = min(all_offsets, default=0.0)
+    requested_clearance_met = minimum_movable >= clearance - tolerance
+    within_shift_limit = (
+        float(report.get("required_outer_shift", 0.0))
+        <= float(report.get("maximum_allowed_outer_shift", 0.0)) + 1.0e-12
+    )
+    updated = dict(report)
+    updated.update({
+        "minimum_signed_offset_after": minimum_movable,
+        "minimum_all_region_offset_after": minimum_all,
+        "uncovered_vertices_after": uncovered_after,
+        "requested_clearance_met": requested_clearance_met,
+        "final_topology_safety_fraction": float(safety_fraction),
+        "safety_limited_clearance": bool(
+            safety_fraction < 1.0 - 1.0e-9 and not requested_clearance_met
+        ),
+        "coverage_acceptance": "nonnegative_source_aligned_dense_outer_cover",
+        "passed": bool(
+            within_shift_limit
+            and uncovered_after == 0
+            and minimum_movable >= -tolerance
+            and minimum_all >= -tolerance
+        ),
+    })
+    return updated
 
 
 def _isolate_flatten_region_boundary(bm, region_faces, region_layer):
@@ -2011,6 +2078,8 @@ def _rebuild_working_mesh(
             for face in qa_faces
         }
         facet_before = _edge_dihedrals(canvas_facet_edges)
+        facet_before_p95 = _percentile(facet_before, 0.95)
+        canvas_frame = _canvas_frame(region_vertices, region_faces, local_scale)
         canvas_base_fairing, canvas_wave, max_allowed = _solve_physics_canvas(
             bm,
             source,
@@ -2042,40 +2111,68 @@ def _rebuild_working_mesh(
             movable,
             region_vertices,
             source_region_coordinates,
-            _canvas_frame(region_vertices, region_faces, local_scale)["normal"],
+            canvas_frame["normal"],
             local_scale,
+        )
+        # Validate the complete candidate, including its outer-cover
+        # correction, rather than discovering flips only in the global gate.
+        final_proposed_coordinates = {
+            vertex: vertex.co.copy() for vertex in movable
+        }
+        outer_safe_fraction, outer_safety_attempts = _canvas_safe_fraction(
+            bm,
+            movable,
+            before_coordinates,
+            final_proposed_coordinates,
+            before_face_geometry,
+            canvas_facet_edges,
+            facet_before_p95,
+            tolerance_degrees=4.0,
+        )
+        effective_safe_fraction = safe_fraction * outer_safe_fraction
+        canvas_outer_envelope = _canvas_outer_envelope_after_safety(
+            canvas_outer_envelope,
+            movable,
+            region_vertices,
+            source_region_coordinates,
+            canvas_frame["normal"],
+            outer_safe_fraction,
         )
         bm.normal_update()
         facet_after = _edge_dihedrals(canvas_facet_edges)
-        facet_before_p95 = _percentile(facet_before, 0.95)
         facet_after_p95 = _percentile(facet_after, 0.95)
         meaningful_faceting = facet_before_p95 >= math.radians(2.0)
         physics_fold_guard = _physics_canvas_fold_guard(
             facet_before_p95,
             facet_after_p95,
-            safe_fraction,
+            effective_safe_fraction,
         )
         canvas_base_fairing.update({
             "facet_edges_sampled": len(canvas_facet_edges),
             "before_facet_dihedral_p95_degrees": math.degrees(facet_before_p95),
             "after_fairing_facet_dihedral_p95_degrees": math.degrees(facet_after_p95),
             "meaningful_source_faceting": meaningful_faceting,
-            "safe_deformation_fraction": safe_fraction,
-            "safety_attempts": safety_attempts,
+            "safe_deformation_fraction": effective_safe_fraction,
+            "physics_stage_safe_fraction": safe_fraction,
+            "outer_cover_stage_safe_fraction": outer_safe_fraction,
+            "safety_attempts": safety_attempts + outer_safety_attempts,
             "physics_fold_guard": physics_fold_guard,
             "faceting_delta_degrees": physics_fold_guard["delta_degrees"],
             "physics_fold_guard_tolerance_degrees": physics_fold_guard["tolerance_degrees"],
             "passed": bool(
-                safe_fraction > 0.0
+                effective_safe_fraction > 0.0
                 and (not meaningful_faceting or physics_fold_guard["passed"])
+                and canvas_outer_envelope["passed"]
             ),
         })
         canvas_wave.update({
             "wave_strength": bounded_strength,
-            "safe_deformation_fraction": safe_fraction,
-            "effective_deformation_scale": bounded_strength * safe_fraction,
-            "safety_method": "adaptive_maximum_safe_fraction_line_search_v2",
-            "safety_limited": bool(safe_fraction < 1.0 - 1.0e-9),
+            "safe_deformation_fraction": effective_safe_fraction,
+            "physics_stage_safe_fraction": safe_fraction,
+            "outer_cover_stage_safe_fraction": outer_safe_fraction,
+            "effective_deformation_scale": bounded_strength * effective_safe_fraction,
+            "safety_method": "two_stage_complete_surface_safe_fraction_line_search_v3",
+            "safety_limited": bool(effective_safe_fraction < 1.0 - 1.0e-9),
             "automatic_subdivision": True,
             "automatic_subdivision_cuts": cuts,
             "base_surface_fairing": canvas_base_fairing,
