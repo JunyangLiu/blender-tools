@@ -2021,6 +2021,7 @@ def _rebuild_working_mesh(
     degenerate_faces = 0
     flipped_face_details = []
     accepted_unstable_sliver_flips = []
+    accepted_coherent_canvas_fold_rotations = []
     degenerate_face_details = []
     for face, (before_normal, before_area) in before_face_geometry.items():
         after_area = float(face.calc_area())
@@ -2059,6 +2060,21 @@ def _rebuild_working_mesh(
                 and after_area >= before_area * 0.20
                 and strict_neighbor_majority
             )
+            # A physical cloth fold may legitimately rotate a face slightly
+            # past 90 degrees relative to its coarse source normal.  That is
+            # not a winding inversion when the face remains healthy and its
+            # final normal agrees with a strict local-neighbour majority.
+            # Keep this deliberately narrow so isolated or strongly reversed
+            # faces still fail closed.
+            accepted_coherent_canvas_fold = bool(
+                mode == "canvas_physics"
+                and face in region_face_set
+                and normal_dot > -0.20
+                and after_area >= before_area * 0.20
+                and len(neighbor_dots) >= 3
+                and positive_neighbors >= 3
+                and strict_neighbor_majority
+            )
             detail = {
                 "face_index": int(face.index),
                 "in_green_region": face in region_face_set,
@@ -2069,7 +2085,9 @@ def _rebuild_working_mesh(
                 "positive_neighbor_normals": positive_neighbors,
                 "neighbor_normal_count": len(neighbor_dots),
             }
-            if accepted_unstable_sliver:
+            if accepted_coherent_canvas_fold:
+                accepted_coherent_canvas_fold_rotations.append(detail)
+            elif accepted_unstable_sliver:
                 accepted_unstable_sliver_flips.append(detail)
             else:
                 flipped_faces += 1
@@ -2221,6 +2239,12 @@ def _rebuild_working_mesh(
         "flipped_face_details": flipped_face_details,
         "accepted_unstable_sliver_flips": len(accepted_unstable_sliver_flips),
         "accepted_unstable_sliver_flip_details": accepted_unstable_sliver_flips,
+        "accepted_coherent_canvas_fold_rotations": len(
+            accepted_coherent_canvas_fold_rotations
+        ),
+        "accepted_coherent_canvas_fold_rotation_details": (
+            accepted_coherent_canvas_fold_rotations
+        ),
         "degenerate_faces": degenerate_faces,
         "degenerate_face_details": degenerate_face_details,
         "ignored_preexisting_tiny_faces": ignored_preexisting_tiny_faces,
@@ -2592,7 +2616,17 @@ def build_scene_candidate(scene, mode="smooth"):
             if gates.get("rotational_projection_complete") is False:
                 failures.append("圆柱/圆锥径向重投影未达到安全完成度")
             detail = "、".join(failures) or "未识别的局部质量门失败"
-            raise ValueError(f"平整质量检查未通过（{detail}），已拒绝生成；源网格未修改")
+            operation_label = {
+                "canvas_physics": "多折面帆布重建",
+                "canvas": "帆布波浪重建",
+                "rotational": "圆润重建",
+                "smooth": "局部平滑重建",
+                "flatten": "平整",
+            }.get(mode, "局部网面重建")
+            raise ValueError(
+                f"{operation_label}质量检查未通过（{detail}），"
+                "已拒绝生成；源网格未修改"
+            )
         checkpoint = _checkpoint(scene, source)
         _link_hidden_working(scene, working)
         preview = _preview_object(
