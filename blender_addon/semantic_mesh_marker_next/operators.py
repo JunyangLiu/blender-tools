@@ -912,6 +912,11 @@ class SMRN_OT_build_surface_candidate(bpy.types.Operator):
             normal_labels = {"AUTO": "自动法向", "FIRST_TARGET": "首个绿面法向", "RED_REFERENCE": "红面法向"}
             choice = report.get("flatten_reference") or {}
             reference = f" · {labels.get(choice.get('height_mode'), '居中')} / {normal_labels.get(choice.get('normal_mode'), '自动法向')}"
+        if report["mode"] == "canvas_physics":
+            wave = topology.get("canvas_wave_qa") or {}
+            requested = float(wave.get("wave_strength", 0.0))
+            applied = float(wave.get("safe_deformation_fraction", 0.0))
+            reference = f" · 请求波浪 {requested:.2f} / 安全应用 {applied * 100.0:.1f}%"
         if report.get("reused_existing"):
             context.scene.smrn_surface_summary = f"当前{action}候选已经是最新结果，无需重复生成{reference}"
             self.report({"INFO"}, context.scene.smrn_surface_summary)

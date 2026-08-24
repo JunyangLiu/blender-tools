@@ -713,9 +713,17 @@ def _canvas_safe_fraction(
     bm, movable, before_coordinates, proposed_coordinates, before_face_geometry,
     matched_dihedral_edges, before_p95, tolerance_degrees=8.0,
 ):
-    """Backtrack the complete local deformation until all safety gates pass."""
+    """Find the strongest safe local deformation instead of rejecting a preset.
+
+    Cloth regions can contain a nearly flat source triangle that reverses at
+    12.5 percent even though a slightly smaller deformation is valid.  The old
+    fixed ladder stopped there and made the upper part of the UI slider almost
+    unusable.  First bracket a safe fraction, then refine the largest passing
+    value with a bounded deterministic line search.
+    """
     attempts = []
-    for fraction in (1.0, 0.75, 0.5, 0.35, 0.25, 0.125):
+
+    def evaluate(fraction, phase):
         for vertex in movable:
             vertex.co = before_coordinates[vertex].lerp(proposed_coordinates[vertex], fraction)
         bm.normal_update()
@@ -737,17 +745,51 @@ def _canvas_safe_fraction(
         )
         attempts.append({
             "fraction": fraction,
+            "phase": phase,
             "flipped_faces": flipped,
             "degenerate_faces": degenerate,
             "after_dihedral_p95_degrees": math.degrees(after_p95),
             "passed": passed,
         })
-        if passed:
-            return fraction, attempts
+        return passed
+
+    previous_unsafe = None
+    best_safe = None
+    for fraction in (
+        1.0, 0.75, 0.5, 0.35, 0.25, 0.125,
+        0.0625, 0.03125, 0.015625, 0.0078125,
+    ):
+        if evaluate(fraction, "bracket"):
+            best_safe = fraction
+            break
+        previous_unsafe = fraction
+
+    if best_safe is None:
+        for vertex in movable:
+            vertex.co = before_coordinates[vertex]
+        bm.normal_update()
+        return 0.0, attempts
+
+    # Refine only inside the first passing/failing bracket.  Six iterations
+    # resolve the usable fraction to better than 0.2 percent in the common
+    # 0.0625-0.125 bracket without turning this into a long simulation loop.
+    if previous_unsafe is not None:
+        lower = best_safe
+        upper = previous_unsafe
+        for _step in range(6):
+            midpoint = (lower + upper) * 0.5
+            if evaluate(midpoint, "refine"):
+                lower = midpoint
+            else:
+                upper = midpoint
+        best_safe = lower
+
     for vertex in movable:
-        vertex.co = before_coordinates[vertex]
+        vertex.co = before_coordinates[vertex].lerp(
+            proposed_coordinates[vertex], best_safe
+        )
     bm.normal_update()
-    return 0.0, attempts
+    return best_safe, attempts
 
 
 def _canvas_final_dihedral_guard(
@@ -2031,6 +2073,9 @@ def _rebuild_working_mesh(
         canvas_wave.update({
             "wave_strength": bounded_strength,
             "safe_deformation_fraction": safe_fraction,
+            "effective_deformation_scale": bounded_strength * safe_fraction,
+            "safety_method": "adaptive_maximum_safe_fraction_line_search_v2",
+            "safety_limited": bool(safe_fraction < 1.0 - 1.0e-9),
             "automatic_subdivision": True,
             "automatic_subdivision_cuts": cuts,
             "base_surface_fairing": canvas_base_fairing,
