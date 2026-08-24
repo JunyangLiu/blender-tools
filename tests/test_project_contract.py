@@ -55,6 +55,16 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn('overlay["smrn_raycast_object_name"] = geometry_obj.name', overlay)
         self.assertNotIn("world_vertices = [hit_obj.matrix_world @ hit_obj.data.vertices", overlay)
 
+    def test_marker_buttons_reset_erase_mode_and_switch_in_one_click(self):
+        operators = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "operators.py").read_text(encoding="utf-8")
+        panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
+        self.assertIn("target.erase = False", panel)
+        self.assertIn("exclude.erase = False", panel)
+        sidebar_branch = operators.split("if self._over_sidebar(event.mouse_x, event.mouse_y):", 1)[1]
+        sidebar_branch = sidebar_branch.split("self._painting = True", 1)[0]
+        self.assertIn('return {"PASS_THROUGH"}', sidebar_branch)
+        self.assertNotIn('return {"FINISHED"}', sidebar_branch)
+
     def test_legacy_helpers_are_excluded_from_raycast(self):
         scene_state = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "scene_state.py").read_text(encoding="utf-8")
         self.assertIn('obj.get("smr_annotation_only", False)', scene_state)

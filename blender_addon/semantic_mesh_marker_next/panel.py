@@ -41,8 +41,10 @@ class SMRN_PT_marking(bpy.types.Panel):
         row = marks_box.row(align=True)
         target = row.operator("smrn.mark_surface", text="绿色刷选：要处理", icon="BRUSH_DATA")
         target.mark_value = 1
+        target.erase = False
         exclude = row.operator("smrn.mark_surface", text="红色刷选：要保留", icon="BRUSH_DATA")
         exclude.mark_value = -1
+        exclude.erase = False
         row = marks_box.row(align=True)
         erase_target = row.operator("smrn.mark_surface", text="擦除绿色", icon="X")
         erase_target.mark_value = 1

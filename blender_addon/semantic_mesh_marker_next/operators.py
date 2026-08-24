@@ -522,7 +522,9 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         if event.type == "LEFTMOUSE" and event.value == "PRESS":
             if self._over_sidebar(event.mouse_x, event.mouse_y):
                 self._finish(context)
-                return {"FINISHED"}
+                # Let this click reach the requested sidebar tool. Otherwise
+                # the running brush consumes the first mode-switch click.
+                return {"PASS_THROUGH"}
             self._painting = True
             if self.erase:
                 self._current_erase_removed = []
