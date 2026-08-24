@@ -133,6 +133,13 @@ class SMRN_PT_marking(bpy.types.Panel):
             icon="PHYSICS",
         )
         physics.mode = "canvas_physics"
+        surface.prop(scene, "smrn_canvas_wave_strength", text="波浪程度", slider=True)
+        strength_hint = surface.row()
+        strength_hint.scale_y = 0.75
+        strength_hint.label(
+            text="0 接近原形/浅缓 · 1 下垂与褶皱更深（不增加波纹数量）",
+            icon="INFO",
+        )
         has_surface_candidate = has_any_surface_candidate and surface_candidate_mode != "rotational"
         mode = surface_candidate_mode
         if has_surface_candidate:
@@ -142,7 +149,6 @@ class SMRN_PT_marking(bpy.types.Panel):
                 hint.scale_y = 0.75
                 hint.label(text="0.50 = 旧版最高 · 1.00 = 强平滑", icon="INFO")
             elif mode in {"canvas", "canvas_physics"}:
-                surface.prop(scene, "smrn_canvas_wave_strength", text="自然波纹程度", slider=True)
                 hint = surface.row()
                 hint.scale_y = 0.75
                 hint.label(

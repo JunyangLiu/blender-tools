@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Semantic Mesh Marker Next",
     "author": "Local developer",
-    "version": (0, 6, 31),
+    "version": (0, 6, 32),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > 语义标记 Next",
     "description": "Non-destructive target and exclude surface marking",
@@ -90,7 +90,7 @@ def register():
     )
     bpy.types.Scene.smrn_canvas_wave_strength = bpy.props.FloatProperty(
         name="帆布自然波纹程度",
-        description="从绿色帆布表面拟合波纹方向、波长与相位；0 为不增强，1 为明显但受限",
+        description="控制波纹位移与下垂深度：0 接近原形且浅缓，1 褶皱更深；不控制波纹数量",
         default=0.45, min=0.0, max=1.0, step=1, precision=2,
     )
     bpy.types.Scene.smrn_surface_hard_angle = bpy.props.FloatProperty(

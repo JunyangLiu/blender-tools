@@ -17,7 +17,7 @@ from pathlib import Path
 
 import bmesh
 import bpy
-from mathutils import Vector
+from mathutils import Vector, kdtree
 import numpy as np
 
 from .anchors import source_snapshot
@@ -294,6 +294,26 @@ def _point_segment_distance(point, first, second):
     return (point - (first + direction * parameter)).length
 
 
+def _locked_segment_memberships(vertices, segments, tolerance):
+    """Map vertices to nearby locked segments without an O(V*S) scan."""
+    ordered_vertices = sorted(vertices, key=lambda vertex: vertex.index)
+    memberships = defaultdict(set)
+    if not ordered_vertices or not segments:
+        return memberships
+    tree = kdtree.KDTree(len(ordered_vertices))
+    for order, vertex in enumerate(ordered_vertices):
+        tree.insert(vertex.co, order)
+    tree.balance()
+    for segment_index, (first, second) in enumerate(segments):
+        midpoint = (first + second) * 0.5
+        query_radius = (second - first).length * 0.5 + tolerance
+        for _coordinate, order, _distance in tree.find_range(midpoint, query_radius):
+            vertex = ordered_vertices[order]
+            if _point_segment_distance(vertex.co, first, second) <= tolerance:
+                memberships[vertex].add(segment_index)
+    return memberships
+
+
 def _best_fit_plane(
     vertices, normal_hint=None, height_mode="MEDIAN", orientation_hint=None,
     height_reference_points=None,
@@ -529,6 +549,7 @@ def _solve_physics_canvas(
     local_scale, strength,
 ):
     """Deterministic quasi-static PBD cloth solve on the exact green ROI."""
+    movable = sorted(movable, key=lambda vertex: vertex.index)
     movable_set = set(movable)
     region_set = set(region_vertices)
     attachment_tolerance = max(local_scale * 1.0e-5, 1.0e-8)
@@ -540,7 +561,7 @@ def _solve_physics_canvas(
         raise ValueError("物理帆布细分后未能保留已验证的绳挂固定链")
     fades = _canvas_boundary_fades(region_vertices, locked_vertices)
     fairing = _taubin_fair_canvas(
-        bm, movable, region_faces, original_coordinates, local_scale, iterations=58,
+        bm, movable, region_faces, original_coordinates, local_scale, iterations=28,
     )
     bm.normal_update()
     base = {vertex: vertex.co.copy() for vertex in region_vertices}
@@ -548,7 +569,13 @@ def _solve_physics_canvas(
         edge for face in region_faces for edge in face.edges
         if all(vertex in region_set for vertex in edge.verts)
     }
-    constraints = [(edge.verts[0], edge.verts[1], edge.calc_length()) for edge in edges]
+    constraints = []
+    for edge in sorted(
+        edges,
+        key=lambda item: tuple(sorted(vertex.index for vertex in item.verts)),
+    ):
+        first, second = sorted(edge.verts, key=lambda vertex: vertex.index)
+        constraints.append((first, second, edge.calc_length()))
 
     # Topological distance from the inferred suspension chain controls where
     # gravity and rope-side compression are strongest, without looking beyond
@@ -571,7 +598,10 @@ def _solve_physics_canvas(
 
     # A tiny source-aligned imperfection chooses the buckle direction.  The
     # structural solver creates the final folds; this is not random surface noise.
-    seed_amplitude = local_scale * (0.010 + 0.014 * bounded_strength)
+    # Strength controls displacement/depth, not wave count. Zero stays close
+    # to the source; one permits deeper sag and folds. Normalize total gravity
+    # by iteration count so performance tuning cannot silently change meaning.
+    seed_amplitude = local_scale * (0.003 + 0.021 * bounded_strength)
     for vertex in movable:
         relative = vertex.co - frame["center"]
         cross_coordinate = relative.dot(frame["cross"]) / max(frame["cross_span"], 1.0e-12)
@@ -579,14 +609,16 @@ def _solve_physics_canvas(
         seed = math.sin(2.0 * math.pi * (2.25 + 2.0 * support) * cross_coordinate)
         vertex.co += normal * seed_amplitude * fades.get(vertex, 0.0) * (0.35 + 0.65 * support) * seed
 
-    iterations = 64
-    gravity_step = local_scale * (0.00042 + 0.00058 * bounded_strength)
-    maximum_displacement = local_scale * (0.42 + 0.08 * bounded_strength)
+    iterations = 28 + int(round(8.0 * bounded_strength))
+    constraint_passes = 2
+    total_gravity = local_scale * (0.008 + 0.080 * bounded_strength)
+    gravity_step = total_gravity / max(iterations, 1)
+    maximum_displacement = local_scale * (0.18 + 0.32 * bounded_strength)
     for _iteration in range(iterations):
         for vertex in movable:
             depth = distance.get(vertex, maximum_distance) / max(maximum_distance, 1)
             vertex.co += gravity * gravity_step * fades.get(vertex, 0.0) * (0.25 + 0.75 * depth)
-        for _pass in range(3):
+        for _pass in range(constraint_passes):
             for first, second, rest_length in constraints:
                 delta = second.co - first.co
                 length = delta.length
@@ -621,16 +653,18 @@ def _solve_physics_canvas(
                 vertex.co = original_coordinates[vertex] + displacement.normalized() * maximum_displacement
     bm.normal_update()
     return fairing, {
-        "method": "quasi_static_position_based_cloth_v1",
+        "method": "quasi_static_position_based_cloth_v2",
         "semantic_class": "marked_rope_hung_thin_canvas",
         "iterations": iterations,
-        "constraint_passes_per_iteration": 3,
+        "constraint_passes_per_iteration": constraint_passes,
         "structural_constraints": len(constraints),
         "bending_relaxation": 0.018,
         "base_shape_tether": 0.006,
         "gravity_local": list(gravity),
         "gravity_step": gravity_step,
+        "total_gravity": total_gravity,
         "seed_amplitude": seed_amplitude,
+        "strength_semantics": "0=source_close_shallow;1=deeper_sag_and_folds_not_more_cycles",
         "random_displacement": False,
         "attachment_inference": attachment_report,
         "locked_seam_vertices": len(locked_vertices),
@@ -638,6 +672,25 @@ def _solve_physics_canvas(
         "whole_vehicle_search": False,
         "source_objects_scanned": 1,
     }, maximum_displacement
+
+
+def _physics_canvas_fold_guard(before_p95, after_p95, safe_fraction):
+    """Accept coherent cloth folds while retaining a bounded geometry guard."""
+    before_degrees = math.degrees(float(before_p95))
+    after_degrees = math.degrees(float(after_p95))
+    tolerance_degrees = max(2.0, min(4.0, before_degrees * 0.05))
+    delta_degrees = after_degrees - before_degrees
+    return {
+        "guard_mode": "physics_cloth_coherent_fold_delta_v1",
+        "before_degrees": before_degrees,
+        "after_degrees": after_degrees,
+        "delta_degrees": delta_degrees,
+        "tolerance_degrees": tolerance_degrees,
+        "passed": bool(
+            float(safe_fraction) > 0.0
+            and delta_degrees <= tolerance_degrees + 1.0e-12
+        ),
+    }
 
 
 def _canvas_macro_fold_edges(selected_edges, hard_angle, local_scale):
@@ -844,7 +897,7 @@ def _taubin_fair_canvas(
     bm, movable, region_faces, original_coordinates, local_scale, iterations=44,
 ):
     """Fair the dense cloth base without shrinking its locked silhouette."""
-    movable_set = set(movable)
+    movable_ordered = sorted(set(movable), key=lambda vertex: vertex.index)
     reference_geometry = {
         face: (face.normal.copy(), max(float(face.calc_area()), 1.0e-20))
         for face in region_faces
@@ -855,7 +908,7 @@ def _taubin_fair_canvas(
 
     def laplacian_targets():
         targets = {}
-        for vertex in movable_set:
+        for vertex in movable_ordered:
             neighbors = [edge.other_vert(vertex) for edge in vertex.link_edges]
             if not neighbors:
                 continue
@@ -864,7 +917,7 @@ def _taubin_fair_canvas(
         return targets
 
     for _iteration in range(max(0, int(iterations))):
-        before_iteration = {vertex: vertex.co.copy() for vertex in movable_set}
+        before_iteration = {vertex: vertex.co.copy() for vertex in movable_ordered}
         for factor in (0.45, -0.46):
             offsets = laplacian_targets()
             for vertex, offset in offsets.items():
@@ -1158,6 +1211,7 @@ def _rebuild_working_mesh(
     bm.from_mesh(working.data)
     bm.faces.ensure_lookup_table()
     bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
     # Creating a BMesh custom-data layer can relocate element storage.  Create
     # it before retaining any BMFace references, otherwise Blender may report
     # those references as removed even though no topology operation ran yet.
@@ -1248,6 +1302,10 @@ def _rebuild_working_mesh(
         )
     bm.faces.ensure_lookup_table()
     bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.index_update()
+    bm.verts.index_update()
+    bm.edges.index_update()
     region_faces = [face for face in bm.faces if int(face[region_layer]) == 1]
     if not region_faces:
         bm.free()
@@ -1269,11 +1327,12 @@ def _rebuild_working_mesh(
     region_vertices = {vertex for face in region_faces for vertex in face.verts}
     region_face_set = set(region_faces)
     lock_tolerance = max(1.0e-8, local_scale * 1.0e-6)
-    locked_vertices = {
-        vertex for vertex in region_vertices
-        if any(_point_segment_distance(vertex.co, first, second) <= lock_tolerance
-               for first, second in locked_segments)
-    }
+    locked_segment_memberships = _locked_segment_memberships(
+        region_vertices,
+        locked_segments,
+        lock_tolerance,
+    )
+    locked_vertices = set(locked_segment_memberships)
     # A non-manifold source can share a vertex without sharing a normal
     # two-face boundary edge.  Lock every green vertex touched by any
     # unmarked face so no unmarked polygon can move even in that topology.
@@ -1283,11 +1342,8 @@ def _rebuild_working_mesh(
     })
     locked_region_edges = {
         edge for face in region_faces for edge in face.edges
-        if any(
-            _point_segment_distance(edge.verts[0].co, first, second) <= lock_tolerance
-            and _point_segment_distance(edge.verts[1].co, first, second) <= lock_tolerance
-            for first, second in locked_segments
-        )
+        if locked_segment_memberships.get(edge.verts[0], set())
+        & locked_segment_memberships.get(edge.verts[1], set())
     }
     if mode == "flatten":
         # "Flatten" is an exact geometric operation.  The former safe-smooth
@@ -1302,7 +1358,7 @@ def _rebuild_working_mesh(
         canvas_facet_segments,
         max(1.0e-8, local_scale * 1.0e-5),
     ) if mode in {"canvas", "canvas_physics"} else set()
-    movable = list(region_vertices - locked_vertices)
+    movable = sorted(region_vertices - locked_vertices, key=lambda vertex: vertex.index)
     if mode == "flatten" and not movable:
         bm.free()
         _remove_object(working)
@@ -1952,6 +2008,11 @@ def _rebuild_working_mesh(
         facet_before_p95 = _percentile(facet_before, 0.95)
         facet_after_p95 = _percentile(facet_after, 0.95)
         meaningful_faceting = facet_before_p95 >= math.radians(2.0)
+        physics_fold_guard = _physics_canvas_fold_guard(
+            facet_before_p95,
+            facet_after_p95,
+            safe_fraction,
+        )
         canvas_base_fairing.update({
             "facet_edges_sampled": len(canvas_facet_edges),
             "before_facet_dihedral_p95_degrees": math.degrees(facet_before_p95),
@@ -1959,12 +2020,12 @@ def _rebuild_working_mesh(
             "meaningful_source_faceting": meaningful_faceting,
             "safe_deformation_fraction": safe_fraction,
             "safety_attempts": safety_attempts,
-            "passed": (
+            "physics_fold_guard": physics_fold_guard,
+            "faceting_delta_degrees": physics_fold_guard["delta_degrees"],
+            "physics_fold_guard_tolerance_degrees": physics_fold_guard["tolerance_degrees"],
+            "passed": bool(
                 safe_fraction > 0.0
-                and (
-                    not meaningful_faceting
-                    or facet_after_p95 <= facet_before_p95 + math.radians(0.5)
-                )
+                and (not meaningful_faceting or physics_fold_guard["passed"])
             ),
         })
         canvas_wave.update({
@@ -2447,7 +2508,7 @@ def _candidate_request_signature(
         "canvas_pipeline": (
             "fair_base_then_source_aligned_wave_outer_envelope_v3"
             if mode == "canvas"
-            else ("quasi_static_position_based_cloth_v1" if mode == "canvas_physics" else None)
+            else ("quasi_static_position_based_cloth_v2" if mode == "canvas_physics" else None)
         ),
         "source_fingerprint": str(source_snapshot_value.get("fingerprint", "")),
         "mode": mode,
@@ -2592,11 +2653,19 @@ def build_scene_candidate(scene, mode="smooth"):
                 )
             if gates.get("canvas_base_faceting_reduced") is False:
                 fairing = topology.get("canvas_base_fairing_qa") or {}
-                failures.append(
-                    "帆布低模棱面仍偏强 "
-                    f"{fairing.get('before_facet_dihedral_p95_degrees', 0.0):.2f}°→"
-                    f"{fairing.get('after_fairing_facet_dihedral_p95_degrees', 0.0):.2f}°"
-                )
+                if mode == "canvas_physics":
+                    failures.append(
+                        "物理布褶变化超出当前区域安全范围 "
+                        f"{fairing.get('before_facet_dihedral_p95_degrees', 0.0):.2f}°→"
+                        f"{fairing.get('after_fairing_facet_dihedral_p95_degrees', 0.0):.2f}°"
+                        f"（允许增加 {fairing.get('physics_fold_guard_tolerance_degrees', 0.0):.2f}°）"
+                    )
+                else:
+                    failures.append(
+                        "帆布低模棱面仍偏强 "
+                        f"{fairing.get('before_facet_dihedral_p95_degrees', 0.0):.2f}°→"
+                        f"{fairing.get('after_fairing_facet_dihedral_p95_degrees', 0.0):.2f}°"
+                    )
             if gates.get("canvas_outer_envelope_complete") is False:
                 envelope = topology.get("canvas_outer_envelope_qa") or {}
                 failures.append(
