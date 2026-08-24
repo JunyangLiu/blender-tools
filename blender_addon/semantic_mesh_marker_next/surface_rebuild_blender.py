@@ -982,7 +982,11 @@ def _isolate_flatten_region_boundary(bm, region_faces, region_layer):
     selected_edges = {edge for face in region_faces for edge in face.edges}
     shared_boundary_edges = {
         edge for edge in selected_edges
-        if any(face not in region_set for face in edge.link_faces)
+        # A bridge is valid only across one green and one preserved face.
+        # Bridging an already non-manifold source edge adds another incident
+        # face and makes the local topology worse on every rebuild.
+        if len(edge.link_faces) == 2
+        and sum(face in region_set for face in edge.link_faces) == 1
     }
     open_boundary_edges = {
         edge for edge in selected_edges if len(edge.link_faces) < 2
@@ -1001,20 +1005,50 @@ def _isolate_flatten_region_boundary(bm, region_faces, region_layer):
             "unmarked_vertices_moved": 0,
         }
 
-    duplicate = {}
-    for vertex in boundary_vertices:
-        copied = bm.verts.new(vertex.co.copy())
-        duplicate[vertex] = copied
-
     boundary_face_set = {
         face for face in region_faces
         if any(vertex in boundary_vertices for vertex in face.verts)
     }
+    # A geometric vertex can contain several disconnected selected face fans
+    # in imported/game meshes.  Reusing one copied vertex for all of them makes
+    # every sidewall branch share the same radial edge; at a four-way junction
+    # that radial edge consequently receives four faces and fails topology QA.
+    # Duplicate per connected selected face fan instead.  This preserves the
+    # original coordinates while keeping independent boundary branches
+    # topologically independent.
+    duplicate_by_face = {}
+    duplicated_boundary_vertices = 0
+    boundary_vertex_fans = 0
+    for vertex in boundary_vertices:
+        incident_faces = {
+            face for face in vertex.link_faces if face in region_set
+        }
+        pending = set(incident_faces)
+        while pending:
+            seed = pending.pop()
+            fan = {seed}
+            stack = [seed]
+            while stack:
+                current = stack.pop()
+                for edge in current.edges:
+                    if vertex not in edge.verts or edge in shared_boundary_edges:
+                        continue
+                    for linked in edge.link_faces:
+                        if linked in pending and linked in incident_faces:
+                            pending.remove(linked)
+                            fan.add(linked)
+                            stack.append(linked)
+            copied = bm.verts.new(vertex.co.copy())
+            duplicated_boundary_vertices += 1
+            boundary_vertex_fans += 1
+            for face in fan:
+                duplicate_by_face[(vertex, face)] = copied
+
     remaining_faces = [face for face in region_faces if face not in boundary_face_set]
     replacement_faces = []
     for face in boundary_face_set:
         replacement_vertices = [
-            duplicate.get(vertex, vertex) for vertex in face.verts
+            duplicate_by_face.get((vertex, face), vertex) for vertex in face.verts
         ]
         try:
             replacement = bm.faces.new(replacement_vertices)
@@ -1048,10 +1082,12 @@ def _isolate_flatten_region_boundary(bm, region_faces, region_layer):
             continue
         first = loop.vert
         second = loop.link_loop_next.vert
-        if first not in duplicate or second not in duplicate:
+        copied_first = duplicate_by_face.get((first, selected_face))
+        copied_second = duplicate_by_face.get((second, selected_face))
+        if copied_first is None or copied_second is None:
             continue
         bridge_specs.append((
-            first, second, duplicate[first], duplicate[second],
+            first, second, copied_first, copied_second,
             selected_face.material_index,
         ))
 
@@ -1099,8 +1135,9 @@ def _isolate_flatten_region_boundary(bm, region_faces, region_layer):
     bm.faces.ensure_lookup_table()
     bm.normal_update()
     return rebuilt_region, bridge_faces, {
-        "method": "detached_green_boundary_with_manifold_sidewalls_v1",
-        "duplicated_boundary_vertices": len(duplicate),
+        "method": "detached_green_boundary_with_face_fan_sidewalls_v2",
+        "duplicated_boundary_vertices": duplicated_boundary_vertices,
+        "boundary_vertex_fans": boundary_vertex_fans,
         "rebuilt_boundary_faces": len(replacement_faces),
         "bridge_faces": len(bridge_faces),
         "unmarked_vertices_moved": 0,
@@ -2338,7 +2375,10 @@ def _rounded_vector(value, precision=6):
     return [round(float(item), precision) for item in value]
 
 
-def _candidate_request_signature(scene, source_snapshot_value, targets, excludes, mode):
+def _candidate_request_signature(
+    scene, source_snapshot_value, targets, excludes, mode,
+    effective_height_mode=None, effective_normal_mode=None,
+):
     """Identify the effective local rebuild request without scanning other objects."""
     records = []
     for record in sorted(
@@ -2369,8 +2409,14 @@ def _candidate_request_signature(scene, source_snapshot_value, targets, excludes
         settings["canvas_wave_strength"] = round(float(scene.smrn_canvas_wave_strength), 6)
     else:
         settings.update({
-            "height_mode": str(getattr(scene, "smrn_surface_height_mode", "MEDIAN")),
-            "normal_mode": str(getattr(scene, "smrn_surface_normal_mode", "AUTO")),
+            "height_mode": str(
+                effective_height_mode
+                or getattr(scene, "smrn_surface_height_mode", "MEDIAN")
+            ),
+            "normal_mode": str(
+                effective_normal_mode
+                or getattr(scene, "smrn_surface_normal_mode", "AUTO")
+            ),
         })
     payload = {
         "schema": 13,
@@ -2435,16 +2481,26 @@ def build_scene_candidate(scene, mode="smooth"):
     source, targets, excludes, before_snapshot = _source_and_records(scene)
     if mode in {"canvas", "canvas_physics"} and len(targets) < 3:
         raise ValueError("帆布波浪重建至少需要 3 处绿色标记，并沿帆布表面分散刷选")
+    height_mode = str(getattr(scene, "smrn_surface_height_mode", "MEDIAN"))
+    normal_mode = str(getattr(scene, "smrn_surface_normal_mode", "AUTO"))
+    source_excludes = [
+        record for record in excludes if record.hit_object_name == source.name
+    ]
+    if mode == "flatten" and not source_excludes:
+        if height_mode == "RED_REFERENCE":
+            height_mode = "MEDIAN"
+        if normal_mode == "RED_REFERENCE":
+            normal_mode = "AUTO"
     request_signature = _candidate_request_signature(
-        scene, before_snapshot, targets, excludes, mode
+        scene, before_snapshot, targets, excludes, mode,
+        effective_height_mode=height_mode,
+        effective_normal_mode=normal_mode,
     )
     existing = _matching_existing_candidate(
         scene, source, before_snapshot, request_signature
     )
     if existing is not None:
         return existing
-    height_mode = str(getattr(scene, "smrn_surface_height_mode", "MEDIAN"))
-    normal_mode = str(getattr(scene, "smrn_surface_normal_mode", "AUTO"))
     normal_hint = _normal_hint_from_records(source, targets, excludes, normal_mode) if mode == "flatten" else None
     height_reference_points = (
         _height_reference_from_records(source, excludes, height_mode) if mode == "flatten" else None
