@@ -697,6 +697,59 @@ def _canvas_safe_fraction(
     return 0.0, attempts
 
 
+def _canvas_final_dihedral_guard(
+    before_p95, after_p95, dihedral_comparable,
+    canvas_base_fairing, canvas_outer_envelope,
+):
+    """Judge cloth folds against the current fair base, not a hard-surface limit.
+
+    The generic matched-edge gate remains the first line of defence.  A cloth
+    candidate may legitimately exceed it after the outer-envelope pass, so a
+    second path is allowed only when the same candidate already passed the
+    cloth fairing/backtracking and dense outer-coverage checks.  Its ceiling is
+    derived from this run's faired source surface, never from another model.
+    """
+    generic_limit = float(before_p95) + math.radians(8.0)
+    generic_passed = (
+        not dihedral_comparable
+        or float(after_p95) <= generic_limit + 1.0e-12
+    )
+    fairing = canvas_base_fairing or {}
+    envelope = canvas_outer_envelope or {}
+    fairing_reference_degrees = max(
+        0.0,
+        float(fairing.get("after_fairing_facet_dihedral_p95_degrees", 0.0)),
+    )
+    fairing_reference = math.radians(fairing_reference_degrees)
+    attempts = fairing.get("safety_attempts") or []
+    safety_attempt_passed = any(bool(attempt.get("passed")) for attempt in attempts)
+    specialized_evidence = bool(
+        fairing.get("passed")
+        and float(fairing.get("safe_deformation_fraction", 0.0)) > 0.0
+        and safety_attempt_passed
+        and envelope.get("passed")
+    )
+    allowed = max(generic_limit, fairing_reference) if specialized_evidence else generic_limit
+    cloth_passed = (
+        not dihedral_comparable
+        or (specialized_evidence and float(after_p95) <= allowed + 1.0e-12)
+    )
+    return {
+        "method": "post_wave_vs_current_faired_source_faceting_v1",
+        "generic_limit_degrees": math.degrees(generic_limit),
+        "fairing_reference_degrees": fairing_reference_degrees,
+        "allowed_degrees": math.degrees(allowed),
+        "after_degrees": math.degrees(float(after_p95)),
+        "safe_deformation_fraction": float(fairing.get("safe_deformation_fraction", 0.0)),
+        "safety_attempt_passed": safety_attempt_passed,
+        "outer_envelope_passed": bool(envelope.get("passed")),
+        "generic_gate_passed": generic_passed,
+        "specialized_evidence_passed": specialized_evidence,
+        "passed": bool(generic_passed or cloth_passed),
+        "scope": "current_green_region_only_no_vehicle_scan",
+    }
+
+
 def _flatten_component_safe_fraction(
     bm, movable, before_coordinates, proposed_coordinates,
     before_face_geometry, matched_edges, before_p95, tolerance_degrees=2.0,
@@ -2055,6 +2108,18 @@ def _rebuild_working_mesh(
         quality_gates["canvas_outer_envelope_complete"] = bool(
             canvas_outer_envelope and canvas_outer_envelope.get("passed")
         )
+        canvas_dihedral_guard = _canvas_final_dihedral_guard(
+            before_p95,
+            after_p95,
+            dihedral_comparable,
+            canvas_base_fairing,
+            canvas_outer_envelope,
+        )
+        quality_gates["matched_dihedral_within_limit"] = bool(
+            canvas_dihedral_guard["passed"]
+        )
+    else:
+        canvas_dihedral_guard = None
     topology_passed = all(quality_gates.values())
 
     # The preview is smooth shaded.  Keep the confirmed working mesh on the
@@ -2107,6 +2172,7 @@ def _rebuild_working_mesh(
         "canvas_wave_qa": canvas_wave,
         "canvas_base_fairing_qa": canvas_base_fairing,
         "canvas_outer_envelope_qa": canvas_outer_envelope,
+        "canvas_dihedral_guard_qa": canvas_dihedral_guard,
         "rotational_projection_qa": rotational_projection,
         "local_edge_scale": local_scale,
         "max_allowed_displacement": max_allowed,
