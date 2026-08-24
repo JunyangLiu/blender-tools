@@ -39,6 +39,15 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("smrn_batched_overlay", (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "overlay.py").read_text(encoding="utf-8"))
         self.assertNotIn("magnetic_radius = min(magnetic_radius, 4)", operators)
 
+    def test_marker_has_role_specific_drag_erasers(self):
+        operators = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "operators.py").read_text(encoding="utf-8")
+        panel = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "panel.py").read_text(encoding="utf-8")
+        self.assertIn('erase: bpy.props.BoolProperty(default=False)', operators)
+        self.assertIn("replace_task_marks", operators)
+        self.assertIn("_current_erase_removed", operators)
+        self.assertIn('text="擦除绿色"', panel)
+        self.assertIn('text="擦除红色"', panel)
+
     def test_marker_overlay_follows_visible_proxy_geometry(self):
         overlay = (ROOT / "blender_addon" / "semantic_mesh_marker_next" / "overlay.py").read_text(encoding="utf-8")
         self.assertIn('hit.get("raycast_object_name", "")', overlay)

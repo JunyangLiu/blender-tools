@@ -28,6 +28,7 @@ from .storage import (
     load_all_marks,
     next_id,
     pop_last_mark,
+    replace_task_marks,
     rewrite_all_marks,
     set_active_source,
 )
@@ -199,8 +200,47 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     mark_value: bpy.props.IntProperty(default=1)
+    erase: bpy.props.BoolProperty(default=False)
+
+    def _role(self):
+        return TARGET_ROLE if self.mark_value == 1 else EXCLUDE_ROLE
+
+    def _rebuild_erase_role_overlay(self, context):
+        role = self._role()
+        remove_overlay(shared_surface_overlay_name(self._task_id, role))
+        role_records = [record for record in self._task_records if record.role == role]
+        if role_records:
+            rebuild_task_surface_overlays(
+                context, role_records, context.scene.smrn_marker_size
+            )
+
+    def _commit_erase_stroke(self, context):
+        removed = getattr(self, "_current_erase_removed", [])
+        if not removed:
+            return 0
+        replace_task_marks(context.scene, self._task_id, self._task_records)
+        self._erase_history.append(list(removed))
+        self._current_erase_removed = []
+        return len(removed)
+
+    def _undo_erase(self, context):
+        self._commit_erase_stroke(context)
+        if not self._erase_history:
+            self.report({"WARNING"}, "本次擦除没有可撤销的标记")
+            return
+        restored = self._erase_history.pop()
+        existing = {(record.task_id, record.id) for record in self._task_records}
+        self._task_records.extend(
+            record for record in restored if (record.task_id, record.id) not in existing
+        )
+        self._task_records.sort(key=lambda record: record.id)
+        replace_task_marks(context.scene, self._task_id, self._task_records)
+        self._rebuild_erase_role_overlay(context)
+        _set_status(context.scene, f"已恢复本次擦除的 {len(restored)} 个标记。")
 
     def _finish(self, context):
+        if getattr(self, "erase", False):
+            self._commit_erase_stroke(context)
         owns_token = context.scene.get(MODAL_TOKEN_KEY, "") == getattr(self, "_token", "")
         if owns_token:
             context.scene[MODAL_TOKEN_KEY] = ""
@@ -210,7 +250,8 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
             pass
         if owns_token:
             counts = document_summary(context.scene)["role_counts"]
-            _set_status(context.scene, f"标记结束：目标 {counts['target']}，排除 {counts['exclude']}。")
+            action = "擦除结束" if self.erase else "标记结束"
+            _set_status(context.scene, f"{action}：目标 {counts['target']}，排除 {counts['exclude']}。")
 
     def _over_sidebar(self, mouse_x, mouse_y):
         return self._ui_region is not None and (
@@ -270,6 +311,43 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         )
 
     def _store_hits(self, context, hits, *, dragging=False):
+        if self.erase:
+            role = self._role()
+            face_keys = {
+                (hit["hit_object_name"], int(hit["face_index"])) for hit in hits
+            }
+            if hits and not self._stroke_object_name:
+                first = hits[0]
+                self._stroke_object_name = first.get(
+                    "raycast_object_name", first["hit_object_name"]
+                )
+            removed = [
+                record
+                for record in self._task_records
+                if record.role == role
+                and (record.hit_object_name, int(record.face_index)) in face_keys
+            ]
+            if not removed:
+                return 0
+            removed_ids = {(record.task_id, record.id) for record in removed}
+            self._task_records = [
+                record
+                for record in self._task_records
+                if (record.task_id, record.id) not in removed_ids
+            ]
+            pending_ids = {
+                (record.task_id, record.id) for record in self._current_erase_removed
+            }
+            self._current_erase_removed.extend(
+                record
+                for record in removed
+                if (record.task_id, record.id) not in pending_ids
+            )
+            self._rebuild_erase_role_overlay(context)
+            if not dragging:
+                color = "绿色" if role == TARGET_ROLE else "红色"
+                _set_status(context.scene, f"已擦除 {len(removed)} 个{color}标记面。")
+            return len(removed)
         pending = []
         seen = set()
         for hit in hits:
@@ -380,7 +458,7 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         self._painting = False
         self._last_paint_window = None
         self._stroke_object_name = ""
-        role = TARGET_ROLE if self.mark_value == 1 else EXCLUDE_ROLE
+        role = self._role()
         summary = document_summary(context.scene)
         self._task_id = summary["task_id"]
         self._source_snapshot = summary.get("source")
@@ -410,6 +488,9 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         rebuild_task_surface_overlays(
             context, consolidated, context.scene.smrn_marker_size
         )
+        self._task_records = list(consolidated)
+        self._erase_history = []
+        self._current_erase_removed = []
         self._marked_faces = {
             (record.hit_object_name, int(record.face_index))
             for record in consolidated
@@ -419,7 +500,10 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
         context.scene[MODAL_TOKEN_KEY] = self._token
         context.window.cursor_modal_set("PAINT_BRUSH")
         context.window_manager.modal_handler_add(self)
-        _set_status(context.scene, f"刷选已启动：检测 {len(meshes)} 个可见网格；按住左键拖动，Z 撤销，右键结束。")
+        action = "擦除绿色" if role == TARGET_ROLE else "擦除红色"
+        if not self.erase:
+            action = "绿色刷选" if role == TARGET_ROLE else "红色刷选"
+        _set_status(context.scene, f"{action}已启动：按住左键拖动，Z 撤销本次操作，右键结束。")
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
@@ -427,7 +511,10 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
             self._finish(context)
             return {"FINISHED"}
         if event.type == "Z" and event.value == "PRESS":
-            bpy.ops.smrn.undo_mark()
+            if self.erase:
+                self._undo_erase(context)
+            else:
+                bpy.ops.smrn.undo_mark()
             return {"RUNNING_MODAL"}
         if event.type in {"RET", "NUMPAD_ENTER", "RIGHTMOUSE", "ESC"} and event.value == "PRESS":
             self._finish(context)
@@ -437,6 +524,8 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
                 self._finish(context)
                 return {"FINISHED"}
             self._painting = True
+            if self.erase:
+                self._current_erase_removed = []
             self._stroke_object_name = ""
             self._last_paint_window = (event.mouse_x, event.mouse_y)
             self._paint_at(context, event.mouse_x, event.mouse_y)
@@ -458,6 +547,8 @@ class SMRN_OT_mark_surface(bpy.types.Operator):
                 self._paint_segment(context, previous, current)
             self._painting = False
             self._last_paint_window = None
+            if self.erase:
+                self._commit_erase_stroke(context)
             return {"RUNNING_MODAL"}
         return {"PASS_THROUGH"}
 

@@ -34,6 +34,16 @@ def mark(number, location=None, face_index=None):
     )
 
 
+def exclude_mark(number, location=None, face_index=None):
+    return records.MarkRecord(
+        **{
+            **mark(number, location, face_index).__dict__,
+            "role": "exclude",
+            "overlay_object_name": f"exclude-{number}",
+        }
+    )
+
+
 class StorageTests(unittest.TestCase):
     def test_legacy_migration_is_non_destructive(self):
         scene = {"smrn_marks_json": json.dumps([{
@@ -86,6 +96,19 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(summary["mark_count"], 2)
         # One initial document creation plus one batch commit.
         self.assertEqual(summary["revision"], 2)
+
+    def test_replace_task_marks_supports_role_specific_eraser(self):
+        scene = {}
+        target = mark(1)
+        excluded = exclude_mark(2, (2.0, 0.0, 0.0), face_index=2)
+        storage.append_marks(scene, [target, excluded])
+        storage.replace_task_marks(scene, "task-0001", [excluded])
+        remaining = storage.load_all_marks(scene, "task-0001")
+        self.assertEqual([(item.id, item.role) for item in remaining], [(2, "exclude")])
+        summary = storage.document_summary(scene)
+        self.assertEqual(summary["mark_count"], 1)
+        self.assertEqual(summary["role_counts"]["target"], 0)
+        self.assertEqual(summary["role_counts"]["exclude"], 1)
 
 
 if __name__ == "__main__":

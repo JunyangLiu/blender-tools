@@ -266,6 +266,36 @@ def clear_task_marks(storage: Any, task_id: str | None = None) -> list[MarkRecor
     return removed
 
 
+def replace_task_marks(
+    storage: Any, task_id: str, task_records: Iterable[MarkRecord]
+) -> None:
+    """Atomically replace one task's marks and rebuild its compact indexes.
+
+    Eraser strokes use this once on mouse release.  The live overlay can update
+    while dragging without rewriting every storage chunk for every mouse event.
+    Marks belonging to other tasks are kept verbatim.
+    """
+    replacement = list(task_records)
+    if any(record.task_id != task_id for record in replacement):
+        raise ValueError("replacement records must belong to the selected task")
+    document = ensure_document(storage)
+    all_records = load_all_marks(storage)
+    kept = [record for record in all_records if record.task_id != task_id]
+    _replace_chunks(storage, document, kept + replacement)
+    task = _task(document, task_id)
+    task["mark_count"] = len(replacement)
+    task["role_counts"] = {role: 0 for role in CORE_ROLES}
+    for record in replacement:
+        counts = task["role_counts"]
+        counts[record.role] = int(counts.get(record.role, 0)) + 1
+    if replacement:
+        document["next_mark_id"] = max(
+            int(document.get("next_mark_id", 1)),
+            max(record.id for record in replacement) + 1,
+        )
+    _write_document(storage, document)
+
+
 def rewrite_all_marks(storage: Any, records: list[MarkRecord]) -> None:
     """Rewrite chunks/indexes while preserving task summaries and monotonic IDs."""
     document = ensure_document(storage)
