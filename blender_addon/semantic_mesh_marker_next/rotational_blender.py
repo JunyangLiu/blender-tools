@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from collections import defaultdict, deque
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -15,9 +16,11 @@ import numpy as np
 from .anchors import source_snapshot
 from .constants import EXCLUDE_ROLE, SOURCE_NAME_KEY, TARGET_ROLE
 from .rotational_fit import (
+    FitThresholds,
     RotationalFit,
     fit_rotational_boundary_rings,
     fit_rotational_surface,
+    fit_rotational_surface_fixed_axis,
 )
 from .scene_state import ensure_scene_roots, keep_model_visible
 from .storage import load_all_marks
@@ -261,7 +264,11 @@ def _normal_derived_cylinder_rings(points, normals):
         axis = -axis
     axial_normal = np.abs(normals @ axis)
     axial_normal_p90 = float(np.quantile(axial_normal, 0.90))
-    if condition < 25.0 or axial_normal_p90 > math.sin(math.radians(6.0)):
+    # The covariance ratio alone is not a reliable confidence score when the
+    # user paints one side of a long cylinder much more densely than another.
+    # Keep the normal-to-axis error as a hard rejection here, then combine the
+    # ratio with angular coverage and axial extent after those are measured.
+    if axial_normal_p90 > math.sin(math.radians(6.0)):
         return None
 
     center = np.mean(points, axis=0)
@@ -286,8 +293,20 @@ def _normal_derived_cylinder_rings(points, normals):
     ordered_angles = angles[order]
     gaps = np.diff(np.r_[ordered_angles, ordered_angles[0] + 2.0 * math.pi])
     span = float(2.0 * math.pi - np.max(gaps))
-    if span < math.radians(160.0):
+    strict_normal_nullspace = condition >= 25.0 and span >= math.radians(160.0)
+    coherent_broad_side_normals = (
+        condition >= 6.0
+        and axial_normal_p90 <= math.sin(math.radians(4.0))
+        and span >= math.radians(240.0)
+        and separation >= radial_scale * 0.35
+    )
+    if not (strict_normal_nullspace or coherent_broad_side_normals):
         return None
+    acceptance_mode = (
+        "strict_normal_nullspace"
+        if strict_normal_nullspace
+        else "coherent_broad_side_normals"
+    )
 
     rings = []
     for axial_level in (axial_min, axial_max):
@@ -297,7 +316,12 @@ def _normal_derived_cylinder_rings(points, normals):
         "method": "normal_null_axis_projected_source_envelope_rings",
         "normal_covariance_values": [float(value) for value in values],
         "normal_axis_condition": condition,
+        "normal_axis": [float(value) for value in axis],
         "normal_axial_p90_degrees": math.degrees(math.asin(min(1.0, axial_normal_p90))),
+        "axis_acceptance_mode": acceptance_mode,
+        "moderate_condition_minimum": 6.0,
+        "moderate_angular_span_minimum_degrees": 240.0,
+        "moderate_axial_to_radial_minimum": 0.35,
         "ring_plane_separation": separation,
         "ring_plane_scatter_p90": 0.0,
         "ring_angular_spans_degrees": [math.degrees(span), math.degrees(span)],
@@ -308,7 +332,8 @@ def _normal_derived_cylinder_rings(points, normals):
 def _broad_arc_island_rings(key_points, source_normals=None):
     """Recover two rings from disconnected islands only with broad arc evidence."""
     points = np.asarray(tuple(key_points.values()), dtype=float)
-    normal_result = _normal_derived_cylinder_rings(points, source_normals or ())
+    normal_rows = () if source_normals is None else source_normals
+    normal_result = _normal_derived_cylinder_rings(points, normal_rows)
     if normal_result is not None:
         return normal_result
     if len(points) < 8:
@@ -369,6 +394,67 @@ def _broad_arc_island_rings(key_points, source_normals=None):
     }
 
 
+def _coherent_normal_axis_core(points, normals, axis):
+    """Keep only marked faces belonging to the proven grooved cylinder core."""
+    points = np.asarray(points, dtype=float)
+    normals = np.asarray(normals, dtype=float)
+    axis = np.asarray(axis, dtype=float)
+    axis /= max(float(np.linalg.norm(axis)), 1.0e-12)
+    normals /= np.maximum(np.linalg.norm(normals, axis=1)[:, None], 1.0e-12)
+    helper = np.asarray((1.0, 0.0, 0.0))
+    if abs(float(helper @ axis)) > 0.85:
+        helper = np.asarray((0.0, 0.0, 1.0))
+    basis_x = np.cross(axis, helper)
+    basis_x /= max(float(np.linalg.norm(basis_x)), 1.0e-12)
+    basis_y = np.cross(axis, basis_x)
+    reference = np.mean(points, axis=0)
+    relative = points - reference
+    plane_points = np.column_stack((relative @ basis_x, relative @ basis_y))
+    plane_normals = np.column_stack((normals @ basis_x, normals @ basis_y))
+    plane_lengths = np.linalg.norm(plane_normals, axis=1)
+    valid = plane_lengths > 0.30
+    plane_normals /= np.maximum(plane_lengths[:, None], 1.0e-12)
+    matrix_rows, value_rows = [], []
+    for point, normal, usable in zip(plane_points, plane_normals, valid):
+        if not usable:
+            continue
+        projector = np.eye(2) - np.outer(normal, normal)
+        matrix_rows.append(projector)
+        value_rows.append(projector @ point)
+    if len(matrix_rows) < 4:
+        return np.zeros(len(points), dtype=bool), {"reason": "too_few_radial_normals"}
+    center_2d, _residuals, rank, singular = np.linalg.lstsq(
+        np.vstack(matrix_rows), np.concatenate(value_rows), rcond=None
+    )
+    if rank < 2 or singular[-1] <= 1.0e-12:
+        return np.zeros(len(points), dtype=bool), {"reason": "unstable_normal_line_center"}
+    radial = plane_points - center_2d
+    radii = np.linalg.norm(radial, axis=1)
+    radial_unit = radial / np.maximum(radii[:, None], 1.0e-12)
+    alignment = np.abs(np.sum(radial_unit * plane_normals, axis=1))
+    median_radius = float(np.median(radii[valid]))
+    mad_radius = float(np.median(np.abs(radii[valid] - median_radius)))
+    radius_limit = median_radius + max(4.0 * mad_radius, median_radius * 0.18)
+    axial_normal = np.abs(normals @ axis)
+    mask = (
+        valid
+        & (axial_normal <= math.sin(math.radians(6.0)))
+        & (alignment >= math.cos(math.radians(20.0)))
+        & (radii <= radius_limit)
+    )
+    return mask, {
+        "method": "normal_line_center_radial_core_filter",
+        "center_condition": float(singular[0] / singular[-1]),
+        "median_radius": median_radius,
+        "radius_mad": mad_radius,
+        "radius_upper_limit": radius_limit,
+        "minimum_radial_normal_alignment_degrees": 20.0,
+        "input_faces": len(points),
+        "compatible_faces": int(np.sum(mask)),
+        "rejected_incompatible_faces": int(np.sum(~mask)),
+    }
+
+
 def _fit_marked_face_strip(source, face_indices):
     indices = {int(index) for index in face_indices}
     if len(indices) < 4:
@@ -397,25 +483,50 @@ def _fit_marked_face_strip(source, face_indices):
         boundary_count = 0
     points, normals = [], []
     if island_evidence.get("method") == "normal_null_axis_projected_source_envelope_rings":
-        key_normal_rows = defaultdict(list)
-        for face_index in sorted(indices):
-            polygon = source.data.polygons[face_index]
-            for vertex in polygon.vertices:
-                key_normal_rows[vertex_keys[vertex]].append(face_normals[face_index])
-        for key, point in key_points.items():
-            normal = np.mean(key_normal_rows[key], axis=0)
-            normal /= max(float(np.linalg.norm(normal)), 1.0e-12)
-            points.append(tuple(float(value) for value in point))
-            normals.append(tuple(float(value) for value in normal))
-        island_evidence["fit_samples"] = (
-            "unique_source_vertices_with_averaged_source_normals"
+        ordered_faces = sorted(indices)
+        points = [
+            tuple(source.matrix_world @ source.data.polygons[index].center)
+            for index in ordered_faces
+        ]
+        normals = [tuple(face_normals[index]) for index in ordered_faces]
+        core_mask, core_evidence = _coherent_normal_axis_core(
+            points, normals, island_evidence["normal_axis"]
         )
+        compatible_faces = [
+            face_index for face_index, keep in zip(ordered_faces, core_mask) if keep
+        ]
+        if len(compatible_faces) < 8:
+            raise ValueError("断续标记中的圆柱核心面不足，无法安全生成独立圆柱候选")
+        core_points = [point for point, keep in zip(points, core_mask) if keep]
+        core_normals = [normal for normal, keep in zip(normals, core_mask) if keep]
+        fit = fit_rotational_surface_fixed_axis(
+            core_points,
+            core_normals,
+            island_evidence["normal_axis"],
+            FitThresholds(maximum_relative_p90=0.35),
+        )
+        if (
+            fit.status == "candidate_ready"
+            and min(island_evidence["ring_angular_spans_degrees"]) >= 300.0
+        ):
+            fit = replace(
+                fit,
+                coverage_mode="full_rotation",
+                angular_span=2.0 * math.pi,
+            )
+        island_evidence.update({
+            "fit_samples": "coherent_source_face_centers_and_normals",
+            "compatible_face_indices": compatible_faces,
+            "profile_fit_relative_p90_limit": 0.35,
+            "dense_envelope_qa_required": True,
+            "core_filter": core_evidence,
+        })
     else:
         for face_index in sorted(indices):
             polygon = source.data.polygons[face_index]
             points.append(tuple(source.matrix_world @ polygon.center))
             normals.append(tuple(face_normals[face_index]))
-    fit = fit_rotational_boundary_rings(rings[0], rings[1], points, normals)
+        fit = fit_rotational_boundary_rings(rings[0], rings[1], points, normals)
     evidence = {
         **island_evidence,
         "unique_mark_faces": len(indices),
@@ -556,7 +667,12 @@ def _marked_face_vertices(source, targets, face_indices=None):
 def _expanded_domain(fit, source, targets, face_indices=None):
     points = _marked_face_vertices(source, targets, face_indices)
     if targets:
-        points.extend(tuple(_current_anchor(item, source)[0]) for item in targets)
+        allowed = None if face_indices is None else {int(index) for index in face_indices}
+        points.extend(
+            tuple(_current_anchor(item, source)[0])
+            for item in targets
+            if allowed is None or int(item.face_index) in allowed
+        )
     axial, radius, angle = _coordinates(points, fit)
     axial_min, axial_max = float(np.min(axial)), float(np.max(axial))
     ordered = np.sort(np.mod(angle, 2.0 * math.pi))
@@ -968,12 +1084,21 @@ def build_scene_candidate(scene):
         return _build_candidate(
             scene, fit, source, targets, excludes, context_report, set(), {}, "semantic_marks"
         )
-    surface_faces = _target_face_indices(source, targets)
+    axis_evidence = context_report.get("axis_evidence", {})
+    compatible = axis_evidence.get("compatible_face_indices")
+    surface_faces = (
+        {int(index) for index in compatible}
+        if compatible
+        else _target_face_indices(source, targets)
+    )
     expansion = {
-        "selection_method": "exact_green_mark_faces",
-        "seed_faces": len(surface_faces),
+        "selection_method": "coherent_green_rotational_faces",
+        "seed_faces": len(_target_face_indices(source, targets)),
         "surface_faces": len(surface_faces),
         "expanded_faces": 0,
+        "rejected_incompatible_mark_faces": (
+            len(_target_face_indices(source, targets)) - len(surface_faces)
+        ),
         "whole_vehicle_search": False,
     }
     return _build_candidate(

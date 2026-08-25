@@ -153,6 +153,29 @@ class RotationalFitTests(unittest.TestCase):
         self.assertAlmostEqual(abs(fit.signed_slope), slope, delta=0.02)
         self.assertEqual(fit.coverage_mode, "partial_arc")
 
+    def test_fixed_normal_axis_accepts_grooved_envelope_without_axis_drift(self):
+        points, normals, expected_axis = surface_samples(
+            angle_degrees=(-180.0, 180.0), noise=0.002
+        )
+        expected_axis, _x, _y = basis(expected_axis)
+        origin = np.mean(points, axis=0)
+        axial = (points - origin) @ expected_axis
+        radial = points - origin - axial[:, None] * expected_axis[None, :]
+        angles = np.arctan2(radial[:, 1], radial[:, 0])
+        # Recessed longitudinal channels make a constant-radius residual large,
+        # while their coherent side normals still prove the cylinder axis.
+        groove = 1.0 - 0.24 * np.maximum(0.0, np.cos(4.0 * angles))
+        points = origin + axial[:, None] * expected_axis + radial * groove[:, None]
+        fit = ROTATIONAL.fit_rotational_surface_fixed_axis(
+            points,
+            normals,
+            expected_axis,
+            ROTATIONAL.FitThresholds(maximum_relative_p90=0.35),
+        )
+        self.assertEqual(fit.status, "candidate_ready", fit.reason)
+        self.assertGreater(abs(np.dot(fit.axis, expected_axis)), 0.9999)
+        self.assertEqual(fit.profile_kind, "cylinder")
+
 
 if __name__ == "__main__":
     unittest.main()

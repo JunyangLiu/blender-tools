@@ -524,6 +524,72 @@ def fit_rotational_surface(points: Iterable[Iterable[float]], normals: Iterable[
     )
 
 
+def fit_rotational_surface_fixed_axis(
+    points: Iterable[Iterable[float]],
+    normals: Iterable[Iterable[float]],
+    axis: Iterable[float],
+    thresholds: FitThresholds | None = None,
+) -> RotationalFit:
+    """Fit a profile on an independently proven axis without axis drift.
+
+    This is used only after broad side-normal evidence has already established
+    the axis.  It deliberately keeps the standard point, normal, condition and
+    angular QA; callers may supply a wider radial residual threshold for a
+    grooved source whose final candidate will be checked by dense envelope QA.
+    """
+    thresholds = thresholds or FitThresholds()
+    point_rows = _as_rows(points, "points")
+    normal_rows = _as_rows(normals, "normals")
+    if len(point_rows) != len(normal_rows):
+        raise ValueError("points and normals must have equal length")
+    if len(point_rows) < thresholds.minimum_samples:
+        return _failed("至少需要 4 个当前源表面样本", len(point_rows))
+    fixed_axis = _canonical_axis(np.asarray(tuple(axis), dtype=float))
+    if fixed_axis is None:
+        return _failed("已验证轴线无效", len(point_rows))
+    best = _fit_one_axis(fixed_axis, point_rows, normal_rows, thresholds)
+    if best is None:
+        return _failed("当前侧面无法在已验证轴线上稳定拟合", len(point_rows))
+
+    reasons = []
+    if best["condition"] > thresholds.maximum_condition:
+        reasons.append("局部圆弧条件数过高")
+    if best["relative_p90"] > thresholds.maximum_relative_p90:
+        reasons.append("点到旋转曲面的误差过大")
+    if best["normal_p90"] > thresholds.maximum_normal_p90_degrees:
+        reasons.append("源面法线与旋转曲面不一致")
+    if best["span"] < math.radians(thresholds.minimum_angular_span_degrees):
+        reasons.append("圆周方向证据太窄")
+    ready = not reasons
+    confidence = max(0.0, min(1.0,
+        1.0
+        - 1.4 * best["relative_p90"]
+        - best["normal_p90"] / 120.0
+        - min(math.log10(max(best["condition"], 1.0)) / 12.0, 0.25)
+    ))
+    return RotationalFit(
+        status="candidate_ready" if ready else "needs_more_evidence",
+        reason="；".join(reasons) if reasons else "已验证侧面法向轴线支持稳定旋转曲面候选",
+        profile_kind="cone" if best["cone"] else "cylinder",
+        surface_side="outer" if best["signed_radius"] >= 0.0 else "inner",
+        axis=tuple(float(value) for value in best["axis"]),
+        axis_origin=tuple(float(value) for value in best["origin"]),
+        basis_x=tuple(float(value) for value in best["basis_x"]),
+        basis_y=tuple(float(value) for value in best["basis_y"]),
+        signed_radius_at_origin=float(best["signed_radius"]),
+        signed_slope=float(best["signed_slope"]),
+        axial_min=float(best["axial_min"]), axial_max=float(best["axial_max"]),
+        angular_start=float(best["start"]), angular_span=float(best["span"]),
+        angular_largest_gap=float(best["largest_gap"]),
+        coverage_mode=str(best["coverage_mode"]),
+        point_residual_p50=float(best["p50"]), point_residual_p90=float(best["p90"]),
+        relative_residual_p90=float(best["relative_p90"]),
+        normal_error_p90_degrees=float(best["normal_p90"]),
+        condition_number=float(best["condition"]), confidence=confidence,
+        sample_count=len(point_rows),
+    )
+
+
 def fit_rotational_boundary_rings(
     first_ring: Iterable[Iterable[float]],
     second_ring: Iterable[Iterable[float]],
