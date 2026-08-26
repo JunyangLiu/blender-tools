@@ -9,13 +9,25 @@ bl_info = {
 }
 
 import bpy
+from bpy.app.handlers import persistent
 
 from .operators import CLASSES as OPERATOR_CLASSES
 from .panel import CLASSES as PANEL_CLASSES
 from .anchors import migrate_scene_anchors
+from .constants import MODAL_TOKEN_KEY
 
 
 CLASSES = OPERATOR_CLASSES + PANEL_CLASSES
+
+
+@persistent
+def _clear_stale_marking_tokens(_unused):
+    """Modal operators do not survive loading, so their saved tokens are stale."""
+    for scene in bpy.data.scenes:
+        if scene.get(MODAL_TOKEN_KEY, ""):
+            scene[MODAL_TOKEN_KEY] = ""
+            if hasattr(scene, "smrn_status"):
+                scene.smrn_status = "已恢复普通选择；可重新启动绿色或红色刷选。"
 
 
 def register():
@@ -120,6 +132,9 @@ def register():
     bpy.types.Scene.smrn_surface_summary = bpy.props.StringProperty(
         name="局部网面重构结果", default="尚未生成局部网面候选",
     )
+    if _clear_stale_marking_tokens not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_clear_stale_marking_tokens)
+    _clear_stale_marking_tokens(None)
     try:
         migration = migrate_scene_anchors(bpy.context.scene)
         bpy.context.scene.smrn_status = (
@@ -131,6 +146,8 @@ def register():
 
 
 def unregister():
+    if _clear_stale_marking_tokens in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_clear_stale_marking_tokens)
     for name in (
         "smrn_surface_summary", "smrn_surface_normal_mode", "smrn_surface_height_mode",
         "smrn_surface_hard_angle",

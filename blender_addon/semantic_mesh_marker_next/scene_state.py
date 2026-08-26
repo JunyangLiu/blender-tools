@@ -84,9 +84,11 @@ def set_source(scene, source):
     model, _candidates, _helpers = ensure_scene_roots(scene)
     if model.objects.get(source.name) is None:
         model.objects.link(source)
-    for owner in tuple(source.users_collection):
-        if owner != model:
-            owner.objects.unlink(source)
+    # Preserve the user's own assembly/scale collection membership.  Moving a
+    # source exclusively into the SMRN model root makes it disappear whenever
+    # that root is hidden in the current view layer and also breaks deliberate
+    # groupings such as a two-part 1:72 export set.  Linking to the authoritative
+    # model root is sufficient; an object may safely belong to both collections.
     scene[SOURCE_NAME_KEY] = source.name
     source.hide_viewport = False
     source.hide_render = False
