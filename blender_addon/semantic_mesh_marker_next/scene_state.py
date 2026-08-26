@@ -142,6 +142,19 @@ def keep_model_visible(scene, required_objects=()):
 def set_helpers_hidden(scene, hidden):
     _model, _candidates, helpers = ensure_scene_roots(scene)
     helpers.hide_viewport = bool(hidden)
+    # Outliner eye visibility is stored per LayerCollection, separately from
+    # Collection.hide_viewport.  If the user hides SMR_03 from the Outliner,
+    # toggling helpers through the panel must restore both states; otherwise
+    # marks are recorded successfully but no green/red feedback is visible.
+    def sync_layer_collection(layer_collection):
+        if layer_collection.collection == helpers:
+            layer_collection.exclude = False
+            layer_collection.hide_viewport = bool(hidden)
+        for child in layer_collection.children:
+            sync_layer_collection(child)
+
+    for view_layer in scene.view_layers:
+        sync_layer_collection(view_layer.layer_collection)
     keep_model_visible(scene)
 
 
